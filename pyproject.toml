@@ -1,0 +1,14 @@
+[project]
+name = "agentic-policy-platform"
+version = "0.1.0"
+description = "Enterprise Agentic Policy Processing Platform — extracts policy data from source files and fills the Brain template"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+addopts = "-v --tb=short"
+pythonpath = ["backend"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"

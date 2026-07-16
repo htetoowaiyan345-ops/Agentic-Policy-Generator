@@ -1,0 +1,42 @@
+# Agentic Policy Platform — core dependencies
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.20
+python-docx==1.1.2
+pdfplumber==0.11.4
+PyMuPDF==1.24.13
+striprtf==0.0.26
+pytest==8.3.4
+pytest-asyncio==0.24.0
+httpx==0.28.1
+thefuzz==0.20.0
+
+# ---------------------------------------------------------------------------
+# RAG-Hybrid retrieval (local, open-source, no cloud APIs).
+# Used to classify slot content for slot 1-15 of the Brain template.
+#
+#   sentence-transformers -> all-MiniLM-L6-v2  (~80 MB) for dense embeddings
+#   faiss-cpu            -> per-document vector index
+#   rank-bm25            -> BM25 keyword search (hybrid scoring)
+#   scikit-learn         -> TF-IDF fallback (when sentence-transformers model is unavailable)
+#   numpy                -> numerical / cosine matrix operations
+#
+# Models are downloaded lazily on first run; if unavailable the pipeline
+# transparently falls back to TF-IDF + numpy cosine.
+# ---------------------------------------------------------------------------
+sentence-transformers==5.6.0
+faiss-cpu==1.14.3
+rank-bm25==0.2.2
+scikit-learn>=1.5
+numpy>=1.26
+
+# ---------------------------------------------------------------------------
+# Optional: spaCy-based label extraction (opt-in).
+#
+#   pip install spacy==3.8.13
+#   python -m spacy download en_core_web_sm
+#   set AGENTIC_POLICY_USE_SPACY=1
+#
+# Without these, the platform falls back to the deterministic regex-based
+# field_parser path automatically.
+# ---------------------------------------------------------------------------

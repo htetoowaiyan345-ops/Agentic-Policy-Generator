@@ -1,0 +1,11 @@
+{
+  "version": "Brain-PF5-v1.1.0",
+  "source_filename": "Policy_Framework_5.docx",
+  "sha256": "6c07776c8c169fd4a91df9639156e860a59df19a7b321e4362e2629094dd78ec",
+  "embedded_media": [
+    "word/media/image1.jpeg",
+    "word/media/image2.png"
+  ],
+  "section_count": 15,
+  "frozen": true
+}

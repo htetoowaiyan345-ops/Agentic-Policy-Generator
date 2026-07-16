@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.idea/
+.vscode/
+.env
+
+# Backend generated runtime data (regenerated on each run)
+backend/data/runs/
+backend/data/outputs/
+backend/data/policy_history.db
+backend/data/policy_history.db-*
+
+# API & frontend logs (regenerated on each run)
+backend/data/api.log
+backend/data/api.err
+backend/data/frontend.log
+backend/data/frontend.err
+*.log
+*.tmp
+
+# Temp scratch files
+_tmp_*.py
