@@ -58,6 +58,10 @@ def _score_title(line: str, position: int = 0) -> float:
          (start with a known Brain label followed by a colon).
          These are NOT titles — they're content lines.
       5. Penalty for very long lines (likely content paragraphs).
+      6. Penalty for lines that look like scope/audience statements
+         (start with `APPLICABLE TO`, `SCOPE`, `AUDIENCE`, `This
+         policy`, `The policy`, etc.). These are body sentences that
+         happen to be long and can otherwise out-score the real title.
     """
     s = line.strip()
     if not s:
@@ -70,6 +74,12 @@ def _score_title(line: str, position: int = 0) -> float:
         return -1.0
     # Penalty: line starts with `Label:` pattern (likely a content line).
     if _looks_like_label_value(s):
+        return -1.0
+    # Penalty: lines that read like scope/audience statements rather
+    # than titles. Without this, a sentence like
+    # "APPLICABLE TO ALL SECTORS UNDER CITY HOLDINGS GROUP..." out-scores
+    # the real title because of length.
+    if _looks_like_scope_or_audience(s):
         return -1.0
     # Title Case bonus.
     score = len(s)
@@ -86,6 +96,34 @@ def _score_title(line: str, position: int = 0) -> float:
     else:
         score -= position * 5  # Decay for later lines
     return score
+
+
+_SCOPE_PREFIX_RE = re.compile(
+    r"^\s*(?:"
+    r"applicable\s+to"
+    r"|scope\s*[:\-]"
+    r"|audience\s*[:\-]"
+    r"|coverage\s*[:\-]"
+    r"|this\s+policy\s+supports?"
+    r"|this\s+policy\s+applies?"
+    r"|this\s+policy\s+recogni[sz]es?"
+    r"|the\s+policy\s+supports?"
+    r"|the\s+policy\s+applies?"
+    r"|the\s+policy\s+recogni[sz]es?"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_scope_or_audience(s: str) -> bool:
+    """True if `s` reads like a scope/audience/applicability statement
+    rather than a policy title. These sentences are typically long
+    (60-150 chars), start with `APPLICABLE TO` / `SCOPE` / `This policy
+    supports` etc., and end with a period. They are body content, not
+    the policy title."""
+    if _SCOPE_PREFIX_RE.match(s):
+        return True
+    return False
 
 
 def _looks_like_label_value(s: str) -> bool:

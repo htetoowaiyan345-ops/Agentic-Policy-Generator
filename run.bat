@@ -67,6 +67,11 @@ if not "%RC%"=="0" (
 )
 :npm_done
 
+REM ---- Prepend portable Node dir to OUR PATH so every subsequent
+REM      `start "..."` cmd /k child inherits it through win32 environment
+REM      propagation. ----
+if defined NODE_DIR set "PATH=%NODE_DIR%;%PATH%"
+
 REM ---- Kill stale servers on 8000/5173 ----
 echo [run.bat] Stopping any previous servers on ports 8000/5173...
 for /f "tokens=5" %%P in ('netstat -ano ^| findstr ":8000" ^| findstr LISTENING') do (
@@ -86,20 +91,38 @@ echo [run.bat] Waiting for API server...
 timeout /t 3 /nobreak > nul
 
 REM ---- Start the SvelteKit dev server in a new persistent window ----
-REM   We must give the new cmd window the full PATH including the
-REM   portable Node dir, because `start` creates a child that does
-REM   NOT inherit the mutations made above.
-if defined NODE_DIR (
-  set "CHILD_PATH=%NODE_DIR%;%PATH%"
-) else (
-  set "CHILD_PATH=%PATH%"
-)
+REM   The portable Node dir is now already on OUR PATH, so children
+REM   inherit it automatically. We also `where node` once to verify
+REM   before launching -- if `node` still resolves to nothing, fall
+REM   back to the absolute path.
 echo [run.bat] Starting SvelteKit dev server (port 5173)...
-start "Frontend :5173" cmd /k "set PATH=%CHILD_PATH% && cd /d ""%PROJECT_DIR%frontend\web"" && npm run dev"
+where node >nul 2>&1
+if errorlevel 1 (
+  if defined NODE_BIN (
+    start "Frontend :5173" cmd /k "cd /d ""%PROJECT_DIR%frontend\web"" && ""%NODE_BIN%"" run dev"
+  ) else (
+    start "Frontend :5173" cmd /k "cd /d ""%PROJECT_DIR%frontend\web"" && npm run dev"
+  )
+) else (
+  start "Frontend :5173" cmd /k "cd /d ""%PROJECT_DIR%frontend\web"" && npm run dev"
+)
+
+REM ---- Poll for frontend bind so the user doesn't see ERR_CONNECTION_REFUSED. ----
+echo [run.bat] Waiting for web UI on port 5173...
+set /a TRIES=0
+:wait_web
+if %TRIES% GEQ 30 goto web_timeout
+netstat -ano | findstr ":5173" | findstr LISTENING >nul 2>&1
+if not errorlevel 1 goto web_ready
+set /a TRIES+=1
+timeout /t 1 /nobreak > nul
+goto wait_web
+:web_ready
+echo [run.bat] Web UI is up on http://localhost:5173/
+:web_timeout
 
 REM ---- Open browser ----
-echo [run.bat] Opening browser in 12s...
-timeout /t 12 /nobreak > nul
+echo [run.bat] Opening browser...
 start http://localhost:5173/
 
 echo.

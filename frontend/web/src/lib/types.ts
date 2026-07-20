@@ -39,7 +39,103 @@ export interface AppState {
   reviewAudit: AuditEntry[];
 }
 
-export type PreviewLine = ['p', string] | ['t', string[][]];
+/**
+ * Brain slot identifier.
+ *   - 0 = free paragraph (content outside any Brain slot; appears at top of docx)
+ *   - 1..15 = the 15 Brain slots (see framework/section_map.py)
+ */
+export type SlotKind =
+  | 0
+  | 1
+  | 2
+  | 3
+  | 4
+  | 5
+  | 6
+  | 7
+  | 8
+  | 9
+  | 10
+  | 11
+  | 12
+  | 13
+  | 14
+  | 15;
+
+export interface RichParagraph {
+  /** Brain slot id; 0 means free paragraph (above all slots). */
+  slot: SlotKind;
+  /** Plain-text fallback (used by audit log, table cells, search). */
+  text: string;
+  /** CKEditor 5 serialized HTML; round-tripped to .docx in publish. */
+  html: string;
+  /** Optional footnotes anchored to this paragraph. */
+  footnotes?: { id: string; body: string }[];
+}
+
+/** CKEditor 5 table-cell payload: text + html per cell. */
+export interface RichCell {
+  text: string;
+  html: string;
+}
+
+/**
+ * Row payload for a Brain-slot table line.
+ * Each cell carries both text (audit-safe) and html (CKEditor 5 output).
+ */
+export type RichTable = RichCell[][];
+
+export type PreviewLine =
+  | ['p', RichParagraph]
+  | ['t', { slot: SlotKind; rows: RichTable }];
+
+/**
+ * Normalise historical payload shape (legacy `['p', string]` or
+ * `['t', string[][]]`) into the rich shape. Used by:
+ *   - api_preview.py on read
+ *   - docx_approved_export.py on export
+ *   - frontend on initial load before mounting the editor
+ */
+export function normalisePreviewLine(raw: unknown): PreviewLine | null {
+  if (!Array.isArray(raw) || raw.length !== 2) return null;
+  const [kind, payload] = raw as [unknown, unknown];
+  if (kind === 'p') {
+    if (typeof payload === 'string') {
+      return ['p', { slot: 0, text: payload, html: '' }];
+    }
+    if (payload && typeof payload === 'object' && 'text' in payload) {
+      const p = payload as Partial<RichParagraph>;
+      return [
+        'p',
+        {
+          slot: (p.slot ?? 0) as SlotKind,
+          text: p.text ?? '',
+          html: p.html ?? '',
+          footnotes: p.footnotes ?? []
+        }
+      ];
+    }
+    return null;
+  }
+  if (kind === 't') {
+    if (Array.isArray(payload)) {
+      const rows = payload as unknown[];
+      const normRows: RichTable = rows.map((row) => {
+        if (!Array.isArray(row)) return [];
+        return row.map((cell) =>
+          typeof cell === 'string' ? { text: cell, html: '' } : (cell as RichCell)
+        );
+      });
+      return ['t', { slot: 0, rows: normRows }];
+    }
+    if (payload && typeof payload === 'object' && 'rows' in payload) {
+      const p = payload as { slot?: SlotKind; rows?: RichCell[][] };
+      return ['t', { slot: (p.slot ?? 0) as SlotKind, rows: p.rows ?? [] }];
+    }
+    return null;
+  }
+  return null;
+}
 
 export interface PreviewData {
   lines: PreviewLine[];

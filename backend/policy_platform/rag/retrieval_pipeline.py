@@ -287,7 +287,11 @@ class RetrievalPipeline:
     ) -> None:
         self.timeout_seconds = float(timeout_seconds)
         self.alpha = float(alpha)
-        self._embedder = Embedder()
+        # Phase 12 — default Embedder to TF-IDF (skips the 80-MB
+        # sentence-transformers cold load). Reranker() honors the
+        # AGENTIC_POLICY_RAG_RERANKER env var and otherwise stays on
+        # the fallback path.
+        self._embedder = Embedder(prefer_tfidf=True)
         self._reranker = Reranker()
 
     @property

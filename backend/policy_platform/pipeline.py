@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from typing import Iterable, Optional
 
 from . import config
 from .audit import new_run_id, now_iso, write_audit
@@ -107,6 +108,357 @@ def process(input_path: Path, output_path: Path | None = None, *, fail_on_valida
     except Exception as e:
         steps.append(_step(2, "Extract", False, str(e)))
         raise PipelineError("Step 2 Extract failed") from e
+
+    return _run_extracted_pipeline(
+        extracted=extracted,
+        output_path=output_path,
+        steps=steps,
+        sections_meta=sections_meta,
+        started_at=started_at,
+        t0=t0,
+        run_id=run_id,
+        input_path=input_path,
+        header_text=None,
+        header_version=None,
+        fail_on_validation=fail_on_validation,
+    )
+
+
+def run_from_lines_json(
+    lines_json: Iterable,
+    output_path: Path,
+    *,
+    run_id: Optional[str] = None,
+    document_name: str = "reviewer-edit-lines-json",
+    fail_on_validation: bool = False,
+) -> AuditResult:
+    """Phase 6 — re-run the Brain pipeline end-to-end against the
+    reviewer's saved lines_json (rich or legacy). Useful for the
+    'Publish & Generate DOCX' button: take whatever the reviewer saved,
+    re-extract it (via LinesJsonExtractor), and run the same 7 steps.
+
+    `fail_on_validation` defaults to False because the reviewer-driven
+    output is permitted to differ from the Brain template's emitted
+    value-counts (slot assignments can change) — a hard validation
+    failure would block every Publish, which is the opposite of what
+    this feature is for.
+
+    If the lines_json payload contains an explicit `Policy Title:`
+    or `Policy Number:` line, those values are extracted and passed
+    through to the renderer as `header_text` / `header_version` so the
+    header mirrors the body's title 1:1. The renderer's heuristic
+    title-extractor can otherwise pick a long body paragraph (e.g. a
+    scope statement) as the title because of length-based scoring —
+    the explicit value short-circuits that path.
+    """
+    from api.lines_json_extractor import LinesJsonExtractor
+    from api.docx_approved_export import extract_explicit_title_and_version
+    if run_id is None:
+        run_id = new_run_id()
+    started_at = now_iso()
+    t0 = time.perf_counter()
+    steps: list[AgentStep] = []
+    sections_meta: list[dict] = []
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Pull the body's explicit Policy Title / Policy Number BEFORE the
+    # pipeline runs, so we can pass them through as `header_text` /
+    # `header_version`. This guarantees `header.title == body.title`
+    # and `header.version == body.number` regardless of how the
+    # heuristic title extractor would otherwise score the paragraphs.
+    try:
+        explicit_title, explicit_version = extract_explicit_title_and_version(
+            list(lines_json) if lines_json is not None else None
+        )
+    except Exception:
+        explicit_title, explicit_version = None, None
+
+    try:
+        extracted = LinesJsonExtractor(lines_json).to_extracted_document()
+        steps.append(
+            _step(
+                2, "Extract", True,
+                f"format={extracted.source_format} sha={extracted.source_sha256[:12]} "
+                f"paragraphs={len(extracted.paragraphs)} tables={len(extracted.tables)}",
+            )
+        )
+    except Exception as e:
+        steps.append(_step(2, "Extract", False, str(e)))
+        raise PipelineError(f"Step 2 Extract (lines_json) failed: {e}") from e
+
+    # Step 1 doesn't apply — we already have the lines_json content. Synthesise
+    # a Receive step so the audit log is complete.
+    steps.insert(0, _step(1, "Receive", True, f"{document_name} (lines_json)"))
+
+    return _run_extracted_pipeline(
+        extracted=extracted,
+        output_path=output_path,
+        steps=steps,
+        sections_meta=sections_meta,
+        started_at=started_at,
+        t0=t0,
+        run_id=run_id,
+        input_path=Path(document_name),
+        header_text=explicit_title,
+        header_version=explicit_version,
+        fail_on_validation=fail_on_validation,
+    )
+
+
+def _run_extracted_pipeline(
+    *,
+    extracted,
+    output_path: Path,
+    steps: list[AgentStep],
+    sections_meta: list[dict],
+    started_at: str,
+    t0: float,
+    run_id: str,
+    input_path: Path,
+    header_text: Optional[str],
+    header_version: Optional[str],
+    fail_on_validation: bool,
+) -> AuditResult:
+    """Shared post-extraction body for `process` and `run_from_lines_json`."""
+    # Step 2.5: Extract header info from the cleaned first page
+    #
+    # Per user directive, the header MUST show ONLY the explicit
+    # `Policy Title:` / `Policy Number:` text from the body — no
+    # heuristic fallback to whatever the longest paragraph or PDF
+    # metadata happens to be. The pipeline computes `header_info`
+    # (heuristic) below for audit logging only; the renderer's
+    # `_replace_header_text` receives the explicit `header_text` /
+    # `header_version` (which may be `None` → empty header slot).
+    header_info = header_extractor.extract(
+        input_path,
+        pdf_metadata=None,
+        cleaned_paragraphs=list(extracted.paragraphs),
+    )
+    # Explicit-only: when the caller supplied `header_text` /
+    # `header_version` (from `extract_explicit_title_and_version`),
+    # those are the SOLE source. When the caller did NOT supply them
+    # (regular PDF pipeline path with no `lines_json`), keep the
+    # heuristic values so a PDF with no explicit label still gets a
+    # title — but a `lines_json` path with no explicit label gets an
+    # empty header slot. Caller signals "explicit-only" by passing
+    # `header_text=""` (empty string) vs. `None`.
+    if header_text is not None:
+        header_title = header_text if header_text else ""
+        header_version = header_version if header_version else ""
+    else:
+        header_title = header_info.get("title")
+        header_version = header_info.get("version")
+    header_source = (
+        "explicit" if header_text is not None else header_info.get("source", "fallback")
+    )
+
+    # Step 2.7: Extract label-value pairs (Phase 7) for slot 1 + slot 3 fields.
+    from .extractors import field_parser
+    from .rag.table_routing import _looks_like_label_row_table
+
+    def _label_row_tables_to_paragraphs(tables):
+        out: list[str] = []
+        if not tables:
+            return out
+        for tbl in tables:
+            if not tbl or not _looks_like_label_row_table(tbl):
+                continue
+            for row in tbl:
+                if not row or len(row) < 2:
+                    continue
+                label = (row[0] or "").strip()
+                value = (row[1] or "").strip()
+                if not label or not value:
+                    continue
+                if label.endswith(":"):
+                    out.append(f"{label} {value}")
+                else:
+                    out.append(f"{label}: {value}")
+        return out
+
+    synth_paragraphs = _label_row_tables_to_paragraphs(
+        getattr(extracted, "tables", None)
+    )
+    parser_input = list(synth_paragraphs) + list(extracted.paragraphs)
+    field_map = field_parser.parse(
+        parser_input,
+        dropped_paragraphs=getattr(extracted, "cleaner_dropped", None),
+        cleaned_to_original=getattr(extracted, "original_indices", None),
+    )
+    if not field_map:
+        field_map = {}
+
+    field_map = _maybe_inject_title_from_top_paragraph(
+        field_map, list(extracted.paragraphs)
+    )
+
+    # Step 3: RAG-Hybrid retrieval
+    try:
+        from .framework.slot_tiers import SLOT_TIERS, slot_required
+        rag_result = get_pipeline().run(
+            list(extracted.paragraphs),
+            tables=list(extracted.tables) if getattr(extracted, "tables", None) else None,
+            table_paragraph_indices=list(extracted.table_paragraph_indices)
+                if getattr(extracted, "table_paragraph_indices", None) else None,
+        )
+        classified = build_classification_from_rag(
+            rag_result,
+            source_paragraph_count=len(extracted.paragraphs),
+        )
+        for sec in FROZEN_SECTIONS:
+            sid = sec["id"]
+            slot = classified.sections.get(sid)
+            status = slot.status if slot else config.SKIPPED_STATUS
+            paras = slot.content_paragraphs if slot else []
+            placed = slot.placed_paragraphs if slot and slot.placed_paragraphs else []
+            tables = slot.content_tables if slot else []
+            routing_rule = slot.routing_rule if slot else ""
+            placed_chars = sum(len(p) for p in placed) + sum(
+                len(c) for t in tables for r in t for c in r
+            )
+            tier = SLOT_TIERS.get(sid, 3)
+            required = slot_required(sid)
+            has_real_content = (status != "Found") and (not paras or not any(p.strip() for p in paras))
+            placeholder_rendered = bool(required and (status != "Found") and has_real_content)
+            sections_meta.append({
+                "id": sid,
+                "name": sec["title"],
+                "status": status,
+                "routing_rule": routing_rule,
+                "tier": tier,
+                "required": required,
+                "slot_unchanged": status in (config.SKIPPED_STATUS, config.FOUND_EMPTY_STATUS),
+                "paragraphs": placed,
+                "source_paragraph_count": len(paras),
+                "tables": tables,
+                "placed_chars": placed_chars,
+                "dropped_chars": 0,
+                "placeholder_rendered": placeholder_rendered,
+            })
+        found = sum(1 for s in sections_meta if s["status"] == "Found")
+        skipped = sum(1 for s in sections_meta if s["status"] == config.SKIPPED_STATUS)
+        empty = sum(1 for s in sections_meta if s["status"] == config.FOUND_EMPTY_STATUS)
+        rag_detail = (
+            f"found={found} skipped={skipped} empty={empty} "
+            f"embedder={rag_result.embedder_backend} faiss={rag_result.faiss_backend} "
+            f"reranker={rag_result.reranker_backend} timed_out={rag_result.timed_out}"
+        )
+        steps.append(_step(3, "RAG-Retrieve", True, rag_detail))
+    except Exception as e:
+        steps.append(_step(3, "RAG-Retrieve", False, str(e)))
+        raise PipelineError(f"Step 3 RAG-Retrieve failed: {e}") from e
+
+    # Step 4: Apply (no transformation; routing result is the payload)
+    try:
+        manifest = brain_loader.init_or_verify(init=False)
+        steps.append(_step(4, "Apply", True, f"framework={manifest['version']}"))
+    except Exception as e:
+        steps.append(_step(4, "Apply", False, str(e)))
+        raise PipelineError(f"Step 4 Apply failed: {e}") from e
+
+    # Step 5+6: Render
+    try:
+        render(
+            classified,
+            extracted,
+            config.BRAIN_PATH,
+            output_path,
+            header_text=header_title,
+            header_version=header_version,
+            field_map=field_map,
+        )
+        for s in sections_meta:
+            sid = s["id"]
+            slot = classified.sections.get(sid)
+            if slot and slot.placed_paragraphs:
+                s["paragraphs"] = slot.placed_paragraphs
+                s["placed_chars"] = sum(len(p) for p in slot.placed_paragraphs) + sum(
+                    len(c) for t in slot.content_tables for r in t for c in r
+                )
+        steps.append(
+            _step(
+                5,
+                "Render",
+                True,
+                f"path={output_path} header_source={header_source} title={header_title!r} version={header_version!r}",
+            )
+        )
+    except Exception as e:
+        steps.append(_step(5, "Render", False, str(e)))
+        raise PipelineError(f"Step 5/6 Render failed: {e}") from e
+
+    # Step 7: Validate
+    report: dict = {"checks": []}
+    try:
+        report = validate(extracted, output_path, classified)
+        steps.append(_step(6, "Validate", True, f"checks={len(report.get('checks', []))}"))
+    except ValidationFailed as vf:
+        steps.append(_step(6, "Validate", False, str(vf)))
+        if fail_on_validation:
+            raise
+    except Exception as e:
+        steps.append(_step(6, "Validate", False, str(e)))
+        if fail_on_validation:
+            raise PipelineError(f"Step 7 Validate failed: {e}") from e
+
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    finished_at = now_iso()
+
+    total_source_chars = sum(len(p) for p in extracted.paragraphs) + sum(
+        len(c) for t in extracted.tables for r in t for c in r
+    )
+    placed_total = sum(s.get("placed_chars", 0) for s in sections_meta)
+    total_dropped = max(0, total_source_chars - placed_total)
+    total_dropped_paragraphs = len(classified.dropped_paragraph_indices)
+
+    unallocated_slots = [s for s in sections_meta if s["status"] not in ("Found",)]
+    per_slot_drop = 0
+    if unallocated_slots and total_dropped > 0:
+        per_slot_drop = total_dropped // len(unallocated_slots)
+        for s in unallocated_slots:
+            s["dropped_chars"] = per_slot_drop
+    leftover = total_dropped - per_slot_drop * len(unallocated_slots) if unallocated_slots else 0
+    if unallocated_slots and leftover > 0:
+        unallocated_slots[0]["dropped_chars"] += leftover
+
+    sample = []
+    for entry in (extracted.cleaner_dropped or [])[:20]:
+        sample.append({
+            "index": entry.get("index", ""),
+            "text": entry.get("text", ""),
+            "reason": entry.get("reason", "cleaner"),
+        })
+    remaining = max(0, 20 - len(sample))
+    for idx in classified.dropped_paragraph_indices[:remaining]:
+        if 0 <= idx < len(extracted.paragraphs):
+            sample.append({"index": idx, "text": extracted.paragraphs[idx], "reason": "rag_dropped"})
+
+    integrity_checks = report.get("checks", []) if isinstance(report, dict) else []
+
+    result = AuditResult(
+        run_id=run_id,
+        document_name=str(input_path.name),
+        processing_time_ms=elapsed_ms,
+        framework_version=manifest["version"],
+        framework_sha256=manifest["sha256"],
+        started_at=started_at,
+        finished_at=finished_at,
+        validation_ok=not any(not s.ok for s in steps if s.name == "Validate"),
+        output_path=str(output_path),
+        audit_json="",
+        sections=sections_meta,
+        steps=steps,
+        integrity_checks=integrity_checks,
+        fallback_used=classified.fallback_used,
+        total_placed_chars=placed_total,
+        total_dropped_chars=total_dropped,
+        total_dropped_paragraphs=total_dropped_paragraphs,
+        dropped_paragraphs_sample=sample,
+        extraction_path="rag",
+    )
+    result.audit_json = write_audit(result)
+    return result
 
     # Step 2.5: Extract header info from the cleaned first page
     header_info = header_extractor.extract(

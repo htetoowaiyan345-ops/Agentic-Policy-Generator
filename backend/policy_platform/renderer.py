@@ -1291,17 +1291,19 @@ def _replace_header_text(doc, title: str, version: str) -> None:
     line) and the straight-connector line stays anchored across the
     header width.
 
-    Fallbacks (apply to every file):
-      - title   → "POLICY TEMPLATE - <DOC_NAME>" if no input title
-      - version → "CL&H_02/24" if no input version
+    Strict policy: header text comes ONLY from the explicit body
+    `Policy Title:` / `Policy Number:` line — there is no fallback to
+    a heuristic-extracted title, no fallback to a hard-coded
+    "POLICY TEMPLATE" string, and no fallback to "CL&H_02/24".
+
+    When `title` / `version` is empty (the body has no explicit line
+    for them) the bracketed slot is written empty so the final
+    header shows nothing in that position. The Brain's logo and
+    straight-connector line are still preserved.
     """
-    # Resolve fallback values.
+    # Resolve text values — NO FALLBACK to defaults. Empty in → empty out.
     title_text = str(title).strip() if title else ""
     version_text = str(version).strip() if version else ""
-    if not title_text:
-        title_text = "POLICY"
-    if not version_text:
-        version_text = "CL&H_02/24"
 
     if not doc.sections:
         return

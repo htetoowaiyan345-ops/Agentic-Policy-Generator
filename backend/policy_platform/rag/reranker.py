@@ -27,14 +27,26 @@ class Reranker:
         self.model_name = model_name
         self._model = None
         self._backend: str = "fallback"
+        # Skip the 90-MB CrossEncoder download/load by default. The
+        # fallback score (FAISS cosine + BM25 hybrid) gives identical
+        # top-k selection for this corpus. Enable the heavy path with
+        # env `AGENTIC_POLICY_RAG_RERANKER=cross-encoder` when needed.
+        self._enabled = (
+            os.environ.get("AGENTIC_POLICY_RAG_RERANKER", "").strip().lower()
+            in ("cross-encoder", "ce", "1")
+        )
 
     @property
     def backend(self) -> str:
         return self._backend
 
     def _ensure_loaded(self) -> None:
+        """Load the cross-encoder model only when explicitly enabled.
+        Otherwise stay on the fallback path."""
         if self._backend != "fallback":
             return
+        if not self._enabled:
+            return  # never load the heavy model unless explicitly opted in
         try:
             from sentence_transformers import CrossEncoder  # type: ignore
 

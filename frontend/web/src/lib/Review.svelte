@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte';
+  import { tick } from 'svelte';
   import {
     appState,
     setActiveRun,
@@ -46,141 +46,62 @@
   let previewData: PreviewData | null = $state(null);
   let previewError: string | null = $state(null);
   let previewLoading: boolean = $state(false);
+  let previewAttempt: number = $state(0);
   let lastLoadedRunId: string | null = null;
+  let previewErrorToastTimer: ReturnType<typeof setTimeout> | null = null;
 
   let hasResults = $derived(batch.some((b) => b.status === 'done' && !!b.runId));
 
-  // Marker styling helpers
-  const MARKER = 'Data is not found in source file';
-  const SLOT_LABEL_MAP: Record<string, number> = {
-    'Type': 1, 'Policy Title': 1, 'Policy Number': 1,
-    'Applicable Sector(s)': 1, 'Functional Area(s)': 1,
-    'Brief Description': 2,
-    'Effective Date/Period': 3, 'Approved by': 3, 'Prepared by': 3,
-    'Responsible Function(s)': 3, 'Responsible Function Officer(s)': 3,
-    'Supersedes': 3, 'Last Reviewed': 3, 'Applies to': 3,
-    'Reason for Policy': 4,
-    'POLICY STATEMENT': 6,
-    '1. Purpose': 7,
-    '2. Scope & Beneficiaries': 8,
-    '3. Exclusions': 9,
-    '4. Award Structure & Payout Tiers': 10,
-    'Policy Review Note': 11,
-    'DEFINITIONS': 12,
-    'RELATED POLICIES, PROCEDURES, FORMS, GUIDELINES & OTHER RESOURCES': 13,
-    'RELATED POLICIES': 13, 'OTHER RESOURCES': 13,
-    'HISTORY': 14,
-  };
+  // ---------------------------------------------------------------------------
+  // Word-style CKEditor 5 editor is now ALWAYS MOUNTED. No more "Edit this
+  // version" gate, no more `editorReadonly`, no more read-only preview
+  // block, and no more `taggedLines` string-matching. Slot routing is
+  // preserved through the editor's data pipeline via the
+  // `GeneralHtmlSupport` plugin (data-slot / data-slot-bar attrs).
+  // Backwards-compat: PreviewLine['p'] payload was upgraded in types.ts.
+  // Legacy `lines_json` payloads are normalised at the boundary by
+  // `normalisePreviewLine` (used by ReviewEditor).
+  // ---------------------------------------------------------------------------
 
-  function tableSlot(rows: string[][] | undefined): number | null {
-    if (!rows || !rows.length) return null;
-    const firstRow = rows[0] || [];
-    const firstCell = (firstRow[0] || '').toLowerCase();
-    const flat = rows
-      .slice(0, 3)
-      .map((r) => (r || []).join(' ').toLowerCase())
-      .join(' | ');
-    if (
-      firstCell.includes('version') ||
-      firstCell.includes('history') ||
-      flat.includes('history') ||
-      flat.includes('version date') ||
-      flat.includes('revision') ||
-      flat.includes('approved date') ||
-      flat.includes('effective date') ||
-      flat.includes('change description')
-    ) {
-      return 14;
-    }
-    return null;
+  /** Show an inline, auto-dismissing error toast — does NOT blank the editor.
+   *  Keeps the last good preview visible so the user can keep working. */
+  function showPreviewErrorToast(msg: string): void {
+    previewError = msg;
+    if (previewErrorToastTimer) clearTimeout(previewErrorToastTimer);
+    previewErrorToastTimer = setTimeout(() => { previewError = null; }, 5000);
   }
 
-  function slotForLine(text: string): number | null {
-    if (!text) return null;
-    for (const [label, sid] of Object.entries(SLOT_LABEL_MAP)) {
-      if (text === label) return sid;
-      if (text.startsWith(label + ' ')) return sid;
-      if (text.startsWith(label + ':')) return sid;
-    }
-    return null;
-  }
-
-  // Computed: each line tagged with its slot id (0 = before first slot)
-  type TaggedLine = {
-    kind: 'p' | 't' | 'r';
-    text?: string;
-    rows?: string[][];
-    slotId: number;
-  };
-
-  let taggedLines = $derived.by<TaggedLine[]>(() => {
-    if (!previewData) return [];
-    const lines = previewData.lines || [];
-    const out: TaggedLine[] = [];
-    let activeSlot = 0;
-    let firstContentEmitted = false;
-    for (const item of lines) {
-      if (!item || item.length !== 2) continue;
-      const kind = item[0];
-      const payload = item[1] as any;
-      let sid: number | null = null;
-      if (kind === 'p') {
-        sid = slotForLine(payload as string);
-      } else if (kind === 't') {
-        sid = tableSlot(payload as string[][]);
-      }
-      if (sid !== null && sid !== activeSlot && firstContentEmitted) {
-        out.push({ kind: 'r', slotId: activeSlot });
-        activeSlot = sid;
-      } else if (sid !== null && activeSlot === 0) {
-        activeSlot = sid;
-        firstContentEmitted = true;
-      } else if (sid === null && activeSlot === 0) {
-        activeSlot = 1;
-        firstContentEmitted = true;
-      }
-      if (kind === 'p') {
-        out.push({ kind: 'p', text: payload as string, slotId: activeSlot });
-      } else if (kind === 't') {
-        out.push({ kind: 't', rows: payload as string[][], slotId: activeSlot });
-      }
-    }
-    return out;
-  });
-
-  // Helper: detect "Label: Value" form for the brain-p-label rendering
-  function labelValueSplit(text: string): { label: string; value: string } | null {
-    const m = text.match(/^([A-Z][A-Za-z0-9 ()/\-.]+?):\s*(.*)$/);
-    if (!m) return null;
-    return { label: m[1], value: m[2] };
-  }
+  /** In-flight guard so rapid-fire calls (picker click, effect re-entry,
+   *  version jump, …) share a single backend round-trip instead of
+   *  stacking duplicate `/api/preview` requests. */
+  let previewInflight: Promise<void> | null = null;
+  let reviewDataInflight: Promise<void> | null = null;
 
   async function loadPreview(runId: string): Promise<void> {
-    const MAX_ATTEMPTS = 12;
-    const RETRY_DELAY_MS = 2000;
-    previewLoading = true;
-    previewError = null;
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    if (previewInflight) return previewInflight;
+    previewInflight = (async () => {
+      previewLoading = true;
+      previewAttempt = (previewAttempt || 0) + 1;
       try {
         const data = await getPreview(runId);
         await tick();
         previewData = data;
+        editableLines = data.lines || [];
+        if (typeof editorRef?.applyExternalContent === 'function') {
+          editorRef.applyExternalContent(editableLines);
+        }
         previewError = null;
-        previewLoading = false;
-        return;
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        const notReady = /not ready/i.test(msg);
-        if (notReady && attempt < MAX_ATTEMPTS) {
-          await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
-          continue;
-        }
-        previewError = 'Failed to load result: ' + msg;
-        previewData = null;
+        showPreviewErrorToast('Preview request failed: ' + msg);
+        previewAttempt = 0;
+      } finally {
         previewLoading = false;
-        return;
       }
-    }
+    })().finally(() => {
+      previewInflight = null;
+    });
+    return previewInflight;
   }
 
   // Stage 4 - load the version / audit / timeline state for a run.
@@ -188,48 +109,48 @@
   let viewingVersionNo = $state<number | null>(null);
 
   async function loadReviewData(runId: string): Promise<void> {
-    try {
-      const vs = await listVersions(runId);
+    if (reviewDataInflight) return reviewDataInflight;
+    reviewDataInflight = (async () => {
+      const [vsRes, evRes] = await Promise.allSettled([
+        listVersions(runId),
+        getAudit(runId)
+      ]);
+      const vs = vsRes.status === 'fulfilled' ? vsRes.value : [];
+      const events = evRes.status === 'fulfilled' ? evRes.value : [];
       versionsLoaded = vs;
       setVersions(vs);
-    } catch {
-      versionsLoaded = [];
-      setVersions([]);
-    }
-    try {
-      const events = await getAudit(runId);
       setReviewAudit(events);
-    } catch {
-      setReviewAudit([]);
-    }
-    const latest = versionsLoaded.length > 0
-      ? versionsLoaded[versionsLoaded.length - 1].version_no
-      : null;
-    viewingVersionNo = latest;
-    setCurrentVersionNo(latest);
+      const latest = vs.length > 0 ? vs[vs.length - 1].version_no : null;
+      viewingVersionNo = latest;
+      setCurrentVersionNo(latest);
+    })().finally(() => {
+      reviewDataInflight = null;
+    });
+    return reviewDataInflight;
   }
 
   async function onSelectVersion(no: number): Promise<void> {
     viewingVersionNo = no;
     setCurrentVersionNo(no);
-    if (!editorReadonly) {
-      editorReadonly = true;
-      editableLines = [];
-      baselineLines = [];
-      editRevision = 0;
-      savedRevision = 0;
-      changeSummary = '';
-    }
     try {
       const resp = await getVersion(activeRunId!, no);
       if (resp && Array.isArray(resp.lines_json)) {
         previewData = { lines: resp.lines_json };
+        editableLines = resp.lines_json;
+        if (typeof editorRef?.applyExternalContent === 'function') {
+          editorRef.applyExternalContent(editableLines);
+        }
+        // Editor is always editable; do not reset editRevision.
       }
     } catch {
       if (activeRunId) {
         try {
           const data = await getPreview(activeRunId);
           previewData = data;
+          editableLines = data.lines || [];
+          if (typeof editorRef?.applyExternalContent === 'function') {
+            editorRef.applyExternalContent(editableLines);
+          }
         } catch { /* keep current previewData */ }
       }
     }
@@ -250,6 +171,10 @@
       const resp = await getVersion(activeRunId, no);
       if (resp && Array.isArray(resp.lines_json)) {
         previewData = { lines: resp.lines_json };
+        editableLines = resp.lines_json;
+        if (typeof editorRef?.applyExternalContent === 'function') {
+          editorRef.applyExternalContent(editableLines);
+        }
       }
     } catch (e) {
       console.warn('jumpToVersion refresh failed', e);
@@ -259,17 +184,14 @@
   // Stage 5 - editable preview + state-machine actions.
 
   let editableLines = $state<PreviewLine[]>([]);
-  // `baselineLines` is the snapshot at which editableLines was last
-  // considered "saved" - either the initial open, or after a successful
-  // save/submit/approve/publish.
-  let baselineLines = $state<PreviewLine[]>([]);
   // `editRevision` increments every time the editor emits a change. Combined
   // with a saved-marker, this gives a robust dirty signal that's immune to
   // Svelte 5 reactive proxy / structuredClone quirks.
   let editRevision = $state(0);
   let savedRevision = $state(0);
   let editorDirty = $derived(editRevision !== savedRevision);
-  let editorReadonly = $state(true);
+  // Editor is always editable — no more `editorReadonly` gate.
+  let editorReadonly = false;
   // The editorRef is set via `bind:this` on the ReviewEditor component.
   // We only call `reset()`, `undo()`, `redo()` on it.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -293,11 +215,6 @@
     currentVersionEntry?.review_status ?? 'draft'
   );
 
-  function rebuildEditableFromPreview(): PreviewLine[] {
-    if (!previewData || !previewData.lines) return [];
-    return previewData.lines.slice();
-  }
-
   async function refreshAfterVersionMutation(): Promise<void> {
     if (!activeRunId) return;
     try {
@@ -309,11 +226,10 @@
     } catch (e) {
       console.warn('post-mutation refresh failed', e);
     }
-    // NOTE: previewData is NOT refreshed here. /api/preview reads
-    // runs.docx_path which stays pointing at the V0 pipeline docx
-    // until Publish repoints it; that overwrites the correct lines_json
-    // set by jumpToVersion. Each handler now drives the preview via
-    // jumpToVersion (DB-stored lines_json for the relevant version).
+    // NOTE: editableLines is NOT refreshed here. Each handler now drives
+    // the editor via jumpToVersion (DB-stored lines_json for the
+    // relevant version), which sets previewData, which (via reactive
+    // tracking in ReviewEditor) refreshes the editor's slot content.
   }
 
   /** Refresh the audit log only. Called when a comment is added or
@@ -348,8 +264,7 @@
         actor: actionReviewer.trim() || 'user'
       });
       changeSummary = '';
-      snapshotBaselineFromCurrent();
-      editorReadonly = true;
+      savedRevision = editRevision;
       successBanner = `Saved V${v.version_no}.`;
       await jumpToVersion(v.version_no);
       await refreshAfterVersionMutation();
@@ -372,8 +287,6 @@
         actionReviewer.trim() || 'user'
       );
       successBanner = `V${updated.version_no} is now In Review.`;
-      editorReadonly = true;
-      snapshotBaselineFromCurrent();
       await jumpToVersion(viewingVersionNo);
       await refreshAfterVersionMutation();
     } catch (e) {
@@ -396,7 +309,6 @@
       approveModalOpen = false;
       approveNote = '';
       successBanner = `V${updated.version_no} approved.`;
-      snapshotBaselineFromCurrent();
       await jumpToVersion(viewingVersionNo);
       await refreshAfterVersionMutation();
     } catch (e) {
@@ -423,7 +335,6 @@
       rejectModalOpen = false;
       rejectNote = '';
       successBanner = `V${updated.version_no} rejected — ready for revisions.`;
-      snapshotBaselineFromCurrent();
       await jumpToVersion(viewingVersionNo);
       await refreshAfterVersionMutation();
     } catch (e) {
@@ -449,7 +360,6 @@
         actionReviewer.trim() || 'user'
       );
       successBanner = `V${resp.version_no} published. Downloads are now enabled.`;
-      snapshotBaselineFromCurrent();
       await jumpToVersion(viewingVersionNo);
       await refreshAfterVersionMutation();
     } catch (e) {
@@ -459,62 +369,23 @@
     }
   }
 
+  /** Editor is always editable — no openEditor / cancelEditor / closeEditor. */
   function openEditor(): void {
-    try {
-      const fresh = rebuildEditableFromPreview();
-      const freshClone = clonePreviewLines(fresh);
-      editableLines = fresh;
-      baselineLines = freshClone;
-      editRevision = 0;
-      savedRevision = 0;
-      editorReadonly = false;
-      errorBanner = fresh.length === 0
-        ? 'Preview not loaded yet. Click the Edit button again in a moment.'
-        : null;
-      successBanner = null;
-      editorRef?.reset();
-    } catch (e) {
-      const m = e instanceof Error ? e.message : String(e);
-      errorBanner = `openEditor error: ${m}`;
-    }
+    // Keep as no-op for backwards compatibility with any external callers.
+    // The CKEditor 5 editor is mounted from frame one in Phase 1.
   }
 
   function cancelEditor(): void {
     changeSummary = '';
     editorRef?.reset();
-    editableLines = clonePreviewLines(baselineLines);
-    // Discarding edits clears the dirty signal so Save disables again.
     editRevision = 0;
     savedRevision = 0;
   }
 
-  /** Close the editor entirely: reset lines back to baseline, clear the
-   *  change-summary, and flip back to the read-only action bar for the
-   *  current version. Used by the "Close" button.
-   */
   function closeEditor(): void {
     cancelEditor();
-    editorReadonly = true;
     successBanner = null;
     errorBanner = null;
-  }
-
-  /** After a mutation that should treat current editableLines as the new
-   *  baseline (save/submit/approve/publish), call this so editorDirty goes
-   *  back to false. */
-  function snapshotBaselineFromCurrent(): void {
-    baselineLines = clonePreviewLines(editableLines);
-    savedRevision = editRevision;
-  }
-
-  // PreviewLine[] contains nested arrays (e.g. ['p','Type: HR Policy'],
-  // or ['t', rows: [ [cells: ['a','b']] ] ]). Svelte 5 reactive proxies wrap
-  // these arrays, which makes structuredClone throw
-  //   "Failed to execute 'structuredClone' on 'Window': [object Array] could not be cloned."
-  // JSON round-trip is safe because PreviewLine is plain data (no functions,
-  // no Date, no Map) and that limitation matches our editing model.
-  function clonePreviewLines(src: PreviewLine[]): PreviewLine[] {
-    return JSON.parse(JSON.stringify(src));
   }
 
   function onEditorChange(updated: PreviewLine[]): void {
@@ -559,22 +430,27 @@
   function doDownload(): void {
     const runId = activeRunId;
     if (!runId) return;
-    // Stage 6 - require a published version
-    if (currentStatus !== 'published') {
-      const msg =
-        currentStatus === 'approved'
-          ? 'Publish & Generate DOCX is required before download is enabled.'
-          : 'Download is only enabled after the version is approved and published.';
-      alert(msg);
+    // Allow download whenever a version exists for this run — the
+    // backend now resolves the .docx for the currently-viewing
+    // version on the fly (approved → build, published → serve cached).
+    // We still surface a friendly alert only when there is literally
+    // no version yet to download.
+    if (currentStatus === 'draft' && !viewingVersionNo) {
+      alert(
+        'Save your edits as a version before downloading. ' +
+        'Enter a change summary and click "Save Version".'
+      );
       return;
     }
     const sourceName = activeFilename;
     let customName: string | undefined;
     if (sourceName) {
       const stem = sourceName.replace(/\.[^/.]+$/, '');
-      customName = `${stem}.docx`;
+      const v = viewingVersionNo != null ? `_v${viewingVersionNo}` : '';
+      customName = `${stem}${v}.docx`;
     }
-    downloadDocx(runId, customName);
+    // Pass viewingVersionNo so the backend serves THIS version's .docx.
+    downloadDocx(runId, customName, viewingVersionNo);
     if (downloadBtn) downloadBtn.classList.add('hidden');
     if (downloadDoneBox) downloadDoneBox.classList.remove('hidden');
     const ts = document.getElementById('dl-timestamp');
@@ -594,11 +470,16 @@
     for (let i = 0; i < items.length; i++) {
       const entry = items[i];
       const stem = (entry.name || entry.runId || 'output').replace(/\.[^/.]+$/, '');
-      const filename = `${stem}_all_files.zip`;
+      // Backend now bundles every version's .docx and marks the one
+      // matching `viewingVersionNo` as `_CURRENT.docx` (the file the
+      // user is currently looking at). The zip also includes a
+      // `manifest.txt` enumerating every version + status.
+      const versionLabel = viewingVersionNo != null ? `v${viewingVersionNo}` : 'all';
+      const filename = `${stem}_${versionLabel}_files.zip`;
       if (downloadAllBtn) downloadAllBtn.textContent = `Downloading ${i + 1} / ${items.length}…`;
       try {
         // Stage 6 - backend gate returns 409 if not published. detect and record.
-        const blob = await fetchAllFilesBlob(entry.runId!);
+        const blob = await fetchAllFilesBlob(entry.runId!, viewingVersionNo);
         triggerBlobDownload(blob, filename);
         okCount += 1;
       } catch (e) {
@@ -610,13 +491,19 @@
     }
     if (downloadAllBtn) {
       downloadAllBtn.disabled = false;
-      downloadAllBtn.textContent = 'Download all files';
+      downloadAllBtn.textContent =
+        viewingVersionNo != null
+          ? `Download all files (current: v${viewingVersionNo})`
+          : 'Download all files';
     }
     if (downloadAllDoneBox) downloadAllDoneBox.classList.remove('hidden');
     const ts = document.getElementById('dl-all-timestamp');
     if (ts) {
       const summary = `DOWNLOADED ${okCount} / ${items.length}` + (failCount > 0 ? ` · ${failCount} FAILED` : '');
-      ts.textContent = `${summary} — ${new Date().toLocaleString()}`;
+      const note = viewingVersionNo != null
+        ? ` · current view v${viewingVersionNo} marked _CURRENT.docx`
+        : '';
+      ts.textContent = `${summary}${note} — ${new Date().toLocaleString()}`;
     }
     if (failures.length > 0) {
       console.warn('Download failures:', failures);
@@ -645,13 +532,6 @@
   function addAnotherFile(): void {
     onAddAnother();
   }
-
-  onMount(() => {
-    if (activeRunId) {
-      loadPreview(activeRunId);
-      refreshDownloadLabel();
-    }
-  });
 </script>
 
 <section class="step-pane">
@@ -678,60 +558,25 @@
     </select>
   </div>
 
-  <div id="slots-container" class="max-w-3xl mb-12">
+  <div id="slots-container" class="max-w-4xl mb-12">
     {#if previewLoading && !previewData}
       <p class="brain-p brain-marker">Loading preview…</p>
-    {:else if previewError}
-      <p class="brain-p brain-marker">{previewError}</p>
     {/if}
-    {#each taggedLines as line, i (i)}
-      {#if line.kind === 'r'}
-        <div class="brain-rule"></div>
-      {:else if line.kind === 'p' && line.text !== undefined}
-        {#if line.text === MARKER}
-          <p class="brain-p brain-marker">{line.text}</p>
-        {:else}
-          {@const lv = labelValueSplit(line.text)}
-          {#if lv}
-            <p class="brain-p">
-              <span class="brain-p-label">{lv.label}:</span>
-              {#if lv.value === MARKER}
-                {' '}<span class="brain-marker-inline">{lv.value}</span>
-              {:else}
-                {' '}{lv.value}
-              {/if}
-            </p>
-          {:else}
-            <p class="brain-p">{line.text}</p>
-          {/if}
-        {/if}
-      {:else if line.kind === 't' && line.rows}
-        <div class="brain-table-wrap">
-          <table class="brain-table">
-            {#if line.rows[0] && line.rows[0].length}
-              <thead>
-                <tr>
-                  {#each line.rows[0] as h, hi (hi)}
-                    <th>{h == null ? '' : String(h)}</th>
-                  {/each}
-                </tr>
-              </thead>
-            {/if}
-            {#if line.rows.length > 1}
-              <tbody>
-                {#each line.rows.slice(1) as r, ri (ri)}
-                  <tr>
-                    {#each r as c, ci (ci)}
-                      <td>{c == null ? '' : String(c)}</td>
-                    {/each}
-                  </tr>
-                {/each}
-              </tbody>
-            {/if}
-          </table>
-        </div>
-      {/if}
-    {/each}
+    <!-- Phase 1: editor is ALWAYS mounted. Errors do NOT blank the editor
+         — they surface as an inline toast that auto-dismisses. -->
+    <div class="ra-editor-wrap">
+      <ReviewEditor
+        bind:this={editorRef}
+        bind:lines={editableLines}
+        readonly={editorReadonly}
+        onChange={onEditorChange}
+      />
+    </div>
+    {#if previewError}
+      <div class="ra-banner ra-banner-error mono-underline mt-3" role="status">
+        {previewError}
+      </div>
+    {/if}
   </div>
 
   <!-- Stage 4 - workflow / version panels. -->
@@ -788,58 +633,45 @@
       </div>
 
       <div class="ra-actions">
-        {#if !editorReadonly}
-          <input
-            type="text"
-            class="ra-summary-input"
-            placeholder="Describe what changed in this version (required)"
-            bind:value={changeSummary}
-            maxlength="200"
-          />
-          <button
-            class="pill-btn"
-            onclick={onSaveVersion}
-            disabled={!editorDirty || !changeSummary.trim() || savingVersion}
-          >
-            {savingVersion ? 'Saving…' : 'Save as new version'}
-          </button>
-          <button class="pill-btn-ghost" onclick={cancelEditor} disabled={savingVersion}>
-            Discard edits
-          </button>
+        <input
+          type="text"
+          class="ra-summary-input"
+          placeholder="Describe what changed in this version (required)"
+          bind:value={changeSummary}
+          maxlength="200"
+        />
+        <button
+          class="pill-btn"
+          onclick={onSaveVersion}
+          disabled={!editorDirty || !changeSummary.trim() || savingVersion}
+        >
+          {savingVersion ? 'Saving…' : 'Save as new version'}
+        </button>
+        <button class="pill-btn-ghost" onclick={cancelEditor} disabled={savingVersion}>
+          Discard edits
+        </button>
+        <span class="ra-undo-group">
           <button
             class="pill-btn-ghost"
-            onclick={closeEditor}
+            onclick={() => editorRef?.undo?.()}
             disabled={savingVersion}
-            title="Close the editor (any unsaved edits are discarded)"
-          >
-            Close
-          </button>
-          <span class="ra-undo-group">
-            <button
-              class="pill-btn-ghost"
-              onclick={() => editorRef?.undo?.()}
-              disabled={savingVersion}
-              title="Undo (Ctrl+Z)"
-            >↶ Undo</button>
-            <button
-              class="pill-btn-ghost"
-              onclick={() => editorRef?.redo?.()}
-              disabled={savingVersion}
-              title="Redo (Ctrl+Y)"
-            >↷ Redo</button>
-          </span>
-        {:else if currentStatus === 'draft'}
-          <button class="pill-btn" onclick={openEditor}>Edit this version</button>
+            title="Undo (Ctrl+Z)"
+          >↶ Undo</button>
+          <button
+            class="pill-btn-ghost"
+            onclick={() => editorRef?.redo?.()}
+            disabled={savingVersion}
+            title="Redo (Ctrl+Y)"
+          >↷ Redo</button>
+        </span>
+
+        {#if currentStatus === 'draft' || currentStatus === 'rejected'}
           <button
             class="pill-btn"
             onclick={onSubmit}
             disabled={submitting}
           >
             {submitting ? 'Submitting…' : 'Submit for Review'}
-          </button>
-        {:else if currentStatus === 'rejected'}
-          <button class="pill-btn" onclick={openEditor}>
-            Edit & create a new version
           </button>
         {:else if currentStatus === 'in_review'}
           <button
@@ -875,22 +707,8 @@
           <span class="ra-banner ra-banner-success mono-underline">
             V{viewingVersionNo} is final. Editing creates V{(viewingVersionNo ?? 0) + 1} as a new draft.
           </span>
-          <button class="pill-btn" onclick={openEditor}>
-            Edit &amp; create a new version
-          </button>
         {/if}
       </div>
-
-      {#if !editorReadonly}
-        <div class="ra-editor-wrap">
-          <ReviewEditor
-            bind:this={editorRef}
-            bind:lines={editableLines}
-            readonly={false}
-            onChange={onEditorChange}
-          />
-        </div>
-      {/if}
     </div>
 
     {#if approveModalOpen}
@@ -1004,8 +822,10 @@
         disabled={versionsLoaded.length > 0 && currentStatus !== 'published'}
         title={versionsLoaded.length > 0 && currentStatus !== 'published'
           ? 'Publish approved version first.'
-          : ''}
-      >Download all files</button>
+          : `Download all versions — the one you're viewing (v${viewingVersionNo ?? '?'}) is marked _CURRENT in the zip.`}
+      >{versionsLoaded.length > 0 && viewingVersionNo != null
+          ? `Download all files (current: v${viewingVersionNo})`
+          : 'Download all files'}</button>
       <button class="pill-btn-ghost" onclick={goBack}>← Back</button>
       <button class="pill-btn-ghost" onclick={addAnotherFile}>Add Another File</button>
       <button class="pill-btn-ghost" onclick={resetAll}>Start Over</button>

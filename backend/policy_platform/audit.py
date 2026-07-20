@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 
 def new_run_id() -> str:
@@ -15,6 +15,84 @@ def new_run_id() -> str:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def attach_slot_diff(
+    sections: list[dict],
+    prev_lines_json: Optional[list],
+    new_lines_json: list,
+) -> None:
+    """Phase 6 — annotate each section dict with `before_text`, `after_text`,
+    and `changed: bool` comparing the previous version's lines_json to the
+    new one, bucketed by slot id.
+
+    Operates in-place on the provided `sections` list (the same list that
+    build_audit() emits). Skips silently when `prev_lines_json` is None
+    (initial run) or when slots have no editable content.
+    """
+    if prev_lines_json is None:
+        return
+    prev_by_slot = _bucket_lines_json_by_slot(prev_lines_json)
+    new_by_slot = _bucket_lines_json_by_slot(new_lines_json)
+    for sec in sections:
+        sid = sec.get('id')
+        if sid is None:
+            continue
+        before = prev_by_slot.get(int(sid), [])
+        after = new_by_slot.get(int(sid), [])
+        before_text = '\n'.join(before)
+        after_text = '\n'.join(after)
+        changed = before_text != after_text
+        sec['before_text'] = before_text
+        sec['after_text'] = after_text
+        sec['slot_changed'] = changed
+        sec['before_chars'] = len(before_text)
+        sec['after_chars'] = len(after_text)
+
+
+def _bucket_lines_json_by_slot(lines_json) -> dict[int, list[str]]:
+    """Bucket ['p', payload] / ['t', payload] lines by slot id (1..15) and
+    return {slot_id: [plain text lines]}. Slot id 0 (free paragraph) is
+    excluded so that any reviewer free-text appended above the slots doesn't
+    pollute the per-slot diff columns.
+    """
+    out: dict[int, list[str]] = {}
+    for raw in lines_json or []:
+        if not isinstance(raw, list) or len(raw) != 2:
+            continue
+        kind, payload = raw
+        if kind == 'p':
+            slot = 0
+            text = ''
+            if isinstance(payload, dict):
+                slot = int(payload.get('slot', 0) or 0)
+                text = str(payload.get('text') or '')
+            elif isinstance(payload, str):
+                text = payload
+            if not text or slot < 1 or slot > 15:
+                continue
+            out.setdefault(slot, []).append(text)
+        elif kind == 't':
+            slot = 0
+            rows = []
+            if isinstance(payload, dict):
+                slot = int(payload.get('slot', 0) or 0)
+                rows = payload.get('rows') or []
+            elif isinstance(payload, list):
+                rows = payload
+            if slot < 1 or slot > 15 or not rows:
+                continue
+            for row in rows:
+                cells = []
+                for cell in (row or []):
+                    text = ''
+                    if isinstance(cell, dict):
+                        text = str(cell.get('text') or '')
+                    else:
+                        text = '' if cell is None else str(cell)
+                    cells.append(text)
+                out.setdefault(slot, []).append(' / '.join(cells))
+    return out
 
 
 def build_audit(result: Any) -> dict:

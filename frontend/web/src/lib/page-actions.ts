@@ -115,7 +115,10 @@ export function renderSlots(data: PreviewData): void {
     const payload = item[1];
 
     if (kind === 'p') {
-      const text = payload as string;
+      const payloadRecord = payload as Record<string, unknown>;
+      const text = (typeof payloadRecord['text'] === 'string'
+        ? (payloadRecord['text'] as string)
+        : '') || (typeof payload === 'string' ? (payload as string) : '');
       const sid = slotForLine(text);
       if (sid !== null && sid !== activeSlot && activeSlot !== 0) {
         const div = document.createElement('div');
@@ -128,7 +131,9 @@ export function renderSlots(data: PreviewData): void {
       container.appendChild(buildLine(text));
       appendedCount += 1;
     } else if (kind === 't') {
-      const rows = payload as string[][];
+      const payloadRecord = payload as Record<string, unknown>;
+      const rowsRaw = payloadRecord['rows'];
+      const rows = (Array.isArray(rowsRaw) ? rowsRaw : payload) as unknown as string[][];
       const sid = tableSlot(rows);
       if (sid !== null && sid !== activeSlot && activeSlot !== 0) {
         const div = document.createElement('div');

@@ -35,7 +35,16 @@ class Embedder:
     Thread-safe; the underlying model is loaded at most once per process.
     """
 
-    def __init__(self, model_name: str = DEFAULT_MODEL_NAME, *, prefer_tfidf: bool = False) -> None:
+    def __init__(self, model_name: str = DEFAULT_MODEL_NAME, *, prefer_tfidf: bool = True) -> None:
+        """Default `prefer_tfidf=True` so the cold-start path doesn't
+        download/load the 80-MB sentence-transformers model on first
+        use. That download was the main reason Step 02 took ~60s on
+        the very first upload — TF-IDF + scikit-learn is already
+        installed and the model is loaded in <100ms.
+
+        Set `prefer_tfidf=False` (or env
+        `AGENTIC_POLICY_RAG_BACKEND=sentence-transformers`) to opt
+        back into the heavier backend."""
         self.model_name = model_name
         self._model = None
         self._backend: Optional[str] = None
@@ -43,7 +52,15 @@ class Embedder:
         self._tfidf_matrix = None
         self._tfidf_corpus: List[str] = []
         self._dim: Optional[int] = None
-        self._prefer_tfidf = prefer_tfidf
+        # Honor the env var so the heavy backend can still be turned
+        # back on for a single run without code changes.
+        backend_env = os.environ.get("AGENTIC_POLICY_RAG_BACKEND", "").strip().lower()
+        if backend_env in ("sentence-transformers", "minilm", "st"):
+            self._prefer_tfidf = False
+        elif backend_env in ("tfidf", "fast", "1"):
+            self._prefer_tfidf = True
+        else:
+            self._prefer_tfidf = prefer_tfidf
 
     @property
     def dim(self) -> int:

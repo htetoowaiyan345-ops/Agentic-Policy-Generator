@@ -205,6 +205,21 @@ def get_version(conn, run_id: str, version_no: int) -> dict | None:
     return d
 
 
+def get_previous_version(conn, run_id: str, version_no: int) -> dict | None:
+    """Return the immediately-prior version (`version_no - 1`) for diffing.
+
+    Phase 6 — used by `publish_to_brain.publish_approved_version` to
+    build a per-slot before/after audit xlsx.
+
+    Returns `None` when `version_no` is 1 or when the prior row does not
+    exist; callers should treat that as "no previous version" (the
+    diff rows will have empty `before_text` in that case).
+    """
+    if version_no is None or version_no <= 1:
+        return None
+    return get_version(conn, run_id, version_no - 1)
+
+
 def latest_published_version_no(conn, run_id: str) -> int | None:
     """Max version_no with review_status='published'. None if no published version."""
     row = conn.execute(

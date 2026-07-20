@@ -1,0 +1,61 @@
+
+> agentic-policy-frontend@2.0.0 dev
+> vite dev
+
+
+  [32m[1mVITE[22m v5.4.21[39m  [2mready in [0m[1m18120[22m[2m[0m ms[22m
+
+  [32m➜[39m  [1mLocal[22m:   [36mhttp://127.0.0.1:[1m5173[22m/[39m
+2:37:43 PM [vite-plugin-svelte] src/lib/Upload.svelte:119:2 Visible, non-interactive element `<div>` with a click event must be accompanied by a keyboard event handler. Consider whether an interactive element such as `<button type="button">` or `<a>` might be more appropriate
+https://svelte.dev/e/a11y_click_events_have_key_events
+2:37:44 PM [vite-plugin-svelte] src/lib/Upload.svelte:156:4 Visible, non-interactive element `<ul>` with a click event must be accompanied by a keyboard event handler. Consider whether an interactive element such as `<button type="button">` or `<a>` might be more appropriate
+https://svelte.dev/e/a11y_click_events_have_key_events
+2:37:44 PM [vite-plugin-svelte] src/lib/Upload.svelte:156:4 Non-interactive element `<ul>` should not be assigned mouse or keyboard event listeners
+https://svelte.dev/e/a11y_no_noninteractive_element_interactions
+2:37:44 PM [vite-plugin-svelte] src/lib/Upload.svelte:185:4 Visible, non-interactive element `<ul>` with a click event must be accompanied by a keyboard event handler. Consider whether an interactive element such as `<button type="button">` or `<a>` might be more appropriate
+https://svelte.dev/e/a11y_click_events_have_key_events
+2:37:44 PM [vite-plugin-svelte] src/lib/Upload.svelte:185:4 Non-interactive element `<ul>` should not be assigned mouse or keyboard event listeners
+https://svelte.dev/e/a11y_no_noninteractive_element_interactions
+2:37:44 PM [vite-plugin-svelte] src/lib/Header.svelte:10:5 '#' is not a valid href attribute
+https://svelte.dev/e/a11y_invalid_attribute
+2:37:44 PM [vite-plugin-svelte] src/lib/Header.svelte:13:6 '#' is not a valid href attribute
+https://svelte.dev/e/a11y_invalid_attribute
+[2m2:51:51 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/lib/CkEditor.svelte[22m
+[2m2:52:49 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/lib/CkEditor.svelte[22m
+[2m2:53:22 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/lib/CkEditor.svelte[22m
+[2m3:06:24 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/lib/EditorToolbar.svelte, /src/lib/EditorToolbar.svelte?svelte&type=style&lang.css[22m
+[2m3:08:55 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/lib/ReviewEditor.svelte, /src/lib/ReviewEditor.svelte?svelte&type=style&lang.css[22m
+[2m3:09:38 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/app.css[22m
+[2m3:10:20 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/client/nodes/0.js[22m
+[2m3:10:20 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/client/nodes/1.js[22m
+[2m3:10:20 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/client/nodes/2.js[22m
+[2m3:10:20 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/client/app.js[22m
+[2m3:10:20 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/client/matchers.js[22m
+[2m3:10:20 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/shared/error-template.js[22m
+[2m3:10:20 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/server/internal.js[22m
+[2m3:10:20 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/root.js[22m
+[2m3:10:35 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/client/nodes/0.js[22m
+[2m3:10:35 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/client/nodes/1.js[22m
+[2m3:10:35 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/client/nodes/2.js[22m
+[2m3:10:35 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/client/app.js[22m
+[2m3:10:35 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/client/matchers.js[22m
+[2m3:10:35 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/shared/error-template.js[22m
+[2m3:10:35 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/server/internal.js[22m
+[2m3:10:35 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/root.js[22m
+[2m3:10:59 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/client/nodes/0.js[22m
+[2m3:10:59 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/client/nodes/1.js[22m
+[2m3:10:59 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/client/nodes/2.js[22m
+[2m3:10:59 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/client/app.js[22m
+[2m3:10:59 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/client/matchers.js[22m
+[2m3:10:59 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/shared/error-template.js[22m
+[2m3:10:59 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/server/internal.js[22m
+[2m3:10:59 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2m.svelte-kit/generated/root.js[22m
+[2m3:10:59 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2mbuild/index.html[22m
+[2m3:11:00 PM[22m [36m[1m[vite][22m[39m [32mpage reload [39m[2mbuild/index.html[22m
+[2m3:42:52 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/lib/CkEditor.svelte[22m
+[2m3:43:12 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/lib/CkEditor.svelte[22m
+[2m3:43:22 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/lib/ReviewEditor.svelte[22m
+[2m3:45:40 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/app.css[22m
+[2m3:48:52 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/app.css[22m
+[2m3:49:32 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/app.css[22m
+[2m3:49:53 PM[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/lib/ReviewEditor.svelte?svelte&type=style&lang.css[22m

@@ -5,10 +5,12 @@ import json
 import uuid
 import threading
 import re
+import time
 import zipfile
 import io
+import collections
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from pathlib import Path
 
 # backend/api/server.py → backend/ (parent)
@@ -28,6 +30,100 @@ MAX_SIZE = 50 * 1024 * 1024
 
 CORS_METHODS = 'GET, POST, OPTIONS'
 CORS_HEADERS_ALLOWED = 'Content-Type, Accept'
+
+
+# ---------------------------------------------------------------------------
+# Phase 10 — preview-cache memoization
+#
+# `build_preview_from_docx` walks the published .docx via python-docx and
+# paragraph-normalises each one — a cold call costs ~2–3s, a warm call
+# ~25ms. We memoize the result keyed on (run_id, docx_path, docx_mtime) in
+# an LRU so that subsequent Step-03 opens for the same run are instant.
+#
+# Invalidation rules:
+#   * Cache entry is **invalidated** when the run's `docx_path` changes or
+#     when `runs.audit_json` is rewritten (Phase 6/8 hook).
+#   * TTL: 5 minutes. Even without explicit invalidation, the entry
+#     expires and gets rebuilt on the next request.
+#   * Size: max 64 entries — old ones evicted (LRU).
+# ---------------------------------------------------------------------------
+PREVIEW_CACHE_TTL_SEC = 5 * 60
+PREVIEW_CACHE_MAX = 64
+
+
+class PreviewCache:
+    """Thread-safe LRU cache for `/api/preview/<run_id>` responses.
+
+    Each entry is `(value, expire_at_ts, signature_str)` where
+    `signature_str` is the (docx_path, docx_mtime, audit_json_len) tuple
+    stringified — used to detect stale entries without DB read."""
+
+    def __init__(self) -> None:
+        self._data: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _signature(run: dict) -> tuple:
+        """Identify the run's current preview source. Returns
+        `(docx_path, mtime, audit_json_signature)`."""
+        docx_path = run.get('docx_path') or ''
+        mtime = 0
+        try:
+            if docx_path:
+                mtime = int(Path(docx_path).stat().st_mtime)
+        except Exception:
+            pass
+        audit = run.get('audit_json') or ''
+        # Truncate the audit; we only care whether it changed substantially.
+        return (docx_path, mtime, len(audit))
+
+    def get(self, run_id: str, sig: tuple) -> "tuple | None":
+        """Return cached `{'lines': [...]}` value or None on miss."""
+        key = (run_id, sig)
+        with self._lock:
+            entry = self._data.get(key)
+            if entry is None:
+                return None
+            value, expire_at = entry
+            if time.time() >= expire_at:
+                self._data.pop(key, None)
+                return None
+            # LRU touch
+            self._data.move_to_end(key)
+            return value
+
+    def put(self, run_id: str, sig: tuple, value) -> None:
+        key = (run_id, sig)
+        with self._lock:
+            # Evict oldest if we're at capacity.
+            while len(self._data) >= PREVIEW_CACHE_MAX:
+                self._data.popitem(last=False)
+            self._data[key] = (value, time.time() + PREVIEW_CACHE_TTL_SEC)
+            self._data.move_to_end(key)
+
+    def invalidate(self, run_id: str) -> None:
+        """Drop all cache entries for a given run_id. Called when the
+        run's docx_path or audit_json changes (publish, save, regenerate)."""
+        with self._lock:
+            keys_to_drop = [k for k in self._data if k[0] == run_id]
+            for k in keys_to_drop:
+                self._data.pop(k, None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+
+
+_preview_cache = PreviewCache()
+
+
+def invalidate_preview_cache(run_id: str) -> None:
+    """Drop the preview cache for `run_id`. Called from save/publish
+    handlers whenever the underlying .docx (or audit_json) changes."""
+    try:
+        _preview_cache.invalidate(run_id)
+    except Exception:
+        pass
 
 
 def cors_headers(handler):
@@ -275,12 +371,90 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_download(self, run_id):
         try:
+            from urllib.parse import parse_qs, urlparse
             run = db.get_run(run_id)
             if not run or not run.get('docx_path'):
                 return send_json(self, {'error': 'no docx'}, status=404)
-            # Stage 6 - require a published version before download.
+
+            # Optional `version_no` query param — when provided, serve
+            # THAT specific version's .docx instead of the run's main
+            # docx_path. Lets the user download the currently-viewing
+            # version directly without having to publish first.
+            #
+            # - If the version is published and the per-version file
+            #   exists on disk, serve it directly.
+            # - If the version is approved but not yet published, build
+            #   the .docx on the fly from that version's lines_json.
+            # - Otherwise fall back to `runs.docx_path` (latest).
+            qs = parse_qs(urlparse(self.path).query)
+            raw_no = (qs.get('version_no') or qs.get('version') or [None])[0]
+            try:
+                requested_no = int(raw_no) if raw_no is not None else None
+            except (TypeError, ValueError):
+                requested_no = None
+
             with db._conn() as c:
                 published_no = versions_io.latest_published_version_no(c, run_id)
+                if requested_no is not None:
+                    ver = versions_io.get_version(c, run_id, requested_no)
+                    if ver:
+                        status_v = ver.get('review_status')
+                        # Prefer per-version file on disk if it exists.
+                        per_version = (
+                            RUNS_DIR
+                            / run_id
+                            / f'{run_id}_approved_v{requested_no}.docx'
+                        )
+                        if status_v == 'published' and per_version.exists():
+                            send_file(
+                                self,
+                                str(per_version),
+                                'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                                download_name=f'Policy_Output_v{requested_no}.docx',
+                            )
+                            return
+                        # Approved but not yet published → build on the fly
+                        # so the user can download their edited .docx
+                        # immediately after approval without an explicit
+                        # publish step.
+                        if status_v == 'approved':
+                            try:
+                                from policy_platform.pipeline import run_from_lines_json
+                                from api.lines_json_extractor import normalise_lines_json
+                                from api.docx_approved_export import _apply_header_footer
+                                tmp_out = RUNS_DIR / run_id / f'{run_id}_approved_v{requested_no}_preview.docx'
+                                run_from_lines_json(
+                                    lines_json=normalise_lines_json(ver.get('lines_json') or []),
+                                    output_path=tmp_out,
+                                    run_id=run_id,
+                                    document_name=f'{run_id}_v{requested_no}_preview',
+                                    fail_on_validation=False,
+                                )
+                                # Phase 8 — apply the Word-style header /
+                                # footer (strip brackets, preserve logo,
+                                # add page X of Y) so the on-the-fly
+                                # download matches what publish produces.
+                                try:
+                                    from docx import Document as _Doc2
+                                    doc2 = _Doc2(str(tmp_out))
+                                    _apply_header_footer(
+                                        doc2,
+                                        ver.get('lines_json') or [],
+                                    )
+                                    doc2.save(str(tmp_out))
+                                except Exception as ee:
+                                    print(f'[handle_download] header/footer apply failed: {ee}', flush=True)
+                                send_file(
+                                    self,
+                                    str(tmp_out),
+                                    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                                    download_name=f'Policy_Output_v{requested_no}.docx',
+                                )
+                                return
+                            except Exception as e:
+                                print(f'[handle_download] on-the-fly build failed: {e}', flush=True)
+                                import traceback; traceback.print_exc()
+
             if published_no is None:
                 return send_json(
                     self,
@@ -294,47 +468,176 @@ class Handler(BaseHTTPRequestHandler):
                     },
                     status=409,
                 )
-            send_file(self, run['docx_path'], 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', download_name='Policy_Output.docx')
+            send_file(
+                self,
+                run['docx_path'],
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                download_name='Policy_Output.docx',
+            )
         except Exception as e:
             send_json(self, {'error': f'download: {e}'}, status=500)
 
     def handle_download_all(self, run_id):
-        """Bundle every file produced for this run (source + docx) into
-        a single zip and stream it to the browser.
+        """Bundle every version's `.docx` from this run into a single
+        zip and stream it to the browser.
 
-        Looks at the run's directory (`data/runs/<run_id>/`) and adds
-        every regular file under it. The zip is named
-        `<run_id>_all_files.zip`.
+        Per the user's spec ("Download all files — each file's currently
+        viewing version"):
+          - NO source file is bundled. The run's original upload is
+            excluded unconditionally (the user must not get the source
+            back via this endpoint).
+          - ALL versions that appear in the Result dropdown are bundled:
+            one `.docx` per `policy_versions` row. Versions that already
+            have a per-version `<run_id>_approved_v<n>.docx` on disk are
+            added as-is. Approved-but-not-published versions are built
+            on the fly from their `lines_json` and bundled. Draft /
+            in-review / rejected versions with no `.docx` are skipped
+            but noted in `manifest.txt`.
+          - The version the user is CURRENTLY VIEWING (passed by the
+            frontend as the `version_no` query param, matching the
+            Result dropdown selection) is marked with `_CURRENT.docx`
+            suffix and listed first inside the zip. A `manifest.txt`
+            summarises every entry with version + status + current flag.
+
+        Zip filename: `<run_id>_all_v<N>.zip` where N is the
+        currently-viewing version (or `_all.zip` when none was passed).
         """
         try:
             run_dir = RUNS_DIR / run_id
             if not run_dir.exists():
                 return send_json(self, {'error': 'run not found'}, status=404)
-            # Stage 6 - require a published version before all-files download.
+            # Allow download once at least one version exists (any status).
             with db._conn() as c:
-                published_no = versions_io.latest_published_version_no(c, run_id)
-            if published_no is None:
+                versions = versions_io.get_versions(c, run_id)
+                latest_pub = versions_io.latest_published_version_no(c, run_id)
+            if not versions:
                 return send_json(
                     self,
                     {
-                        'error': 'no_published_version',
+                        'error': 'no_versions',
+                        'message': 'No versions exist for this run yet.',
+                    },
+                    status=404,
+                )
+
+            # Parse `version_no` from the query string. When the
+            # frontend doesn't send one, fall back to the latest
+            # published version (or the highest-numbered version).
+            qs = parse_qs(urlparse(self.path).query)
+            raw_no = (qs.get('version_no') or qs.get('version') or [None])[0]
+            try:
+                requested_no = int(raw_no) if raw_no is not None else None
+            except (TypeError, ValueError):
+                requested_no = None
+            if requested_no is None:
+                requested_no = latest_pub if latest_pub is not None else max(
+                    v.get('version_no', 0) for v in versions
+                )
+
+            files_to_zip: list[tuple[Path, str]] = []
+            manifest_lines: list[str] = []
+            # Sort versions ascending; build on-the-fly for missing ones.
+            for v in sorted(versions, key=lambda x: x.get('version_no', 0)):
+                vno = int(v.get('version_no') or 0)
+                status_v = v.get('review_status') or 'draft'
+                is_current = (vno == requested_no)
+                current_tag = '_CURRENT' if is_current else ''
+
+                # 1. Prefer per-version file already on disk.
+                per_version_main = run_dir / f'{run_id}_approved_v{vno}.docx'
+                per_version_preview = run_dir / f'{run_id}_approved_v{vno}_preview.docx'
+                chosen_path: Path | None = None
+                if per_version_main.exists():
+                    chosen_path = per_version_main
+                elif per_version_preview.exists():
+                    chosen_path = per_version_preview
+                else:
+                    # 2. Build on-the-fly if approved/published but no file.
+                    if status_v in ('approved', 'published'):
+                        try:
+                            from policy_platform.pipeline import run_from_lines_json
+                            from api.lines_json_extractor import normalise_lines_json
+                            from api.docx_approved_export import _apply_header_footer
+                            tmp_out = per_version_preview
+                            run_from_lines_json(
+                                lines_json=normalise_lines_json(v.get('lines_json') or []),
+                                output_path=tmp_out,
+                                run_id=run_id,
+                                document_name=f'{run_id}_v{vno}_preview',
+                                fail_on_validation=False,
+                            )
+                            try:
+                                from docx import Document as _Doc2
+                                doc2 = _Doc2(str(tmp_out))
+                                _apply_header_footer(
+                                    doc2, v.get('lines_json') or [],
+                                )
+                                doc2.save(str(tmp_out))
+                            except Exception as ee:
+                                print(f'[handle_download_all] header/footer apply failed: {ee}', flush=True)
+                            chosen_path = tmp_out
+                        except Exception as e:
+                            print(f'[handle_download_all] on-the-fly build for v{vno} failed: {e}', flush=True)
+
+                if chosen_path is None:
+                    manifest_lines.append(
+                        f'v{vno}\t{status_v}\t(no .docx generated — skipped)'
+                    )
+                    continue
+
+                arcname = f'v{vno}_{status_v}{current_tag}.docx'
+                files_to_zip.append((chosen_path, arcname))
+                marker = ' [CURRENT VIEW]' if is_current else ''
+                manifest_lines.append(
+                    f'v{vno}\t{status_v}\t{arcname}{marker}'
+                )
+
+            if not files_to_zip:
+                return send_json(
+                    self,
+                    {
+                        'error': 'no_docx_available',
                         'message': (
-                            'No published version. Approve a version, then click '
-                            'Publish & Generate DOCX to enable download.'
+                            'No .docx output is available for any version '
+                            'in this run. Approve and publish at least one '
+                            'version first.'
                         ),
                     },
-                    status=409,
+                    status=404,
                 )
+
+            # Source file is EXPLICITLY excluded — see header docstring.
+            # Do not add any path matching `source.*` to files_to_zip.
+
+            # Re-order: CURRENT entry first, rest in version order.
+            files_to_zip.sort(
+                key=lambda t: (not t[1].endswith('_CURRENT.docx'), t[1])
+            )
+
+            # Build manifest header.
+            manifest_header = (
+                f'Run: {run_id}\n'
+                f'Current view version: v{requested_no}\n'
+                f'Generated: {time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}\n'
+                f'Entries ({len(files_to_zip)}):\n'
+            )
+            manifest_text = manifest_header + '\n'.join(manifest_lines) + '\n'
+
+            zip_name = f'{run_id}_all_v{requested_no}.zip'
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for p in sorted(run_dir.iterdir()):
-                    if p.is_file():
-                        zf.write(p, arcname=p.name)
+                # Manifest goes FIRST so users see it on extraction.
+                zf.writestr('manifest.txt', manifest_text)
+                for src, arcname in files_to_zip:
+                    zf.write(src, arcname=arcname)
             data = buf.getvalue()
             self.send_response(200)
             self.send_header('Content-Type', 'application/zip')
             self.send_header('Content-Length', str(len(data)))
-            self.send_header('Content-Disposition', f'attachment; filename="{run_id}_all_files.zip"')
+            self.send_header(
+                'Content-Disposition',
+                f'attachment; filename="{zip_name}"',
+            )
             for k, v in cors_headers(self).items():
                 self.send_header(k, v)
             self.end_headers()
@@ -347,7 +650,11 @@ class Handler(BaseHTTPRequestHandler):
         into the 15 slots. This guarantees the web preview matches the
         docx output 1:1 (the audit 'sections' field is built from the
         analyzer's pre-render state, which can differ slightly from what
-        was actually written to the docx)."""
+        was actually written to the docx).
+
+        Phase 10: result is memoized in a thread-safe LRU keyed by
+        `(run_id, docx_path, docx_mtime, audit_json_len)`. Cold backend
+        first-call: ~2-3s. Warm: <5ms."""
         try:
             run = db.get_run(run_id)
             if not run:
@@ -357,8 +664,14 @@ class Handler(BaseHTTPRequestHandler):
             docx_path = run.get('docx_path')
             if not docx_path or not Path(docx_path).exists():
                 return send_json(self, {'error': 'no docx on disk'}, status=404)
+            sig = PreviewCache._signature(run)
+            cached = _preview_cache.get(run_id, sig)
+            if cached is not None:
+                send_json(self, cached)
+                return
             from api.api_preview import build_preview_from_docx
             data = build_preview_from_docx(docx_path)
+            _preview_cache.put(run_id, sig, data)
             send_json(self, data)
         except Exception as e:
             import traceback
@@ -491,6 +804,9 @@ class Handler(BaseHTTPRequestHandler):
                 new_v = versions_io.save_version(
                     c, run_id, lines_json_str, change_summary, actor
                 )
+            # Phase 10 — drop the preview cache for this run. The next
+            # /api/preview request will rebuild from the current .docx.
+            invalidate_preview_cache(run_id)
             send_json(self, new_v)
         except Exception as e:
             send_json(self, {'error': f'version_save: {e}'}, status=500)
@@ -650,6 +966,9 @@ class Handler(BaseHTTPRequestHandler):
                         {'error': 'publish failed (brain verify or docx build)'},
                         status=500,
                     )
+            # Phase 10 — published docx path changed, drop the preview cache
+            # so the next /api/preview returns the brand-new content.
+            invalidate_preview_cache(run_id)
             send_json(self, {
                 'version_no': updated['version_no'],
                 'review_status': updated['review_status'],

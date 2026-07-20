@@ -99,8 +99,8 @@ input, select, textarea {
   line-height: 1.55;
   text-justify: inter-word;
   -webkit-hyphens: auto;
-  hyphens: auto;
 }
+.re-preview-attempt { display: none; }
 .brain-p-label { color: rgba(17, 17, 17, 0.55); font-size: 14px; }
 .brain-marker { color: var(--accent); font-style: italic; }
 .brain-marker-inline { color: var(--accent); font-style: italic; }
@@ -480,3 +480,359 @@ input, select, textarea {
 
 /* misc */
 .text-\[\] { /* no-op */ }
+
+/* ===========================================================================
+   Stage 8 - WORD-STYLE HEADER / FOOTER + MIRRORED PAGE (CKEditor 5)
+
+   Mirrors the published .docx:
+     - ONE CKEditor 5 (DecoupledEditor) covering the full document.
+     - ONE Word-style toolbar at the top, sticky until the editor
+       surface scrolls off-screen (see `position: sticky` below).
+     - Body: `.ck-content` paragraphs match the .docx paragraphs 1:1.
+     - NO slot labels anywhere. NO data-slot pseudo-elements.
+   =========================================================================== */
+
+/* CKEditor 5 mounts a `.ck.ck-editor` root with `.ck-toolbar` and
+   `.ck-content`. The toolbar is rendered into `.ck-host-toolbar` via
+   `DecoupledEditor.create()` and that host is the element we make
+   sticky. The toolbar follows scroll until the editable area scrolls
+   off-screen, then unsticks naturally — see `position: sticky` below. */
+.re-document .ck-host-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--cream);
+  /* White-space buffer between the sticky toolbar and the editable
+     text field below it. The toolbar floats over the document; this
+     padding keeps the first line of text from sitting flush against
+     the toolbar's bottom border. */
+  padding-bottom: 20px;
+}
+.re-document .ck-host-toolbar:empty {
+  display: none;
+}
+
+/* Single document frame: the unified CkEditor mounts directly into
+   .re-document; .re-doc-frame is gone with TipTap — CKEditor 5 owns
+   the inner surface (`.ck-content`). Header / Footer rules live inside
+   ReviewEditor.svelte (component-scoped) and override defaults where
+   applicable. */
+.re-document .re-doc-body { background: #fff; }
+
+/* Surface (CKEditor 5's `.ck-content`) ------------------- */
+.re-document .re-doc-body .ck.ck-editor {
+  width: 100%;
+  background: #fff;
+}
+.re-document .re-doc-body .ck-editor__main {
+  min-height: 50vh;
+}
+.re-document .re-doc-body .ck.ck-content {
+  outline: none;
+  min-height: 50vh;
+  background: #fff;
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.6;
+}
+.re-document .re-doc-body .ck.ck-content:focus,
+.re-document .re-doc-body .ck.ck-content:focus-within {
+  outline: none;
+}
+
+/* Make sure ALL inline / block content sits flush and tidy in the body */
+.re-document .re-doc-body .ck-content p,
+.re-document .re-doc-body .ck-content h1,
+.re-document .re-doc-body .ck-content h2,
+.re-document .re-doc-body .ck-content h3,
+.re-document .re-doc-body .ck-content li,
+.re-document .re-doc-body .ck-content blockquote {
+  position: static;
+}
+
+/* ============================================================================
+   Editor body styles — plain editable document surface.
+
+   The single unified editor (ReviewEditor) renders paragraphs without any
+   brain-faithful classification classes. Spacing / line-height / page-frame
+   rules match today; the Word-style toolbar can still apply bold, headings,
+   lists, tables, etc. on top.
+   ========================================================================= */
+
+/* Slot bar — black horizontal rule below each non-zero slot.
+   The rule rides on an empty `<p data-slot-bar="bottom">` placeholder
+   paragraph injected by `ReviewEditor.buildUnifiedInitialHtml` at the
+   boundary between adjacent slots. CKEditor 5's `GeneralHtmlSupport`
+   preserves the `data-slot` / `data-slot-bar` attributes through
+   `setData`. `htmlToLines` filters them out before persisting to
+   `lines_json`. The bar is editable: click + select + backspace + delete
+   in the CKEditor 5 editor. */
+.re-document .re-doc-body .ck-content p[data-slot-bar="bottom"] {
+  border: 0;
+  border-bottom: 2px solid #000;
+  height: 2px;
+  min-height: 2px;
+  margin: 10px 0;
+  padding: 0;
+  cursor: pointer;
+}
+.re-document .re-doc-body .ck-content p[data-slot-bar="bottom"]:hover {
+  border-bottom-color: var(--accent);
+}
+.re-document .re-doc-body .ck-content p[data-slot-bar="bottom"].ck-widget_selected {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Slot spacer — white-space-only paragraph emitted between sections
+   that should NOT show a black bar. Adds 10 px white space above and
+   below with no visible rule. */
+.re-document .re-doc-body .ck-content p[data-slot-bar="space"] {
+  border: 0;
+  height: 0;
+  min-height: 0;
+  margin: 10px 0;
+  padding: 0;
+  cursor: default;
+}
+
+/* Functional-area bar — same visual as `bottom` bars: 2px solid black
+   rule with 10 px white space above and below. Emitted explicitly after
+   the `Functional Area(s):` metadata paragraph. */
+.re-document .re-doc-body .ck-content p[data-slot-bar="functional-area"] {
+  border: 0;
+  border-bottom: 2px solid #000;
+  height: 2px;
+  min-height: 2px;
+  margin: 10px 0;
+  padding: 0;
+  cursor: pointer;
+}
+.re-document .re-doc-body .ck-content p[data-slot-bar="functional-area"]:hover {
+  border-bottom-color: var(--accent);
+}
+.re-document .re-doc-body .ck-content p[data-slot-bar="functional-area"].ck-widget_selected {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Phase 1.5 keeps the legacy card chrome available for stories/tests. */
+/* Slot card (legacy / unused in CKEditor 5 path) --------------- */
+.slot-editor {
+  border: 1px solid var(--ink);
+  background: #fff;
+  margin-bottom: 14px;
+  padding: 12px 14px 16px 14px;
+  font-family: var(--sans);
+  font-size: 13px;
+  color: var(--ink);
+  position: relative;
+}
+.slot-editor[data-slot="0"] { border-style: dashed; }
+
+/* Header (slot label + description) -------------------------------- */
+.slot-editor-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.slot-editor-label {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.slot-editor-id {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.slot-editor-name {
+  font-family: var(--sans);
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--ink);
+}
+.slot-editor-description {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 500;
+  color: var(--ink);
+  opacity: 0.6;
+}
+.tb-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 4px;
+  border-right: 1px solid rgba(17, 17, 17, 0.18);
+}
+.tb-group:last-child { border-right: 0; }
+.tb-btn {
+  min-width: 26px;
+  min-height: 26px;
+  padding: 2px 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--ink);
+  border-radius: 0;
+}
+.tb-btn:hover {
+  background: var(--ink);
+  color: #fff;
+}
+.tb-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.tb-btn.tb-active {
+  background: var(--ink);
+  color: #fff;
+  border-color: var(--ink);
+}
+.tb-select {
+  padding: 3px 6px;
+  border: 1px solid var(--ink);
+  background: #fff;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--ink);
+  border-radius: 0;
+}
+.tb-select-narrow { width: 56px; }
+.tb-color {
+  width: 28px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--ink);
+  background: #fff;
+  cursor: pointer;
+}
+
+/* Editor surface (CKEditor 5 .ck-content) ----------------------- */
+/* Legacy `.slot-editor-surface` selectors kept harmless for tests. */
+.slot-editor-surface {
+  border: 1px dashed rgba(17, 17, 17, 0.35);
+  background: #fff;
+  min-height: 80px;
+  padding: 14px 16px;
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--ink);
+}
+.slot-editor-surface.is-active { border-style: solid; }
+/* No `.ProseMirror` children — TipTap was retired. */
+
+/* Markup viewer (CKEditor 5 path uses `.re-markup` in ReviewEditor) - */
+.slot-editor-markup {
+  margin-bottom: 8px;
+  border: 1px dashed rgba(17, 17, 17, 0.25);
+  background: rgba(17, 17, 17, 0.03);
+  padding: 6px 10px;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.slot-editor-markup summary { cursor: pointer; }
+.slot-editor-markup pre { white-space: pre-wrap; margin: 6px 0 0; }
+
+/* Fullscreen ------------------------------------------------------ */
+/* Legacy `.slot-fullscreen` kept harmless for tests. */
+.slot-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: #fff;
+  margin: 0;
+  overflow: auto;
+  padding: 32px;
+}
+/* CKEditor 5 path uses `.re-fullscreen` defined in ReviewEditor.svelte. */
+
+/* Find / Replace modal ------------------------------------------- */
+.fr-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(17, 17, 17, 0.32);
+  z-index: 9998;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.fr-modal {
+  background: #fff;
+  border: 1px solid var(--ink);
+  padding: 18px 20px 20px;
+  width: 380px;
+  max-width: 95vw;
+  font-family: var(--sans);
+  color: var(--ink);
+  box-shadow: 0 6px 24px rgba(17, 17, 17, 0.18);
+}
+.fr-header {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  margin-bottom: 12px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--ink);
+}
+.fr-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-family: var(--sans);
+  font-size: 13px;
+}
+.fr-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.fr-label {
+  width: 64px;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: rgba(17, 17, 17, 0.7);
+}
+.fr-input {
+  flex: 1;
+  font-family: var(--sans);
+  font-size: 13px;
+  padding: 6px 8px;
+  border: 1px solid var(--ink);
+  background: #fff;
+  color: var(--ink);
+}
+.fr-count {
+  margin: 8px 0 12px;
+  color: rgba(17, 17, 17, 0.65);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.fr-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}

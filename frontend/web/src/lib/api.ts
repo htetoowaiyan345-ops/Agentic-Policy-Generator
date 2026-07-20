@@ -105,8 +105,12 @@ export async function fetchDocxBlob(runId: string): Promise<Blob> {
   return await res.blob();
 }
 
-export async function fetchAllFilesBlob(runId: string): Promise<Blob> {
-  const url = `${API_BASE}/download/${runId}/all`;
+export async function fetchAllFilesBlob(runId: string, versionNo?: number | null): Promise<Blob> {
+  // Scope the bundle to ONE version of the run — the version selected
+  // in the editor's version dropdown (passed as `versionNo`). When
+  // omitted, the backend falls back to the latest published version.
+  const qs = versionNo != null ? `?version_no=${encodeURIComponent(String(versionNo))}` : '';
+  const url = `${API_BASE}/download/${runId}/all${qs}`;
   const res = await safeFetch(url);
   if (!res.ok) throw new Error(`Download failed (${res.status})`);
   return await res.blob();
@@ -114,9 +118,11 @@ export async function fetchAllFilesBlob(runId: string): Promise<Blob> {
 
 export async function downloadDocx(
   runId: string,
-  customFilename?: string
+  customFilename?: string,
+  versionNo?: number | null
 ): Promise<void> {
-  const url = `${API_BASE}/download/${runId}/docx`;
+  const qs = versionNo != null ? `?version_no=${encodeURIComponent(String(versionNo))}` : '';
+  const url = `${API_BASE}/download/${runId}/docx${qs}`;
   try {
     const res = await safeFetch(url);
     if (!res.ok) throw new Error(`Download failed (${res.status})`);

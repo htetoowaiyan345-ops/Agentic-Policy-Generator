@@ -245,7 +245,18 @@
 
       try {
         const s = await getStatus(entry.runId!);
-        if (s && (typeof s.sections_filled === 'number' || s.state === 'done')) {
+        // `currentRunLastProgress` is the "real progress" timestamp —
+        // bumped only when the pipeline reports a state change, not on
+        // every poll. Otherwise stuck polling resets the timer forever.
+        // We treat `done`, `failed`, `failed_timeout` as terminal: the
+        // poll succeeded, no more progress is needed, so we DO update
+        // the timestamp (so stuckTimer doesn't double-fire).
+        const terminal =
+          s.state === 'done' ||
+          s.state === 'failed' ||
+          s.state === 'failed_timeout';
+        const realProgress = terminal || (s.sections_filled ?? 0) > 0;
+        if (s && realProgress) {
           currentRunLastProgress = Date.now();
         }
         if (skipRequested) {
@@ -264,9 +275,14 @@
           entry.markers_count = s.markers_count || 0;
           renderChips();
           advanceBatch('done');
-        } else if (s.state === 'failed') {
+        } else if (s.state === 'failed' || s.state === 'failed_timeout') {
+          // Phase 11 — recognise `failed_timeout` so the user sees a
+          // proper failure rather than a stalled spinner.
           entry.status = 'failed';
-          entry.reason = s.message || 'pipeline failed';
+          entry.reason =
+            s.state === 'failed_timeout'
+              ? (s.message || 'pipeline exceeded time budget')
+              : (s.message || 'pipeline failed');
           renderChips();
           advanceBatch('pipeline-failed');
         }
@@ -352,6 +368,18 @@
     }
 
     populateResultsPicker();
+    warmPreviewCacheForFirstDone();
+  }
+
+  /** Fire-and-forget cache warm: hit `/api/preview/<run_id>` once after
+   *  Step 02 finishes so Phase 10's server-side cache is populated. When
+   *  the user clicks "Review →", `Review.svelte`'s `loadPreview` resolves
+   *  in <30 ms (warm) instead of 2 s (cold). Errors are swallowed — this
+   *  is purely an optimisation. */
+  function warmPreviewCacheForFirstDone(): void {
+    const first = batch.find((b) => b.status === 'done' && b.runId);
+    if (!first || !first.runId) return;
+    getPreview(first.runId).catch(() => { /* no-op */ });
   }
 
   function populateResultsPicker(): void {
