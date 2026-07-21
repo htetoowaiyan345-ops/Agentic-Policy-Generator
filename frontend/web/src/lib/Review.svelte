@@ -2,6 +2,7 @@
   import { tick } from 'svelte';
   import {
     appState,
+    currentUser,
     setActiveRun,
     setVersions,
     setCurrentVersionNo,
@@ -12,6 +13,7 @@
     downloadDocx,
     fetchDocxBlob,
     fetchAllFilesBlob,
+    fetchAllFilesZip,
     triggerBlobDownload,
     listVersions,
     getVersion,
@@ -107,6 +109,11 @@
   // Stage 4 - load the version / audit / timeline state for a run.
   let versionsLoaded = $state<VersionEntry[]>([]);
   let viewingVersionNo = $state<number | null>(null);
+  // Per-file currently-viewing version. Updated whenever the user
+  // selects a version in the timeline (see onSelectVersion). Used by
+  // "Download all files" to bundle each file's currently-viewing
+  // version's .docx (not just the active file's).
+  let viewingVersionByRunId = $state<Map<string, number>>(new Map());
 
   async function loadReviewData(runId: string): Promise<void> {
     if (reviewDataInflight) return reviewDataInflight;
@@ -123,6 +130,14 @@
       const latest = vs.length > 0 ? vs[vs.length - 1].version_no : null;
       viewingVersionNo = latest;
       setCurrentVersionNo(latest);
+      if (latest != null) {
+        // Remember the initial current view per file so "Download all
+        // files" can use the right version for each run.
+        viewingVersionByRunId = new Map(viewingVersionByRunId).set(
+          runId,
+          latest
+        );
+      }
     })().finally(() => {
       reviewDataInflight = null;
     });
@@ -132,6 +147,15 @@
   async function onSelectVersion(no: number): Promise<void> {
     viewingVersionNo = no;
     setCurrentVersionNo(no);
+    if (activeRunId) {
+      // Record per-file current view version so "Download all files"
+      // bundles each file's currently-viewing version's .docx, not just
+      // the active file's.
+      viewingVersionByRunId = new Map(viewingVersionByRunId).set(
+        activeRunId,
+        no
+      );
+    }
     try {
       const resp = await getVersion(activeRunId!, no);
       if (resp && Array.isArray(resp.lines_json)) {
@@ -206,7 +230,11 @@
   let rejectModalOpen = $state(false);
   let approveNote = $state('');
   let rejectNote = $state('');
-  let actionReviewer = $state<string>('');
+  // Stage 3 — actor / reviewer identity is now derived from the
+  // logged-in user (currentUser). The free-text "Your name" input
+  // is gone; the action bar shows the current username read-only.
+  let actorName = $derived($currentUser?.username ?? 'anonymous');
+  let isAdmin = $derived(!!$currentUser?.is_admin);
 
   let currentVersionEntry = $derived(
     versionsLoaded.find((v) => v.version_no === viewingVersionNo) || null
@@ -261,7 +289,7 @@
       const v = await saveVersion(activeRunId, {
         lines_json: linesJson,
         change_summary: summary,
-        actor: actionReviewer.trim() || 'user'
+        actor: actorName
       });
       changeSummary = '';
       savedRevision = editRevision;
@@ -284,7 +312,7 @@
       const updated = await submitForReview(
         activeRunId,
         viewingVersionNo,
-        actionReviewer.trim() || 'user'
+        actorName
       );
       successBanner = `V${updated.version_no} is now In Review.`;
       await jumpToVersion(viewingVersionNo);
@@ -303,7 +331,7 @@
     try {
       const updated = await reviewVersion(activeRunId, viewingVersionNo, {
         action: 'approve',
-        reviewer: actionReviewer.trim() || 'reviewer',
+        reviewer: actorName,
         note: approveNote.trim() || undefined
       });
       approveModalOpen = false;
@@ -329,7 +357,7 @@
     try {
       const updated = await reviewVersion(activeRunId, viewingVersionNo, {
         action: 'reject',
-        reviewer: actionReviewer.trim() || 'reviewer',
+        reviewer: actorName,
         note: rejectNote.trim()
       });
       rejectModalOpen = false;
@@ -357,7 +385,7 @@
       const resp = await publishVersion(
         activeRunId,
         viewingVersionNo,
-        actionReviewer.trim() || 'user'
+        actorName
       );
       successBanner = `V${resp.version_no} published. Downloads are now enabled.`;
       await jumpToVersion(viewingVersionNo);
@@ -462,51 +490,43 @@
     if (items.length === 0) return;
     if (downloadAllBtn) {
       downloadAllBtn.disabled = true;
-      downloadAllBtn.textContent = `Downloading 0 / ${items.length}…`;
+      downloadAllBtn.textContent = `Preparing ${items.length} file${items.length === 1 ? '' : 's'}…`;
     }
-    let okCount = 0;
-    let failCount = 0;
-    const failures: string[] = [];
-    for (let i = 0; i < items.length; i++) {
-      const entry = items[i];
-      const stem = (entry.name || entry.runId || 'output').replace(/\.[^/.]+$/, '');
-      // Backend now bundles every version's .docx and marks the one
-      // matching `viewingVersionNo` as `_CURRENT.docx` (the file the
-      // user is currently looking at). The zip also includes a
-      // `manifest.txt` enumerating every version + status.
-      const versionLabel = viewingVersionNo != null ? `v${viewingVersionNo}` : 'all';
-      const filename = `${stem}_${versionLabel}_files.zip`;
-      if (downloadAllBtn) downloadAllBtn.textContent = `Downloading ${i + 1} / ${items.length}…`;
-      try {
-        // Stage 6 - backend gate returns 409 if not published. detect and record.
-        const blob = await fetchAllFilesBlob(entry.runId!, viewingVersionNo);
-        triggerBlobDownload(blob, filename);
-        okCount += 1;
-      } catch (e) {
-        failCount += 1;
-        const msg = e instanceof Error ? e.message : String(e);
-        failures.push(`${entry.name}: ${msg}`);
+    try {
+      // Build the per-file current-view list. For each file in the
+      // Results dropdown, use that file's currently-viewing version
+      // (recorded in `viewingVersionByRunId` when the user clicks the
+      // timeline). If we don't have a recorded version for a file,
+      // pass 0 so the backend uses its latest-published default.
+      const allItems = items.map((b) => ({
+        runId: b.runId!,
+        versionNo: viewingVersionByRunId.get(b.runId!) ?? null
+      }));
+
+      // One ZIP for the whole batch — one .docx per file = that file's
+      // current view version. No source file, no manifest.
+      const blob = await fetchAllFilesZip(allItems);
+      const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const filename = `all_files_${ts}.zip`;
+      triggerBlobDownload(blob, filename);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      alert('Download failed: ' + msg);
+      console.warn('Download all failed:', e);
+    } finally {
+      if (downloadAllBtn) {
+        downloadAllBtn.disabled = false;
+        const totalVersions = items.length;
+        downloadAllBtn.textContent =
+          totalVersions > 0
+            ? `Download all files (${totalVersions} file${totalVersions === 1 ? '' : 's'})`
+            : 'Download all files';
       }
-      await new Promise((r) => setTimeout(r, 350));
-    }
-    if (downloadAllBtn) {
-      downloadAllBtn.disabled = false;
-      downloadAllBtn.textContent =
-        viewingVersionNo != null
-          ? `Download all files (current: v${viewingVersionNo})`
-          : 'Download all files';
-    }
-    if (downloadAllDoneBox) downloadAllDoneBox.classList.remove('hidden');
-    const ts = document.getElementById('dl-all-timestamp');
-    if (ts) {
-      const summary = `DOWNLOADED ${okCount} / ${items.length}` + (failCount > 0 ? ` · ${failCount} FAILED` : '');
-      const note = viewingVersionNo != null
-        ? ` · current view v${viewingVersionNo} marked _CURRENT.docx`
-        : '';
-      ts.textContent = `${summary}${note} — ${new Date().toLocaleString()}`;
-    }
-    if (failures.length > 0) {
-      console.warn('Download failures:', failures);
+      if (downloadAllDoneBox) downloadAllDoneBox.classList.remove('hidden');
+      const ts = document.getElementById('dl-all-timestamp');
+      if (ts) {
+        ts.textContent = `DOWNLOADED — ${new Date().toLocaleString()}`;
+      }
     }
   }
 
@@ -622,14 +642,11 @@
         </div>
       {/if}
 
-      <div class="ra-actor-row">
-        <input
-          class="ra-actor-input"
-          type="text"
-          placeholder="Your name (used for audit & comments)"
-          bind:value={actionReviewer}
-          maxlength="60"
-        />
+      <div class="ra-actor-row" data-testid="actor-row">
+        <span class="mono-label">ACTOR</span>
+        <span class="ra-actor-display" data-testid="actor-name">
+          {actorName}{isAdmin ? ' · admin' : ''}
+        </span>
       </div>
 
       <div class="ra-actions">
@@ -650,20 +667,6 @@
         <button class="pill-btn-ghost" onclick={cancelEditor} disabled={savingVersion}>
           Discard edits
         </button>
-        <span class="ra-undo-group">
-          <button
-            class="pill-btn-ghost"
-            onclick={() => editorRef?.undo?.()}
-            disabled={savingVersion}
-            title="Undo (Ctrl+Z)"
-          >↶ Undo</button>
-          <button
-            class="pill-btn-ghost"
-            onclick={() => editorRef?.redo?.()}
-            disabled={savingVersion}
-            title="Redo (Ctrl+Y)"
-          >↷ Redo</button>
-        </span>
 
         {#if currentStatus === 'draft' || currentStatus === 'rejected'}
           <button
@@ -822,10 +825,8 @@
         disabled={versionsLoaded.length > 0 && currentStatus !== 'published'}
         title={versionsLoaded.length > 0 && currentStatus !== 'published'
           ? 'Publish approved version first.'
-          : `Download all versions — the one you're viewing (v${viewingVersionNo ?? '?'}) is marked _CURRENT in the zip.`}
-      >{versionsLoaded.length > 0 && viewingVersionNo != null
-          ? `Download all files (current: v${viewingVersionNo})`
-          : 'Download all files'}</button>
+          : `Download all files in the Results dropdown as ONE zip — each file's currently-viewing version.`}
+      >{`Download all files (${batch.filter((b) => b.status === 'done' && b.runId).length})`}</button>
       <button class="pill-btn-ghost" onclick={goBack}>← Back</button>
       <button class="pill-btn-ghost" onclick={addAnotherFile}>Add Another File</button>
       <button class="pill-btn-ghost" onclick={resetAll}>Start Over</button>

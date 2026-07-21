@@ -61,6 +61,7 @@ def publish_approved_version(
     version_no: int,
     output_dir: Path,
     actor: str = 'user',
+    actor_user_id: int | None = None,
 ) -> dict | None:
     """Build the final brain-formatted .docx for an approved version by
     re-running the full Brain pipeline against the reviewer's saved
@@ -72,6 +73,7 @@ def publish_approved_version(
         version_no: approved version to publish.
         output_dir: per-run dir (already exists).
         actor: user publishing.
+        actor_user_id: Stage 3 — logged-in user id for audit attribution.
 
     Returns: dict with docx_path, status='published', and the audit
     JSON. Or None on failure.
@@ -153,7 +155,10 @@ def publish_approved_version(
     # 5) Update DB with published docx_path. Then enrich `runs.audit_json`
     # with the per-slot diff columns so the History / workflow viewer can
     # show before/after per slot.
-    updated = versions_io.set_published(c, run_id, version_no, str(output_path), actor=actor)
+    updated = versions_io.set_published(
+        c, run_id, version_no, str(output_path),
+        actor=actor, actor_user_id=actor_user_id,
+    )
     try:
         from api import db as _db
         _db.update_status(

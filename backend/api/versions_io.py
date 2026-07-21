@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS policy_versions (
     published_at    TEXT,
     docx_path       TEXT,
     source          TEXT NOT NULL DEFAULT 'pipeline',
+    actor_user_id           INTEGER,
+    assigned_reviewer_user_id INTEGER,
     UNIQUE(run_id, version_no)
 );
 
@@ -53,6 +55,7 @@ CREATE TABLE IF NOT EXISTS review_comments (
     anchor_key      TEXT,
     body            TEXT NOT NULL,
     author          TEXT NOT NULL DEFAULT 'user',
+    author_user_id  INTEGER,
     created_at      TEXT NOT NULL,
     resolved        INTEGER NOT NULL DEFAULT 0
 );
@@ -66,6 +69,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     version_no      INTEGER,
     event_type      TEXT NOT NULL,
     actor           TEXT NOT NULL,
+    actor_user_id   INTEGER,
     details         TEXT,
     created_at      TEXT NOT NULL
 );
@@ -128,12 +132,17 @@ def save_version(
     lines_json: str,
     change_summary: str,
     actor: str = 'user',
+    author_user_id: int | None = None,
 ) -> dict:
     """Create V(n+1) where n is the current max version_no for `run_id`.
 
     The new version starts with review_status='draft' regardless of prior status.
     Source='user_edit'. Audit 'edited' event is logged.
     Returns the inserted row as dict.
+
+    Stage 3 (multi-user): `author_user_id` is the logged-in user id and is
+    recorded in both `policy_versions.actor_user_id` (new column) and
+    `audit_log.actor_user_id` for attribution.
     """
     if not change_summary or not change_summary.strip():
         raise ValueError("change_summary is required")
@@ -145,17 +154,19 @@ def save_version(
     cur = conn.execute(
         """INSERT INTO policy_versions
            (run_id, version_no, lines_json, change_summary, modified_by, modified_at,
-            review_status, source)
-           VALUES (?, ?, ?, ?, ?, ?, 'draft', 'user_edit')""",
-        (run_id, next_no, lines_json, change_summary.strip(), actor, _now()),
+            review_status, source, actor_user_id)
+           VALUES (?, ?, ?, ?, ?, ?, 'draft', 'user_edit', ?)""",
+        (run_id, next_no, lines_json, change_summary.strip(), actor, _now(),
+         author_user_id),
     )
     conn.execute(
-        """INSERT INTO audit_log (run_id, version_no, event_type, actor, details, created_at)
-           VALUES (?, ?, 'edited', ?, ?, ?)""",
+        """INSERT INTO audit_log (run_id, version_no, event_type, actor, actor_user_id, details, created_at)
+           VALUES (?, ?, 'edited', ?, ?, ?, ?)""",
         (
             run_id,
             next_no,
             actor,
+            author_user_id,
             f"V{next_no} saved: {change_summary.strip()[:200]}",
             _now(),
         ),
@@ -241,10 +252,15 @@ def set_review_status(
     note: str | None = None,
     event_type: str = 'status_changed',
     details: str | None = None,
+    actor_user_id: int | None = None,
 ) -> dict | None:
     """Update review_status (and related reviewer/note/timestamps).
 
     Writes audit row. Returns updated version dict or None if not found.
+
+    Stage 3 (multi-user): `actor_user_id` is recorded in the audit row
+    for attribution. The `reviewer` field stays as free-text for legacy
+    compatibility (it duplicates `actor` in most cases).
     """
     existing = conn.execute(
         "SELECT * FROM policy_versions WHERE run_id = ? AND version_no = ?",
@@ -264,9 +280,9 @@ def set_review_status(
     if not details:
         details = f"V{version_no} -> {new_status}" + (f" ({note[:200]})" if note else '')
     conn.execute(
-        """INSERT INTO audit_log (run_id, version_no, event_type, actor, details, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (run_id, version_no, event_type, actor, details, _now()),
+        """INSERT INTO audit_log (run_id, version_no, event_type, actor, actor_user_id, details, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (run_id, version_no, event_type, actor, actor_user_id, details, _now()),
     )
     conn.commit()
     return get_version(conn, run_id, version_no)
@@ -278,8 +294,12 @@ def set_published(
     version_no: int,
     docx_path: str,
     actor: str = 'user',
+    actor_user_id: int | None = None,
 ) -> dict | None:
-    """Mark version as published and record docx path. Writes audit row."""
+    """Mark version as published and record docx path. Writes audit row.
+
+    Stage 3 (multi-user): `actor_user_id` is recorded in audit log.
+    """
     existing = conn.execute(
         "SELECT * FROM policy_versions WHERE run_id = ? AND version_no = ?",
         (run_id, version_no),
@@ -293,12 +313,13 @@ def set_published(
         (docx_path, _now(), run_id, version_no),
     )
     conn.execute(
-        """INSERT INTO audit_log (run_id, version_no, event_type, actor, details, created_at)
-           VALUES (?, ?, 'published', ?, ?, ?)""",
+        """INSERT INTO audit_log (run_id, version_no, event_type, actor, actor_user_id, details, created_at)
+           VALUES (?, ?, 'published', ?, ?, ?, ?)""",
         (
             run_id,
             version_no,
             actor,
+            actor_user_id,
             f"V{version_no} published; docx={docx_path}",
             _now(),
         ),
@@ -315,23 +336,30 @@ def add_comment(
     anchor_kind: str | None = None,
     anchor_key: str | None = None,
     author: str = 'user',
+    author_user_id: int | None = None,
 ) -> dict:
-    """Add a comment to (run_id, version_no). Returns new comment dict."""
+    """Add a comment to (run_id, version_no). Returns new comment dict.
+
+    Stage 3 (multi-user): `author_user_id` is the logged-in user id
+    and is recorded in `review_comments.author_user_id` and
+    `audit_log.actor_user_id` for attribution.
+    """
     if not body or not body.strip():
         raise ValueError("comment body is required")
     cur = conn.execute(
         """INSERT INTO review_comments
-           (run_id, version_no, anchor_kind, anchor_key, body, author, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (run_id, version_no, anchor_kind, anchor_key, body.strip(), author, _now()),
+           (run_id, version_no, anchor_kind, anchor_key, body, author, author_user_id, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (run_id, version_no, anchor_kind, anchor_key, body.strip(), author, author_user_id, _now()),
     )
     conn.execute(
-        """INSERT INTO audit_log (run_id, version_no, event_type, actor, details, created_at)
-           VALUES (?, ?, 'comment_added', ?, ?, ?)""",
+        """INSERT INTO audit_log (run_id, version_no, event_type, actor, actor_user_id, details, created_at)
+           VALUES (?, ?, 'comment_added', ?, ?, ?, ?)""",
         (
             run_id,
             version_no,
             author,
+            author_user_id,
             f"Comment added on {anchor_kind or 'general'}: {body.strip()[:120]}",
             _now(),
         ),

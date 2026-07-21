@@ -20,7 +20,7 @@ def _conn():
 def init_db():
     """Create schema if it doesn't exist. Adds new columns if upgrading."""
     # Local import to avoid circular dependency (versions_io only needs sqlite3).
-    from api import versions_io
+    from api import versions_io, users
 
     with _conn() as c:
         c.execute("""
@@ -54,19 +54,59 @@ def init_db():
             c.execute("ALTER TABLE runs ADD COLUMN source_path TEXT")
         if 'audit_json' not in existing:
             c.execute("ALTER TABLE runs ADD COLUMN audit_json TEXT")
+        # Stage 1.4 (multi-user): runs.created_by_user_id (nullable, for
+        # orphaned data; new runs fill this from the session's user id).
+        if 'created_by_user_id' not in existing:
+            c.execute("ALTER TABLE runs ADD COLUMN created_by_user_id INTEGER")
 
         # Stage 1 - workflow / version-control tables.
         versions_io.init_version_tables(c)
 
+        # Stage 1.4 (multi-user): project membership + reviewer assignment
+        # + actor attribution. Idempotent.
+        users.init_user_tables(c)
+        seeded = users.seed_users_if_empty(c)
+        if seeded:
+            print(f"[init_db] seeded {seeded} user(s)", flush=True)
 
-def insert_run(run_id, filename, size, source_path=None):
+        # Stage 1.4 migrations for policy_versions + audit_log + review_comments.
+        # policy_versions: assigned_reviewer_user_id + actor_user_id
+        pv_cols = {row[1] for row in c.execute("PRAGMA table_info(policy_versions)").fetchall()}
+        if 'assigned_reviewer_user_id' not in pv_cols:
+            c.execute("ALTER TABLE policy_versions ADD COLUMN assigned_reviewer_user_id INTEGER")
+        if 'actor_user_id' not in pv_cols:
+            c.execute("ALTER TABLE policy_versions ADD COLUMN actor_user_id INTEGER")
+        # audit_log: actor_user_id
+        al_cols = {row[1] for row in c.execute("PRAGMA table_info(audit_log)").fetchall()}
+        if 'actor_user_id' not in al_cols:
+            c.execute("ALTER TABLE audit_log ADD COLUMN actor_user_id INTEGER")
+        # review_comments: author_user_id
+        rc_cols = {row[1] for row in c.execute("PRAGMA table_info(review_comments)").fetchall()}
+        if 'author_user_id' not in rc_cols:
+            c.execute("ALTER TABLE review_comments ADD COLUMN author_user_id INTEGER")
+
+        c.commit()
+
+
+def insert_run(run_id, filename, size, source_path=None, created_by_user_id=None):
+    """Insert a new run. If `created_by_user_id` is provided, also auto-add
+    that user to `project_members` with `access_level='approver'` so they
+    have full access to their own run."""
     with _conn() as c:
         c.execute(
             """INSERT INTO runs
-               (run_id, filename, file_size_bytes, created_at, status, source_path)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (run_id, filename, size, datetime.utcnow().isoformat() + 'Z', 'uploaded', source_path)
+               (run_id, filename, file_size_bytes, created_at, status, source_path,
+                created_by_user_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (run_id, filename, size, datetime.utcnow().isoformat() + 'Z', 'uploaded',
+             source_path, created_by_user_id)
         )
+        if created_by_user_id is not None:
+            from api import users as _users
+            _users.add_project_member(
+                c, run_id, int(created_by_user_id), 'approver',
+                added_by_user_id=int(created_by_user_id),
+            )
 
 
 def update_status(run_id, status, **kwargs):

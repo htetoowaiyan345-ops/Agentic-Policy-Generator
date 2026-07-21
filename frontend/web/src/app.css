@@ -159,6 +159,8 @@ input, select, textarea {
 .rc-header { margin-bottom: 10px; padding-bottom: 6px; border-bottom: 1px solid var(--ink); }
 .rc-form { display: grid; gap: 8px; margin-bottom: 12px; }
 .rc-author-input, .rc-anchor-select { font-family: var(--mono); font-size: 11px; padding: 6px 8px; border: 1px solid var(--ink); background: var(--cream); width: 100%; color: var(--ink); }
+.rc-author-row { display: flex; gap: 8px; align-items: center; }
+.rc-author-display { font-family: var(--mono); font-size: 11px; padding: 4px 8px; border: 1px solid var(--ink); background: var(--cream); color: var(--ink); font-weight: 500; }
 .rc-body-textarea { font-family: var(--sans); font-size: 13px; padding: 8px 10px; border: 1px solid var(--ink); background: #fff; width: 100%; resize: vertical; color: var(--ink); }
 .rc-submit { align-self: flex-start; }
 .rc-error { color: var(--accent); padding: 6px 0; font-weight: 600; }
@@ -204,8 +206,9 @@ input, select, textarea {
 .ra-banner-error { color: var(--accent); border: 1px solid var(--accent); background: rgba(214,40,40,0.05); }
 .ra-banner-success { color: #0a7a2a; border: 1px solid #0a7a2a; background: rgba(10,122,42,0.05); }
 .ra-banner-rejected { color: var(--accent); border: 1px dashed var(--accent); background: rgba(214,40,40,0.05); }
-.ra-actor-row { margin: 10px 0; }
+.ra-actor-row { margin: 10px 0; display: flex; gap: 8px; align-items: center; }
 .ra-actor-input { font-family: var(--mono); font-size: 12px; padding: 6px 10px; border: 1px solid var(--ink); background: var(--cream); width: 320px; max-width: 100%; color: var(--ink); }
+.ra-actor-display { font-family: var(--mono); font-size: 12px; padding: 6px 10px; border: 1px solid var(--ink); background: var(--cream); color: var(--ink); font-weight: 500; }
 .ra-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0; }
 .ra-summary-input { font-family: var(--sans); font-size: 13px; padding: 8px 12px; border: 1px solid var(--ink); background: #fff; width: 360px; max-width: 100%; color: var(--ink); }
 .ra-editor-wrap { margin-top: 16px; border-top: 1px solid var(--ink); padding-top: 16px; }

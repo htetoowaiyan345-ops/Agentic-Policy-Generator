@@ -1,5 +1,6 @@
 import { writable } from 'svelte/store';
 import type { AppState, BatchEntry, RejectedFile, VersionEntry, AuditEntry } from './types';
+import type { User } from './api';
 
 export function createInitialAppState(): AppState {
   return {
@@ -19,6 +20,11 @@ export function createInitialAppState(): AppState {
 }
 
 export const appState = writable<AppState>(createInitialAppState());
+
+// Separate writable for the current logged-in user. Kept outside
+// `appState` because the auth lifecycle (login / logout / 401) is
+// independent of the workflow app state.
+export const currentUser = writable<User | null>(null);
 
 export function resetAppState(): void {
   appState.set(createInitialAppState());
@@ -60,4 +66,14 @@ export function setCurrentVersionNo(no: number | null): void {
 
 export function setReviewAudit(audit: AuditEntry[]): void {
   appState.update((s) => ({ ...s, reviewAudit: audit }));
+}
+
+// Stage 2 - auth store helpers.
+
+export function setCurrentUser(user: User | null): void {
+  currentUser.set(user);
+}
+
+export function clearCurrentUser(): void {
+  currentUser.set(null);
 }

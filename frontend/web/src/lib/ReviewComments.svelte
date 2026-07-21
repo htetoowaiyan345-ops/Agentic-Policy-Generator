@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { ReviewComment } from './types';
   import { addComment, resolveComment, listComments } from './api';
+  import { currentUser } from './stores';
 
   interface Props {
     runId: string;
@@ -18,8 +19,11 @@
   let newBody = $state('');
   let newAnchorKind = $state<'slot' | 'paragraph' | 'general' | ''>('general');
   let newAnchorKey = $state('');
-  let author = $state<string>('');
   let submitting = $state(false);
+
+  // Stage 3 — comment author is now derived from the logged-in user.
+  // The "Your name" text input has been removed.
+  let commentAuthor = $derived($currentUser?.username ?? 'anonymous');
 
   const ANCHOR_OPTIONS: { value: string; label: string }[] = [
     { value: 'slot:Type', label: 'Slot: Type' },
@@ -87,7 +91,7 @@
         body: newBody.trim(),
         anchor_kind: newAnchorKind || null,
         anchor_key: newAnchorKey || null,
-        author: author.trim() || 'user'
+        author: commentAuthor
       });
       newBody = '';
       newAnchorKind = 'general';
@@ -147,13 +151,12 @@
   <div class="rc-header mono-label">COMMENTS</div>
 
   <form class="rc-form" onsubmit={onSubmit}>
-    <input
-      type="text"
-      class="rc-author-input"
-      placeholder="Your name (for audit)"
-      bind:value={author}
-      maxlength="40"
-    />
+    <div class="rc-author-row">
+      <span class="mono-label">AUTHOR</span>
+      <span class="rc-author-display" data-testid="comment-author">
+        {commentAuthor}
+      </span>
+    </div>
     <select
       class="rc-anchor-select"
       onchange={onAnchorChange}

@@ -18,9 +18,27 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 PROJECT_ROOT = BACKEND_DIR
 sys.path.insert(0, str(BACKEND_DIR))
 
+# Load .env file if present (used for ADMIN_PASSWORD etc.). No external
+# dependency — stdlib only. Existing real-env vars are NOT overwritten.
+_env_path = BACKEND_DIR / '.env'
+if _env_path.exists():
+    try:
+        for _line in _env_path.read_text(encoding='utf-8').splitlines():
+            _line = _line.strip()
+            if not _line or _line.startswith('#') or '=' not in _line:
+                continue
+            _k, _v = _line.split('=', 1)
+            _k = _k.strip()
+            _v = _v.strip().strip('"').strip("'")
+            if _k and _k not in os.environ:
+                os.environ[_k] = _v
+    except Exception as _e:
+        print(f"[server] failed to load .env: {_e}", flush=True)
+
 from api import db
 from api import pipeline_runner
 from api import versions_io
+from api import users
 
 DATA_DIR = PROJECT_ROOT / 'data'
 RUNS_DIR = DATA_DIR / 'runs'
@@ -29,7 +47,7 @@ ALLOWED_EXT = {'.pdf', '.docx', '.txt'}
 MAX_SIZE = 50 * 1024 * 1024
 
 CORS_METHODS = 'GET, POST, OPTIONS'
-CORS_HEADERS_ALLOWED = 'Content-Type, Accept'
+CORS_HEADERS_ALLOWED = 'Content-Type, Accept, Authorization'
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +246,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        # Stage 1.5 — auth routes (public, no require_auth).
+        if path == '/api/auth/login':
+            return self.handle_login()
+        if path == '/api/auth/logout':
+            return self.handle_logout()
         if path == '/api/upload':
             return self.handle_upload()
         m = re.match(r'^/api/process/([a-f0-9]+)$', path)
@@ -262,6 +285,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        # Stage 1.5 — auth routes (public for /me since it requires a token;
+        # the handler itself enforces auth).
+        if path == '/api/auth/me':
+            return self.handle_me()
+        if path == '/api/auth/users':
+            return self.handle_list_users()
         if path == '/api/history':
             return self.handle_history()
         m = re.match(r'^/api/status/([a-f0-9]+)$', path)
@@ -296,6 +325,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_upload(self):
         try:
+            from api.auth_middleware import require_auth
+            current = require_auth(self)
+            if current is None:
+                return
             filename, data = parse_multipart(self)
             if not data:
                 return send_json(self, {'error': 'no file in request'}, status=400)
@@ -311,7 +344,13 @@ class Handler(BaseHTTPRequestHandler):
             run_dir.mkdir(exist_ok=True)
             src_path = run_dir / f'source{ext}'
             src_path.write_bytes(data)
-            db.insert_run(run_id, filename, len(data), source_path=str(src_path))
+            # Stage 3 — record who created this run; the creator is
+            # auto-added to project_members as 'approver' in db.insert_run.
+            db.insert_run(
+                run_id, filename, len(data),
+                source_path=str(src_path),
+                created_by_user_id=int(current["id"]),
+            )
             pipeline_runner.set_state(run_id, 'uploaded')
             send_json(self, {'run_id': run_id, 'filename': filename, 'size_bytes': len(data)})
         except Exception as e:
@@ -478,74 +517,109 @@ class Handler(BaseHTTPRequestHandler):
             send_json(self, {'error': f'download: {e}'}, status=500)
 
     def handle_download_all(self, run_id):
-        """Bundle every version's `.docx` from this run into a single
-        zip and stream it to the browser.
+        """Bundle one `.docx` per file in the Results dropdown into a
+        single zip and stream it to the browser.
 
         Per the user's spec ("Download all files — each file's currently
         viewing version"):
-          - NO source file is bundled. The run's original upload is
-            excluded unconditionally (the user must not get the source
-            back via this endpoint).
-          - ALL versions that appear in the Result dropdown are bundled:
-            one `.docx` per `policy_versions` row. Versions that already
-            have a per-version `<run_id>_approved_v<n>.docx` on disk are
-            added as-is. Approved-but-not-published versions are built
-            on the fly from their `lines_json` and bundled. Draft /
-            in-review / rejected versions with no `.docx` are skipped
-            but noted in `manifest.txt`.
-          - The version the user is CURRENTLY VIEWING (passed by the
-            frontend as the `version_no` query param, matching the
-            Result dropdown selection) is marked with `_CURRENT.docx`
-            suffix and listed first inside the zip. A `manifest.txt`
-            summarises every entry with version + status + current flag.
+          - The frontend passes the list of run_ids it's showing in the
+            Results dropdown via the `ids` query param (comma-separated),
+            plus the current view version per file via the `versions`
+            query param (comma-separated, parallel to `ids`).
+          - For each (run_id, version_no) pair: bundle EXACTLY ONE
+            `.docx` — the current view version's `.docx`. No other
+            versions are included.
+          - Source files are EXCLUDED. No `manifest.txt`. Only `.docx`
+            files in the zip.
+          - The zip entry filename is `<file_stem>_v<N>.docx` where
+            `file_stem` is derived from `runs.filename` (the original
+            upload's name, extension stripped and spaces normalised).
 
-        Zip filename: `<run_id>_all_v<N>.zip` where N is the
-        currently-viewing version (or `_all.zip` when none was passed).
+        Backward compatibility: when called with a single `run_id` and
+        no `ids` query param, falls back to the single-file behavior
+        (bundle that file's current view version's `.docx` only).
         """
         try:
-            run_dir = RUNS_DIR / run_id
-            if not run_dir.exists():
-                return send_json(self, {'error': 'run not found'}, status=404)
-            # Allow download once at least one version exists (any status).
-            with db._conn() as c:
-                versions = versions_io.get_versions(c, run_id)
-                latest_pub = versions_io.latest_published_version_no(c, run_id)
-            if not versions:
-                return send_json(
-                    self,
-                    {
-                        'error': 'no_versions',
-                        'message': 'No versions exist for this run yet.',
-                    },
-                    status=404,
-                )
-
-            # Parse `version_no` from the query string. When the
-            # frontend doesn't send one, fall back to the latest
-            # published version (or the highest-numbered version).
             qs = parse_qs(urlparse(self.path).query)
-            raw_no = (qs.get('version_no') or qs.get('version') or [None])[0]
-            try:
-                requested_no = int(raw_no) if raw_no is not None else None
-            except (TypeError, ValueError):
-                requested_no = None
-            if requested_no is None:
-                requested_no = latest_pub if latest_pub is not None else max(
-                    v.get('version_no', 0) for v in versions
-                )
+            ids_param = (qs.get('ids') or [''])[0]
+            versions_param = (qs.get('versions') or [''])[0]
+
+            if ids_param:
+                # Multi-file mode: ids + versions are comma-separated,
+                # parallel lists.
+                ids_list = [s for s in ids_param.split(',') if s]
+                versions_list_raw = [s for s in versions_param.split(',') if s]
+                if len(versions_list_raw) != len(ids_list):
+                    return send_json(
+                        self,
+                        {
+                            'error': 'param_mismatch',
+                            'message': (
+                                '`ids` and `versions` must have the same '
+                                'number of entries (parallel lists).'
+                            ),
+                        },
+                        status=400,
+                    )
+                # Build a list of (run_id, version_no) pairs. If a
+                # version is missing or unparseable, fall back to None
+                # (the per-run resolution below will pick a default).
+                items: list[tuple[str, int | None]] = []
+                for rid, vraw in zip(ids_list, versions_list_raw):
+                    try:
+                        items.append((rid, int(vraw)))
+                    except (TypeError, ValueError):
+                        items.append((rid, None))
+            else:
+                # Single-file mode (backward compat). The path
+                # `/api/download/<run_id>/all?version_no=N` still works.
+                try:
+                    requested_no = int(
+                        (qs.get('version_no') or qs.get('version') or ['0'])[0]
+                    )
+                except (TypeError, ValueError):
+                    requested_no = 0
+                items = [(run_id, requested_no or None)]
 
             files_to_zip: list[tuple[Path, str]] = []
-            manifest_lines: list[str] = []
-            # Sort versions ascending; build on-the-fly for missing ones.
-            for v in sorted(versions, key=lambda x: x.get('version_no', 0)):
-                vno = int(v.get('version_no') or 0)
-                status_v = v.get('review_status') or 'draft'
-                is_current = (vno == requested_no)
-                current_tag = '_CURRENT' if is_current else ''
+
+            for rid, current_version in items:
+                run_dir = RUNS_DIR / rid
+                if not run_dir.exists():
+                    continue
+                with db._conn() as c:
+                    versions = versions_io.get_versions(c, rid)
+                    latest_pub = versions_io.latest_published_version_no(c, rid)
+                    run_row = db.get_run(rid)
+                if not versions:
+                    continue
+
+                # Resolve target version: explicit current > latest
+                # published > highest-numbered.
+                if current_version is None or current_version <= 0:
+                    if latest_pub is not None:
+                        target_no = latest_pub
+                    else:
+                        target_no = max(
+                            v.get('version_no', 0) for v in versions
+                        )
+                else:
+                    target_no = current_version
+
+                # Find the version row.
+                ver = next(
+                    (
+                        v for v in versions
+                        if int(v.get('version_no') or 0) == int(target_no)
+                    ),
+                    None,
+                )
+                if ver is None:
+                    continue
 
                 # 1. Prefer per-version file already on disk.
-                per_version_main = run_dir / f'{run_id}_approved_v{vno}.docx'
-                per_version_preview = run_dir / f'{run_id}_approved_v{vno}_preview.docx'
+                per_version_main = run_dir / f'{rid}_approved_v{target_no}.docx'
+                per_version_preview = run_dir / f'{rid}_approved_v{target_no}_preview.docx'
                 chosen_path: Path | None = None
                 if per_version_main.exists():
                     chosen_path = per_version_main
@@ -553,6 +627,7 @@ class Handler(BaseHTTPRequestHandler):
                     chosen_path = per_version_preview
                 else:
                     # 2. Build on-the-fly if approved/published but no file.
+                    status_v = ver.get('review_status') or 'draft'
                     if status_v in ('approved', 'published'):
                         try:
                             from policy_platform.pipeline import run_from_lines_json
@@ -560,37 +635,40 @@ class Handler(BaseHTTPRequestHandler):
                             from api.docx_approved_export import _apply_header_footer
                             tmp_out = per_version_preview
                             run_from_lines_json(
-                                lines_json=normalise_lines_json(v.get('lines_json') or []),
+                                lines_json=normalise_lines_json(ver.get('lines_json') or []),
                                 output_path=tmp_out,
-                                run_id=run_id,
-                                document_name=f'{run_id}_v{vno}_preview',
+                                run_id=rid,
+                                document_name=f'{rid}_v{target_no}_preview',
                                 fail_on_validation=False,
                             )
                             try:
                                 from docx import Document as _Doc2
                                 doc2 = _Doc2(str(tmp_out))
                                 _apply_header_footer(
-                                    doc2, v.get('lines_json') or [],
+                                    doc2, ver.get('lines_json') or [],
                                 )
                                 doc2.save(str(tmp_out))
                             except Exception as ee:
                                 print(f'[handle_download_all] header/footer apply failed: {ee}', flush=True)
                             chosen_path = tmp_out
                         except Exception as e:
-                            print(f'[handle_download_all] on-the-fly build for v{vno} failed: {e}', flush=True)
+                            print(f'[handle_download_all] on-the-fly build for v{target_no} failed: {e}', flush=True)
 
                 if chosen_path is None:
-                    manifest_lines.append(
-                        f'v{vno}\t{status_v}\t(no .docx generated — skipped)'
-                    )
                     continue
 
-                arcname = f'v{vno}_{status_v}{current_tag}.docx'
+                # Derive file_stem from the original upload name, falling
+                # back to the run_id.
+                original_name = (run_row or {}).get('filename') or rid
+                file_stem = re.sub(r'\.[^/.]+$', '', original_name)
+                # Replace path separators and characters that are
+                # awkward inside zip entries.
+                file_stem = re.sub(r'[\\/:*?"<>|]', '_', file_stem).strip()
+                if not file_stem:
+                    file_stem = rid
+
+                arcname = f'{file_stem}_v{target_no}.docx'
                 files_to_zip.append((chosen_path, arcname))
-                marker = ' [CURRENT VIEW]' if is_current else ''
-                manifest_lines.append(
-                    f'v{vno}\t{status_v}\t{arcname}{marker}'
-                )
 
             if not files_to_zip:
                 return send_json(
@@ -598,36 +676,28 @@ class Handler(BaseHTTPRequestHandler):
                     {
                         'error': 'no_docx_available',
                         'message': (
-                            'No .docx output is available for any version '
-                            'in this run. Approve and publish at least one '
-                            'version first.'
+                            'No .docx output is available for the requested '
+                            'files / versions. Approve and publish at least '
+                            'one version first.'
                         ),
                     },
                     status=404,
                 )
 
             # Source file is EXPLICITLY excluded — see header docstring.
-            # Do not add any path matching `source.*` to files_to_zip.
+            # No `manifest.txt` either.
 
-            # Re-order: CURRENT entry first, rest in version order.
-            files_to_zip.sort(
-                key=lambda t: (not t[1].endswith('_CURRENT.docx'), t[1])
+            zip_name = (
+                f'all_files_{time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())}.zip'
+                if len(items) > 1
+                else (
+                    f'{items[0][0]}_v{items[0][1] or 0}.zip'
+                    if items
+                    else 'all_files.zip'
+                )
             )
-
-            # Build manifest header.
-            manifest_header = (
-                f'Run: {run_id}\n'
-                f'Current view version: v{requested_no}\n'
-                f'Generated: {time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}\n'
-                f'Entries ({len(files_to_zip)}):\n'
-            )
-            manifest_text = manifest_header + '\n'.join(manifest_lines) + '\n'
-
-            zip_name = f'{run_id}_all_v{requested_no}.zip'
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-                # Manifest goes FIRST so users see it on extraction.
-                zf.writestr('manifest.txt', manifest_text)
                 for src, arcname in files_to_zip:
                     zf.write(src, arcname=arcname)
             data = buf.getvalue()
@@ -685,6 +755,79 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             send_json(self, {'error': f'history: {e}'}, status=500)
 
+    # Stage 1.5 - auth handlers.
+
+    def handle_login(self):
+        """POST /api/auth/login  body: {username, password}
+        Returns: {token, user, expires_at} on success; 401 on failure."""
+        try:
+            length = int(self.headers.get('Content-Length', 0) or 0)
+            raw = self.rfile.read(length).decode('utf-8') if length else '{}'
+            try:
+                body = json.loads(raw) if raw else {}
+            except Exception:
+                body = {}
+            username = (body.get('username') or '').strip()
+            password = body.get('password') or ''
+            if not username or not password:
+                return send_json(
+                    self,
+                    {'error': 'bad_request', 'message': 'username and password required'},
+                    status=400,
+                )
+            with db._conn() as c:
+                result = users.login(c, username, password)
+            if not result:
+                return send_json(
+                    self,
+                    {'error': 'invalid_credentials', 'message': 'Invalid username or password.'},
+                    status=401,
+                )
+            return send_json(self, result)
+        except Exception as e:
+            return send_json(self, {'error': f'login: {e}'}, status=500)
+
+    def handle_logout(self):
+        """POST /api/auth/logout  body: {token} or Authorization: Bearer
+        Deletes the session. Idempotent — returns 200 even if token absent."""
+        try:
+            token = None
+            auth = self.headers.get('Authorization', '')
+            if auth.lower().startswith('bearer '):
+                token = auth.split(None, 1)[1].strip()
+            if not token:
+                length = int(self.headers.get('Content-Length', 0) or 0)
+                raw = self.rfile.read(length).decode('utf-8') if length else '{}'
+                try:
+                    body = json.loads(raw) if raw else {}
+                except Exception:
+                    body = {}
+                token = body.get('token')
+            if token:
+                with db._conn() as c:
+                    users.delete_session(c, token)
+            return send_json(self, {'logged_out': True})
+        except Exception as e:
+            return send_json(self, {'error': f'logout: {e}'}, status=500)
+
+    def handle_me(self):
+        """GET /api/auth/me  — returns the current user, or 401."""
+        from api.auth_middleware import require_auth
+        user = require_auth(self)
+        if user is None:
+            return  # require_auth sent 401
+        return send_json(self, {'user': user})
+
+    def handle_list_users(self):
+        """GET /api/auth/users  — list all users (any logged-in user)."""
+        from api.auth_middleware import require_auth
+        user = require_auth(self)
+        if user is None:
+            return
+        with db._conn() as c:
+            all_users = users.list_users(c)
+        return send_json(self, {'items': all_users})
+
     # Stage 2 - workflow / version-control read handlers (READ-ONLY).
 
     def handle_versions_list(self, run_id):
@@ -740,6 +883,10 @@ class Handler(BaseHTTPRequestHandler):
             run = db.get_run(run_id)
             if not run:
                 return send_json(self, {'error': 'unknown run_id'}, status=404)
+            from api.auth_middleware import require_auth
+            current = require_auth(self)
+            if current is None:
+                return
             length = int(self.headers.get('Content-Length', 0) or 0)
             raw = self.rfile.read(length).decode('utf-8') if length else '{}'
             try:
@@ -751,10 +898,14 @@ class Handler(BaseHTTPRequestHandler):
                 return send_json(self, {'error': 'comment body required'}, status=400)
             anchor_kind = body.get('anchor_kind')
             anchor_key = body.get('anchor_key')
-            author = body.get('author') or 'user'
+            # Stage 3 — author identity comes from the session. The
+            # body `author` field is now ignored.
+            author = current["username"]
+            author_user_id = int(current["id"])
             with db._conn() as c:
                 comment = versions_io.add_comment(
-                    c, run_id, version_no, text, anchor_kind, anchor_key, author
+                    c, run_id, version_no, text, anchor_kind, anchor_key, author,
+                    author_user_id=author_user_id,
                 )
             send_json(self, comment)
         except Exception as e:
@@ -777,7 +928,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_version_save(self, run_id):
         """Create V(n+1) from edited lines_json. Always creates draft."""
+        import traceback
         try:
+            # Stage 3 — auth first, then DB lookup. This ensures 401
+            # is returned for unauthenticated requests even when the
+            # run_id doesn't exist.
+            from api.auth_middleware import require_auth
+            current = require_auth(self)
+            if current is None:
+                return
             run = db.get_run(run_id)
             if not run:
                 return send_json(self, {'error': 'unknown run_id'}, status=404)
@@ -799,16 +958,21 @@ class Handler(BaseHTTPRequestHandler):
             change_summary = (body.get('change_summary') or '').strip()
             if not change_summary:
                 return send_json(self, {'error': 'change_summary required'}, status=400)
-            actor = (body.get('actor') or 'user').strip() or 'user'
+            # Stage 3 — actor identity comes from the session, not the
+            # request body. The body `actor` field is now ignored.
+            actor = current["username"]
+            actor_user_id = int(current["id"])
             with db._conn() as c:
                 new_v = versions_io.save_version(
-                    c, run_id, lines_json_str, change_summary, actor
+                    c, run_id, lines_json_str, change_summary, actor,
+                    author_user_id=actor_user_id,
                 )
             # Phase 10 — drop the preview cache for this run. The next
             # /api/preview request will rebuild from the current .docx.
             invalidate_preview_cache(run_id)
             send_json(self, new_v)
         except Exception as e:
+            traceback.print_exc()
             send_json(self, {'error': f'version_save: {e}'}, status=500)
 
     def handle_version_submit(self, run_id, version_no):
@@ -817,13 +981,19 @@ class Handler(BaseHTTPRequestHandler):
             run = db.get_run(run_id)
             if not run:
                 return send_json(self, {'error': 'unknown run_id'}, status=404)
+            from api.auth_middleware import require_auth
+            current = require_auth(self)
+            if current is None:
+                return
             length = int(self.headers.get('Content-Length', 0) or 0)
             raw = self.rfile.read(length).decode('utf-8') if length else '{}'
             try:
                 body = json.loads(raw) if raw else {}
             except Exception:
                 body = {}
-            actor = (body.get('actor') or 'user').strip() or 'user'
+            # Stage 3 — actor identity comes from the session.
+            actor = current["username"]
+            actor_user_id = int(current["id"])
             with db._conn() as c:
                 cur = versions_io.get_version(c, run_id, version_no)
                 if not cur:
@@ -848,6 +1018,7 @@ class Handler(BaseHTTPRequestHandler):
                     'in_review',
                     actor=actor,
                     reviewer=actor,
+                    actor_user_id=actor_user_id,
                     event_type='submitted',
                     details=(
                         f"V{version_no} submitted for review by {actor}"
@@ -862,6 +1033,10 @@ class Handler(BaseHTTPRequestHandler):
             run = db.get_run(run_id)
             if not run:
                 return send_json(self, {'error': 'unknown run_id'}, status=404)
+            from api.auth_middleware import require_auth
+            current = require_auth(self)
+            if current is None:
+                return
             length = int(self.headers.get('Content-Length', 0) or 0)
             raw = self.rfile.read(length).decode('utf-8') if length else '{}'
             try:
@@ -875,7 +1050,9 @@ class Handler(BaseHTTPRequestHandler):
                     {'error': 'action must be approve or reject'},
                     status=400,
                 )
-            reviewer = (body.get('reviewer') or '').strip() or 'reviewer'
+            # Stage 3 — reviewer identity comes from the session.
+            reviewer = current["username"]
+            reviewer_user_id = int(current["id"])
             note = (body.get('note') or '').strip()
             if action == 'reject' and not note:
                 return send_json(
@@ -912,6 +1089,7 @@ class Handler(BaseHTTPRequestHandler):
                     new_status,
                     actor=reviewer,
                     reviewer=reviewer,
+                    actor_user_id=reviewer_user_id,
                     note=note or None,
                     event_type=action + 'd',
                     details=details,
@@ -927,13 +1105,19 @@ class Handler(BaseHTTPRequestHandler):
             run = db.get_run(run_id)
             if not run:
                 return send_json(self, {'error': 'unknown run_id'}, status=404)
+            from api.auth_middleware import require_auth
+            current = require_auth(self)
+            if current is None:
+                return
             length = int(self.headers.get('Content-Length', 0) or 0)
             raw = self.rfile.read(length).decode('utf-8') if length else '{}'
             try:
                 body = json.loads(raw) if raw else {}
             except Exception:
                 body = {}
-            actor = (body.get('actor') or 'user').strip() or 'user'
+            # Stage 3 — actor identity comes from the session.
+            actor = current["username"]
+            actor_user_id = int(current["id"])
             with db._conn() as c:
                 cur = versions_io.get_version(c, run_id, version_no)
                 if not cur:
@@ -959,6 +1143,7 @@ class Handler(BaseHTTPRequestHandler):
                     version_no,
                     output_dir=RUNS_DIR / run_id,
                     actor=actor,
+                    actor_user_id=actor_user_id,
                 )
                 if not updated:
                     return send_json(
