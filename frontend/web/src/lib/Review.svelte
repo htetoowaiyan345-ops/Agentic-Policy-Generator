@@ -20,13 +20,17 @@
     getAudit,
     saveVersion,
     submitForReview,
+    submitDraft,
     reviewVersion,
     publishVersion,
     listProjectMembers,
     markProjectSeen,
+    getDraft,
+    saveDraft,
     type AccessLevel
   } from './api';
   import type { PreviewData, BatchEntry, VersionEntry, PreviewLine } from './types';
+  import { timeAgo } from './timeAgo';
   import VersionTimeline from './VersionTimeline.svelte';
   import ReviewComments from './ReviewComments.svelte';
   import ReviewEditor from './ReviewEditor.svelte';
@@ -98,8 +102,31 @@
         }
         previewError = null;
       } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        showPreviewErrorToast('Preview request failed: ' + msg);
+        const err = e instanceof Error ? e : null;
+        const cause = (err?.cause ?? {}) as {
+          status?: number;
+          error?: string;
+          status_state?: string;
+        };
+        // Friendly message for the common "pipeline hasn't run yet"
+        // case (backend returns 400 with `{error: 'result not ready',
+        // status: 'uploaded'}`).
+        if (
+          err
+          && (cause.error === 'result not ready'
+              || /result not ready/i.test(err.message))
+        ) {
+          const runStatus = cause.status || 'unknown';
+          showPreviewErrorToast(
+            `Preview isn't ready yet — this run is in "${runStatus}" state. `
+            + `Process the document first to generate the .docx, then the `
+            + `preview will appear here.`
+          );
+        } else if (err) {
+          showPreviewErrorToast('Preview request failed: ' + err.message);
+        } else {
+          showPreviewErrorToast('Preview request failed.');
+        }
         previewAttempt = 0;
       } finally {
         previewLoading = false;
@@ -131,15 +158,23 @@
       versionsLoaded = vs;
       setVersions(vs);
       setReviewAudit(events);
-      const latest = vs.length > 0 ? vs[vs.length - 1].version_no : null;
-      viewingVersionNo = latest;
-      setCurrentVersionNo(latest);
-      if (latest != null) {
-        // Remember the initial current view per file so "Download all
-        // files" can use the right version for each run.
+      // Stage 4.14 — initial view: latest drafting row if any
+      // (V# = latest_frozen + N), else latest frozen row.
+      const drafts = vs
+        .filter((v) => v.kind === 'draft')
+        .sort((a, b) => b.version_no - a.version_no);
+      let initialV: number | null = null;
+      if (drafts.length > 0) {
+        initialV = drafts[0].version_no;
+      } else if (vs.length > 0) {
+        initialV = vs[vs.length - 1].version_no;
+      }
+      viewingVersionNo = initialV;
+      setCurrentVersionNo(initialV);
+      if (initialV != null) {
         viewingVersionByRunId = new Map(viewingVersionByRunId).set(
           runId,
-          latest
+          initialV
         );
       }
     })().finally(() => {
@@ -149,12 +184,28 @@
   }
 
   async function onSelectVersion(no: number): Promise<void> {
+    // Stage 4.12 — drafts are real V#s in `versionsLoaded` (computed as
+    // `latest_frozen + edit_count`). No more -1 sentinel: every row in
+    // the timeline has a real V#.
+
+    // Stage 4.12 — when switching to a different V#, cancel any
+    // pending/in-flight autosave and mark the editor clean so a stale
+    // autosave from the previous view doesn't pollute the new one.
+    // The new V#'s content is loaded below from the server (fresh).
+    clearAutosaveTimer();
+    if (autosaveAbort) {
+      autosaveAbort.abort();
+      autosaveAbort = null;
+    }
+    autosaveInFlight = false;
+    autosaveError = null;
+    editorDirty = false;
+
     viewingVersionNo = no;
     setCurrentVersionNo(no);
     if (activeRunId) {
       // Record per-file current view version so "Download all files"
-      // bundles each file's currently-viewing version's .docx, not just
-      // the active file's.
+      // bundles each file's currently-viewing version's .docx.
       viewingVersionByRunId = new Map(viewingVersionByRunId).set(
         activeRunId,
         no
@@ -234,6 +285,25 @@
   let rejectModalOpen = $state(false);
   let approveNote = $state('');
   let rejectNote = $state('');
+  // Stage 4.13 — autosave-draft state. `autosaveClientEditId` is
+  // generated ONCE per session (per user, per run) and reused for
+  // every save. Same id within 60s → server UPDATE-in-place (content
+  // updates, V# stays stable). After 60s, the next save with the same
+  // id... actually it still matches the last row so it updates again.
+  // The 60s window only matters for network retries: a true retry
+  // with the same edit_id within 60s gets the cached response.
+  // `autosaveInFlight` gates the "Saving…" status; `autosaveError` is
+  // shown when the most-recent attempt failed.
+  let autosaveClientEditId = $state<string>(crypto.randomUUID());
+  let autosaveEditId = $state<string | null>(null);
+  let autosaveEditCount = $state<number>(0);
+  let autosaveSavedAt = $state<string | null>(null);
+  let autosaveDraftVersionNo = $state<number>(0);
+  let autosaveInFlight = $state<boolean>(false);
+  let autosaveError = $state<string | null>(null);
+  // `nowTick` is bumped every 30s so `timeAgo(autosaveSavedAt)`
+  // re-evaluates and the "Saved Ns ago" text stays current.
+  let nowTick = $state<number>(Date.now());
   // Stage 3 — actor / reviewer identity is now derived from the
   // logged-in user (currentUser). The free-text "Your name" input
   // is gone; the action bar shows the current username read-only.
@@ -291,6 +361,15 @@
     currentVersionEntry?.review_status ?? 'draft'
   );
 
+  // Stage 4.12 — drafting rows now live in `versionsLoaded` with
+  // `kind: 'draft'` and `review_status: 'drafting'`. The CURRENT STATE
+  // badge just reflects the row's actual status (no sentinel).
+  let onDraft = $derived(currentVersionEntry?.kind === 'draft');
+  let displayStatus = $derived(
+    onDraft ? 'drafting' : currentStatus
+  );
+  let displayVersionNo = $derived(viewingVersionNo ?? 0);
+
   async function refreshAfterVersionMutation(): Promise<void> {
     if (!activeRunId) return;
     try {
@@ -322,49 +401,127 @@
     }
   }
 
-  async function onSaveVersion(): Promise<void> {
-    if (!activeRunId) return;
-    const summary = changeSummary.trim();
-    if (!summary) {
-      errorBanner = 'Please enter a change summary before saving.';
-      return;
-    }
-    savingVersion = true;
-    errorBanner = null;
-    successBanner = null;
-    try {
-      const linesJson = JSON.stringify(editableLines);
-      const v = await saveVersion(activeRunId, {
-        lines_json: linesJson,
-        change_summary: summary,
-        actor: actorName
-      });
-      changeSummary = '';
-      savedRevision = editRevision;
-      successBanner = `Saved V${v.version_no}.`;
-      await jumpToVersion(v.version_no);
-      await refreshAfterVersionMutation();
-    } catch (e) {
-      errorBanner = e instanceof Error ? e.message : String(e);
-    } finally {
-      savingVersion = false;
+  // Stage 4.11 — autosave: debounced POST to /api/runs/<id>/draft.
+  // `AUTOSAVE_DEBOUNCE_MS` is the quiet-period after the last
+  // keystroke before we POST. The same `client_edit_id` (stable
+  // per session) is reused so a network-retry of the same intent
+  // is idempotent server-side.
+  const AUTOSAVE_DEBOUNCE_MS = 1500;
+  let autosaveTimer: ReturnType<typeof setTimeout> | null = null;
+  let autosaveAbort: AbortController | null = null;
+
+  function clearAutosaveTimer(): void {
+    if (autosaveTimer) {
+      clearTimeout(autosaveTimer);
+      autosaveTimer = null;
     }
   }
 
+  async function flushAutosave(): Promise<void> {
+    if (!activeRunId) return;
+    if (autosaveAbort) {
+      // Cancel any in-flight request so the newer state wins.
+      autosaveAbort.abort();
+    }
+    const controller = new AbortController();
+    autosaveAbort = controller;
+    autosaveInFlight = true;
+    autosaveError = null;
+    try {
+      const linesJson = JSON.stringify(editableLines);
+      // Stage 4.13 — use the stable per-session `autosaveClientEditId`.
+      // Server uses the 60s idempotency window + UPDATE-in-place to
+      // update the SAME draft row with new content. No new V# is
+      // created for in-progress editing.
+      const resp = await saveDraft(
+        activeRunId, linesJson, autosaveClientEditId
+      );
+      autosaveEditId = resp.edit_id;
+      autosaveEditCount = resp.edit_count;
+      autosaveSavedAt = resp.saved_at;
+      // Stage 4.14 — refresh versionsLoaded so the latest timeline
+      // state (including any new draft row created after a 60s gap)
+      // is reflected in the UI. V# is computed from the server's
+      // response: latest_frozen + edit_count.
+      try {
+        const vs = await listVersions(activeRunId);
+        versionsLoaded = vs;
+        setVersions(vs);
+      } catch {
+        /* non-fatal — fall back to resp.draft_version_no */
+        autosaveDraftVersionNo = resp.draft_version_no;
+      }
+      autosaveDraftVersionNo = resp.draft_version_no;
+      savedRevision = editRevision;
+      nowTick = Date.now();
+    } catch (e) {
+      // AbortError is intentional — don't show it as a failure.
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.toLowerCase().includes('abort')) return;
+      autosaveError = msg;
+    } finally {
+      if (autosaveAbort === controller) {
+        autosaveAbort = null;
+      }
+      autosaveInFlight = false;
+    }
+  }
+
+  function scheduleAutosave(): void {
+    if (!canEdit) return;  // viewers never autosave
+    clearAutosaveTimer();
+    autosaveTimer = setTimeout(() => {
+      autosaveTimer = null;
+      flushAutosave();
+    }, AUTOSAVE_DEBOUNCE_MS);
+  }
+
+  // Derived: the human-readable save-status string shown in the action
+  // bar. Pure presentation; never used for logic.
+  let autosaveStatusText = $derived.by(() => {
+    // Force re-evaluation of "Ns ago" every 30s.
+    void nowTick;
+    if (autosaveError) {
+      return `Autosave failed: ${autosaveError}`;
+    }
+    if (autosaveInFlight) {
+      return 'Saving…';
+    }
+    if (autosaveSavedAt) {
+      const ago = timeAgo(autosaveSavedAt);
+      return `Saved ${ago} · editing V${autosaveDraftVersionNo}`;
+    }
+    return 'No edits yet';
+  });
+
   async function onSubmit(): Promise<void> {
-    if (!activeRunId || !viewingVersionNo) return;
+    if (!activeRunId) return;
     submitting = true;
     errorBanner = null;
     successBanner = null;
     try {
-      const updated = await submitForReview(
-        activeRunId,
-        viewingVersionNo,
-        actorName
-      );
+      // Stage 4.13 — flush any pending autosave BEFORE submit so the
+      // server's draft is the freshest possible snapshot. Submit
+      // consumes the (single) draft into a new frozen version.
+      clearAutosaveTimer();
+      if (autosaveInFlight) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 300));
+      }
+      if (editorDirty) {
+        await flushAutosave();
+      }
+      // Single draft row per run; the server picks it by default.
+      const updated = await submitDraft(activeRunId, viewingVersionNo);
       successBanner = `V${updated.version_no} is now In Review.`;
-      await jumpToVersion(viewingVersionNo);
-      await refreshAfterVersionMutation();
+      autosaveEditCount = 0;
+      autosaveSavedAt = null;
+      autosaveDraftVersionNo = 0;
+      autosaveEditId = null;
+      savedRevision = editRevision;
+      await loadReviewData(activeRunId);
+      if (updated.version_no != null) {
+        await jumpToVersion(updated.version_no);
+      }
     } catch (e) {
       errorBanner = e instanceof Error ? e.message : String(e);
     } finally {
@@ -456,6 +613,14 @@
     editorRef?.reset();
     editRevision = 0;
     savedRevision = 0;
+    // Stage 4.11 — also clear any in-flight autosave so we don't
+    // write back the discarded content.
+    clearAutosaveTimer();
+    if (autosaveAbort) {
+      autosaveAbort.abort();
+      autosaveAbort = null;
+    }
+    autosaveError = null;
   }
 
   function closeEditor(): void {
@@ -467,6 +632,7 @@
   function onEditorChange(updated: PreviewLine[]): void {
     editableLines = updated;
     editRevision = editRevision + 1;
+    scheduleAutosave();
   }
 
 
@@ -488,12 +654,78 @@
   $effect(() => {
     if (activeRunId && activeRunId !== lastLoadedRunId) {
       lastLoadedRunId = activeRunId;
+      // Stage 4.13 — when switching to a new run, generate a fresh
+      // `autosaveClientEditId` so a new draft row is created for the
+      // new run (and no collision with the previous run's draft).
+      // Also reset autosave state and clear pending timers.
+      autosaveClientEditId = crypto.randomUUID();
+      autosaveEditId = null;
+      autosaveEditCount = 0;
+      autosaveSavedAt = null;
+      autosaveDraftVersionNo = 0;
+      autosaveError = null;
+      clearAutosaveTimer();
+      if (autosaveAbort) {
+        autosaveAbort.abort();
+        autosaveAbort = null;
+      }
       loadPreview(activeRunId);
       loadReviewData(activeRunId);
       refreshDownloadLabel();
       refreshYourAccess(activeRunId);
+      // Stage 4.13 — fetch the autosave draft and apply it on top
+      // of whatever the latest frozen version was. This makes a
+      // page refresh "resume" the in-progress edits.
+      loadDraftAndApply(activeRunId);
     }
   });
+
+  // Stage 4.11 — refresh "Saved Ns ago" every 30s without re-renders
+  // elsewhere.
+  $effect(() => {
+    const handle = setInterval(() => {
+      nowTick = Date.now();
+    }, 30_000);
+    return () => clearInterval(handle);
+  });
+
+async function loadDraftAndApply(runId: string): Promise<void> {
+    // Stage 4.14 — multi-draft per run (each session/60s-window gets
+    // its own row). On page load, refresh the list and jump to the
+    // LATEST draft (highest V# = newest 60s window).
+    try {
+      const vs = await listVersions(runId);
+      versionsLoaded = vs;
+      setVersions(vs);
+      const drafts = vs
+        .filter((v) => v.kind === 'draft')
+        .sort((a, b) => b.version_no - a.version_no);
+      if (drafts.length === 0) return;
+      const latestDraft = drafts[0];
+      viewingVersionNo = latestDraft.version_no;
+      setCurrentVersionNo(latestDraft.version_no);
+      viewingVersionByRunId = new Map(viewingVersionByRunId).set(
+        runId,
+        latestDraft.version_no
+      );
+      autosaveEditCount = latestDraft.edit_count ?? 1;
+      autosaveSavedAt = latestDraft.modified_at;
+      autosaveDraftVersionNo = latestDraft.version_no;
+      try {
+        const resp = await getVersion(runId, latestDraft.version_no);
+        if (resp && Array.isArray(resp.lines_json)) {
+          editableLines = resp.lines_json as PreviewLine[];
+          editRevision = editRevision + 1;
+          savedRevision = editRevision;
+          if (typeof editorRef?.applyExternalContent === 'function') {
+            await tick();
+            editorRef.applyExternalContent(editableLines);
+          }
+        }
+      } catch { /* ignore */ }
+      nowTick = Date.now();
+    } catch { /* ignore — fall back to frozen view */ }
+  }
 
   function onPickerChange(e: Event): void {
     const target = e.target as HTMLSelectElement | null;
@@ -687,12 +919,12 @@
   {/if}
 
   <!-- Stage 5/6 - state-machine action bar + editor + modals. -->
-  {#if activeRunId && currentVersionEntry}
+  {#if activeRunId && (currentVersionEntry || onDraft)}
     <div id="review-action-bar" class="max-w-4xl mb-12">
       <div class="ra-status-row">
         <span class="mono-label">CURRENT STATE</span>
-        <span class="ra-status-badge ra-status-{currentStatus}" data-status={currentStatus}>
-          {currentStatus.toUpperCase().replace('_', ' ')} (V{viewingVersionNo})
+        <span class="ra-status-badge ra-status-{displayStatus}" data-status={displayStatus}>
+          {displayStatus.toUpperCase().replace('_', ' ')} (V{displayVersionNo})
         </span>
       </div>
 
@@ -709,79 +941,59 @@
         </div>
       {/if}
 
-      <div class="ra-actor-row" data-testid="actor-row">
+      <div class="ra-actor-row ra-actor-row-inline" data-testid="actor-row">
         <span class="mono-label">ACTOR</span>
         <span class="ra-actor-display" data-testid="actor-name">
           {actorName}{isAdmin ? ' · admin' : ''}
         </span>
+        <span class="ra-divider">·</span>
+        <span class="ra-saved-status-inline-text" data-testid="saved-text">{autosaveStatusText}</span>
+        <span class="ra-actions-inline">
+          {#if canSubmit && (currentStatus === 'draft' || currentStatus === 'drafting' || currentStatus === 'rejected')}
+            <button
+              class="pill-btn"
+              onclick={onSubmit}
+              disabled={submitting}
+            >
+              {submitting ? 'Submitting…' : 'Submit for Review'}
+            </button>
+          {:else if canReview && currentStatus === 'in_review'}
+            <button
+              class="pill-btn"
+              onclick={() => (approveModalOpen = true)}
+              disabled={reviewActing}
+            >
+              Approve…
+            </button>
+            <button
+              class="pill-btn-ghost"
+              onclick={() => (rejectModalOpen = true)}
+              disabled={reviewActing}
+            >
+              Request Changes…
+            </button>
+          {:else if canReview && currentStatus === 'approved'}
+            <button
+              class="pill-btn"
+              onclick={onPublish}
+              disabled={publishing}
+            >
+              {publishing ? 'Publishing…' : 'Publish & Generate DOCX'}
+            </button>
+            <button
+              class="pill-btn-ghost"
+              onclick={() => (rejectModalOpen = true)}
+              disabled={reviewActing}
+            >
+              Send back for revisions…
+            </button>
+          {:else if currentStatus === 'published'}
+            <span class="ra-banner ra-banner-success mono-underline">
+              V{viewingVersionNo} is final. Editing creates V{(viewingVersionNo ?? 0) + 1} as a new draft.
+            </span>
+          {/if}
+        </span>
       </div>
-
-      <div class="ra-actions">
-        <input
-          type="text"
-          class="ra-summary-input"
-          placeholder="Describe what changed in this version (required)"
-          bind:value={changeSummary}
-          maxlength="200"
-        />
-        {#if canEdit}
-          <button
-            class="pill-btn"
-            onclick={onSaveVersion}
-            disabled={!editorDirty || !changeSummary.trim() || savingVersion}
-          >
-            {savingVersion ? 'Saving…' : 'Save as new version'}
-          </button>
-          <button class="pill-btn-ghost" onclick={cancelEditor} disabled={savingVersion}>
-            Discard edits
-          </button>
-        {/if}
-
-        {#if canSubmit && (currentStatus === 'draft' || currentStatus === 'rejected')}
-          <button
-            class="pill-btn"
-            onclick={onSubmit}
-            disabled={submitting}
-          >
-            {submitting ? 'Submitting…' : 'Submit for Review'}
-          </button>
-        {:else if canReview && currentStatus === 'in_review'}
-          <button
-            class="pill-btn"
-            onclick={() => (approveModalOpen = true)}
-            disabled={reviewActing}
-          >
-            Approve…
-          </button>
-          <button
-            class="pill-btn-ghost"
-            onclick={() => (rejectModalOpen = true)}
-            disabled={reviewActing}
-          >
-            Request Changes…
-          </button>
-        {:else if canReview && currentStatus === 'approved'}
-          <button
-            class="pill-btn"
-            onclick={onPublish}
-            disabled={publishing}
-          >
-            {publishing ? 'Publishing…' : 'Publish & Generate DOCX'}
-          </button>
-          <button
-            class="pill-btn-ghost"
-            onclick={() => (rejectModalOpen = true)}
-            disabled={reviewActing}
-          >
-            Send back for revisions…
-          </button>
-        {:else if currentStatus === 'published'}
-          <span class="ra-banner ra-banner-success mono-underline">
-            V{viewingVersionNo} is final. Editing creates V{(viewingVersionNo ?? 0) + 1} as a new draft.
-          </span>
-        {/if}
-      </div>
-    </div>
 
     {#if approveModalOpen}
       <div
@@ -840,7 +1052,7 @@
           aria-modal="true"
           tabindex="-1"
         >
-          <div class="ra-modal-header">Reject V{viewingVersionNo} (back to draft)</div>
+          <div class="ra-modal-header">Reject V{viewingVersionNo}</div>
           <textarea
             class="ra-modal-textarea"
             placeholder="Rejection reason (required)"
@@ -866,6 +1078,7 @@
         </div>
       </div>
     {/if}
+    </div>
   {/if}
 
   <div class="border-t border-[#111111] mt-8 pt-12 max-w-4xl">

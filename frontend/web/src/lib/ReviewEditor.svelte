@@ -393,10 +393,14 @@
     $state(null);
 
   /** Replace editor content with `newLines`. Used by Review.svelte on
-   *  version jump. Resets history so undo doesn't cross version boundaries. */
+   *  version jump. Resets history so undo doesn't cross version boundaries.
+   *  Also sets `suppressNextChange = true` so the CKEditor "content
+   *  change" event that fires from `setHtml` is ignored by `onChange`,
+   *  preventing a spurious autosave. */
   export function applyExternalContent(newLines: PreviewLine[]): void {
     history = [];
     redoStack = [];
+    suppressNextChange = true;
     if (ckEditorRef) ckEditorRef.setHtml(buildUnifiedInitialHtml(newLines));
     else initialHtml = buildUnifiedInitialHtml(newLines);
   }
@@ -404,10 +408,22 @@
   /** Initial html used on first mount only. */
   let initialHtml = $state(buildUnifiedInitialHtml(lines));
 
+  /** Set true by `applyExternalContent` so the first `onSlotChange`
+   *  triggered by CKEditor's `setHtml` is ignored. Prevents a
+   *  programmatic load (V-switch / draft load) from triggering a
+   *  spurious autosave on the host. */
+  let suppressNextChange = $state(false);
+
   /** CkEditor calls this on every change. Translate to lines and emit
    *  to the host. */
   function onSlotChange(_slot: SlotKind, html: string, text: string): void {
     if (readonly) return;
+    if (suppressNextChange) {
+      suppressNextChange = false;
+      // Still update internal state, but don't emit to the host so
+      // the host's autosave isn't triggered for a programmatic load.
+      return;
+    }
     pushHistory(lines);
     const next = htmlToLines(html, 0, text);
     emitChange(next);

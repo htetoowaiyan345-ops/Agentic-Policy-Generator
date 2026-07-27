@@ -10,7 +10,9 @@
   let { versions, selectedVersionNo, onSelect }: Props = $props();
 
   let ordered = $derived(
-    versions ? [...versions].sort((a, b) => b.version_no - a.version_no) : []
+    versions
+      ? [...versions].sort((a, b) => b.version_no - a.version_no)
+      : []
   );
 
   function fmt(iso: string | null | undefined): string {
@@ -38,7 +40,11 @@
   {:else}
     <ul class="vt-list">
       {#each ordered as v (v.version_no)}
-        <li class="vt-row" data-active={v.version_no === selectedVersionNo}>
+        <li
+          class="vt-row"
+          class:vt-row-sticky={v.version_no === selectedVersionNo}
+          data-active={v.version_no === selectedVersionNo}
+        >
           <div class="vt-row-header">
             <span class="vt-num mono-tag">V{v.version_no}</span>
             <span class="vt-status badge-hu">{statusLabel(v.review_status)}</span>

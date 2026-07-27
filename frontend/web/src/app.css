@@ -143,9 +143,23 @@ input, select, textarea {
 .vt-wrap { border: 1px solid var(--ink); background: #fff; padding: 16px; }
 .vt-header { margin-bottom: 10px; padding-bottom: 6px; border-bottom: 1px solid var(--ink); }
 .vt-empty { color: var(--ink); font-weight: 500; }
-.vt-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.vt-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 24rem;
+  overflow-y: auto;
+  padding-right: 4px;
+  border-bottom: 1px solid var(--ink-60);
+}
 .vt-row { border-left: 3px solid var(--ink); padding: 6px 10px; background: var(--cream); }
 .vt-row[data-active="true"] { border-left-color: var(--accent); background: #fff; box-shadow: 0 0 0 1px var(--accent); }
+/* Stage 4.12 — the "Currently Viewing" row sticks to the top of the
+   scrollable timeline so the user can re-find it while scrolling. */
+.vt-row-sticky { position: sticky; top: 0; z-index: 2; box-shadow: 0 4px 6px -4px rgba(0,0,0,0.15); }
 .vt-row-header { display: flex; align-items: center; gap: 8px; }
 .vt-num { font-size: 11px; padding: 2px 6px; background: var(--ink); color: #fff; border-radius: 0; }
 .vt-status { font-family: var(--mono); font-size: 10px; font-weight: 600; padding: 2px 6px; border: 1px solid var(--ink); background: #fff; color: var(--ink); }
@@ -211,6 +225,11 @@ input, select, textarea {
 .ra-status-approved { color: #0a7a2a; border-color: #0a7a2a; }
 .ra-status-rejected { color: var(--accent); border-color: var(--accent); }
 .ra-status-published { background: #0a7a2a; color: #fff; border-color: #0a7a2a; }
+/* Stage 4.11 — live autosave draft. Distinct from `.ra-status-draft`
+   (a frozen V whose status is still 'draft'). Same border + color as
+   `.ra-status-draft` to honour the "no color change" instruction, but
+   the text reads "DRAFTING" so it never collides with a frozen V. */
+.ra-status-drafting { color: var(--ink); border-style: dashed; }
 .ra-banner { padding: 8px 12px; margin: 8px 0; font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: 0.04em; }
 .ra-banner-error { color: var(--accent); border: 1px solid var(--accent); background: rgba(214,40,40,0.05); }
 .ra-banner-success { color: #0a7a2a; border: 1px solid #0a7a2a; background: rgba(10,122,42,0.05); }
@@ -1016,6 +1035,66 @@ input, select, textarea {
 .ps-save-btn:disabled, .ps-cancel-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* Stage 4.11 — autosave-draft status line.
+   Replaces the "Save as new version" button with a live text indicator. */
+.ra-saved-status {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  padding: 4px 10px;
+  border: 1px solid var(--ink);
+  background: var(--cream);
+  color: var(--ink);
+  min-width: 12rem;
+}
+.ra-saved-status[data-state="saving"] {
+  background: rgba(255, 244, 196, 0.7);  /* pale yellow while in-flight */
+}
+.ra-saved-status[data-state="saved"] {
+  background: rgba(200, 230, 201, 0.55);  /* pale green on success */
+}
+.ra-saved-status[data-state="error"] {
+  background: rgba(255, 200, 200, 0.6);   /* pale red on failure */
+  border-color: var(--ink);
+}
+.ra-saved-status[data-state="idle"] {
+  background: #fafafa;
+  color: #555;
+}
+/* Stage 4.15 — ACTOR and saved-status sit next to each other on one
+   inline line. Each retains its own styling (border, padding) so they
+   look like 2 separate elements rather than one grouped box. */
+.ra-actor-row-inline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 10px 0;
+}
+.ra-saved-status-inline-text {
+  font-family: var(--mono) !important;
+  font-size: 12px !important;
+  letter-spacing: 0.04em;
+  padding: 6px 10px !important;
+  border: 1px solid var(--ink) !important;
+  background-color: var(--cream) !important;
+  color: var(--ink) !important;
+  display: inline-block;
+}
+.ra-actions-inline {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-left: 12px;
+  padding-left: 12px;
+  border-left: 1px solid var(--ink-60);
+}
+.ra-divider {
+  color: var(--ink-60);
+  margin: 0 4px;
 }
 
 /* Stage 4.7 — share access badge (Flow 3) */

@@ -428,3 +428,274 @@ def _row_to_dict(row: sqlite3.Row | None) -> dict | None:
     if not row:
         return None
     return {k: row[k] for k in row.keys()}
+
+
+# ---------------------------------------------------------------------------
+# Stage 4.11 / 4.12 — policy_drafts table (append-only draft history per run).
+#
+# Stage 4.12: each autosave creates a NEW row, not an overwrite. Rows
+# are deleted on submit. The PK is `draft_id` AUTOINCREMENT so multiple
+# rows can coexist for the same run, one per autosave. Idempotent on
+# `last_edit_id` (60s window) to prevent duplicate rows on retry.
+# ---------------------------------------------------------------------------
+
+DRAFTS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS policy_drafts (
+    draft_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id        TEXT NOT NULL,
+    lines_json    TEXT NOT NULL,
+    last_edit_id  TEXT,
+    edit_count    INTEGER NOT NULL DEFAULT 0,
+    modified_by   TEXT NOT NULL DEFAULT 'system',
+    actor_user_id INTEGER,
+    modified_at   TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_drafts_run_count
+    ON policy_drafts (run_id, edit_count);
+
+CREATE INDEX IF NOT EXISTS idx_drafts_run_editid
+    ON policy_drafts (run_id, last_edit_id);
+"""
+
+
+def init_drafts_table(conn) -> None:
+    """Create the policy_drafts table + indexes. Idempotent.
+
+    Stage 4.13 — single mutable draft row per run (Stage 4.11 design
+    revisited). Schema is the same as Stage 4.12 (draft_id PK) but the
+    upsert logic treats the table as single-row-per-run with 60s
+    update-in-place window.
+
+    Old residue (Stage 4.12 leftover rows) is acceptable; the active
+    draft is the one matching the current session's edit_id, others
+    are orphans. To keep the timeline clean, we drop the table on
+    startup — old drafts are test residue.
+    """
+    conn.execute("DROP TABLE IF EXISTS policy_drafts")
+    conn.executescript(DRAFTS_SCHEMA_SQL)
+    conn.commit()
+
+
+def _draft_idempotency_check(conn, run_id: str, edit_id: str) -> bool:
+    """Return True if the same edit_id was already inserted in the
+    last 60 seconds (caller should NOT insert a new row)."""
+    if not edit_id:
+        return False
+    row = conn.execute(
+        "SELECT modified_at FROM policy_drafts WHERE run_id = ? "
+        "AND last_edit_id = ? ORDER BY modified_at DESC LIMIT 1",
+        (run_id, edit_id),
+    ).fetchone()
+    if not row:
+        return False
+    try:
+        from datetime import datetime
+        prev = datetime.fromisoformat(row["modified_at"].replace("Z", "+00:00"))
+        now = datetime.fromisoformat(_now().replace("Z", "+00:00"))
+        return (now - prev).total_seconds() < 60
+    except Exception:
+        return False
+
+
+def get_draft(conn, run_id: str) -> dict | None:
+    """Return the LATEST draft row for `run_id` (highest edit_count),
+    or None.
+    """
+    row = conn.execute(
+        "SELECT * FROM policy_drafts WHERE run_id = ? "
+        "ORDER BY edit_count DESC LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    return _row_to_dict(row)
+
+
+def list_drafts(conn, run_id: str) -> list[dict]:
+    """All draft rows for `run_id`, ordered by edit_count ASC."""
+    rows = conn.execute(
+        "SELECT * FROM policy_drafts WHERE run_id = ? "
+        "ORDER BY edit_count ASC",
+        (run_id,),
+    ).fetchall()
+    return [_row_to_dict(r) for r in rows]
+
+
+def get_draft_by_edit_count(conn, run_id: str, edit_count: int) -> dict | None:
+    """Return the specific draft row matching `edit_count`, or None."""
+    row = conn.execute(
+        "SELECT * FROM policy_drafts WHERE run_id = ? AND edit_count = ?",
+        (run_id, edit_count),
+    ).fetchone()
+    return _row_to_dict(row)
+
+
+def upsert_draft(
+    conn,
+    run_id: str,
+    lines_json: str,
+    edit_id: str,
+    actor: str = 'user',
+    actor_user_id: int | None = None,
+    append_audit: bool = True,
+) -> dict:
+    """Stage 4.14 — per-session draft with 60s update window.
+
+    Behavior:
+      - Look for an existing draft row for (run_id, edit_id) whose
+        `modified_at` is within the last 60s.
+      - If found: UPDATE that row in place (lines_json + modified_by +
+        modified_at; edit_count stable). Same V# stays.
+      - If NOT found (no draft OR last save was 60s+ ago OR different
+        edit_id from a different user): INSERT a new row with
+        edit_count = MAX + 1. This creates a new V# in the timeline.
+
+    The 60s window is per (run_id, edit_id) so each user's session
+    has its own update window. Rapid typing within 60s updates the
+    SAME row (no new V#); pausing typing for 60s+ causes the next
+    save to create a NEW V# row.
+    """
+    from datetime import datetime, timedelta, timezone
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=60)
+    ).isoformat()
+    recent = conn.execute(
+        "SELECT edit_count FROM policy_drafts "
+        "WHERE run_id = ? AND last_edit_id = ? AND modified_at >= ?",
+        (run_id, edit_id, cutoff),
+    ).fetchone()
+    if recent is not None:
+        # Within 60s — UPDATE in place (same V#).
+        new_count = int(recent["edit_count"])
+        conn.execute(
+            """UPDATE policy_drafts
+               SET lines_json = ?, modified_by = ?,
+                   actor_user_id = ?, modified_at = ?
+               WHERE run_id = ? AND last_edit_id = ?""",
+            (lines_json, actor, actor_user_id, _now(),
+             run_id, edit_id),
+        )
+    else:
+        # Either no draft yet, or last save was 60s+ ago, or different
+        # edit_id (different user). INSERT a new row.
+        max_row = conn.execute(
+            "SELECT COALESCE(MAX(edit_count), 0) AS m "
+            "FROM policy_drafts WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        new_count = int(max_row["m"]) + 1
+        conn.execute(
+            """INSERT INTO policy_drafts
+               (run_id, lines_json, last_edit_id, edit_count,
+                modified_by, actor_user_id, modified_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (run_id, lines_json, edit_id, new_count,
+             actor, actor_user_id, _now()),
+        )
+    if append_audit:
+        conn.execute(
+            """INSERT INTO audit_log
+               (run_id, version_no, event_type, actor, actor_user_id,
+                details, created_at)
+               VALUES (?, NULL, 'edited', ?, ?, ?, ?)""",
+            (
+                run_id,
+                actor,
+                actor_user_id,
+                f"autosave edit #{new_count} ({edit_id[:8]})",
+                _now(),
+            ),
+        )
+    conn.commit()
+    return get_draft(conn, run_id)
+
+
+def delete_draft(conn, run_id: str) -> bool:
+    """Drop ALL draft rows for `run_id`. Returns True if any row was removed."""
+    cur = conn.execute(
+        "DELETE FROM policy_drafts WHERE run_id = ?", (run_id,)
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def delete_draft_by_edit_count(conn, run_id: str, edit_count: int) -> bool:
+    """Drop a single draft row by its edit_count. Returns True on success."""
+    cur = conn.execute(
+        "DELETE FROM policy_drafts WHERE run_id = ? AND edit_count = ?",
+        (run_id, edit_count),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def consume_draft_into_version(
+    conn,
+    run_id: str,
+    change_summary: str = "Submitted from draft",
+    actor: str = "user",
+    actor_user_id: int | None = None,
+    draft_edit_count: int | None = None,
+) -> dict | None:
+    """Stage 4.12 — snapshot a draft row into a NEW frozen
+    `policy_versions` row, delete ONLY that draft row, return the new
+    frozen version entry.
+
+    If `draft_edit_count` is given, consume THAT specific draft row
+    ('Submit Only the Currently Viewed Version'). Otherwise fall back
+    to the row with `MAX(edit_count)` (latest). Other drafting rows
+    remain as orphan drafts in the Version History timeline.
+    """
+    if draft_edit_count is not None:
+        draft = get_draft_by_edit_count(conn, run_id, draft_edit_count)
+    else:
+        draft = get_draft(conn, run_id)
+    if not draft:
+        return None
+    row = conn.execute(
+        "SELECT COALESCE(MAX(version_no), 0) AS m FROM policy_versions WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    next_no = int(row["m"]) + 1
+    summary = (
+        f"{change_summary.strip()} (auto-saved edit #{draft['edit_count']})"
+        if change_summary and change_summary.strip()
+        else f"Auto-saved edit #{draft['edit_count']}"
+    )
+    cur = conn.execute(
+        """INSERT INTO policy_versions
+           (run_id, version_no, lines_json, change_summary, modified_by,
+            modified_at, review_status, source, actor_user_id)
+           VALUES (?, ?, ?, ?, ?, ?, 'draft', 'user_edit', ?)""",
+        (
+            run_id,
+            next_no,
+            draft["lines_json"],
+            summary,
+            actor,
+            _now(),
+            actor_user_id,
+        ),
+    )
+    conn.execute(
+        """INSERT INTO audit_log
+           (run_id, version_no, event_type, actor, actor_user_id,
+            details, created_at)
+           VALUES (?, ?, 'submitted', ?, ?, ?, ?)""",
+        (
+            run_id,
+            next_no,
+            actor,
+            actor_user_id,
+            f"V{next_no} submitted from draft edit #{draft['edit_count']} "
+            f"by {actor}",
+            _now(),
+        ),
+    )
+    delete_draft_by_edit_count(conn, run_id, draft["edit_count"])
+    return _row_to_dict(
+        conn.execute(
+            "SELECT * FROM policy_versions WHERE version_id = ?",
+            (cur.lastrowid,),
+        ).fetchone()
+    )

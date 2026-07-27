@@ -62,6 +62,11 @@ def init_db():
         # Stage 1 - workflow / version-control tables.
         versions_io.init_version_tables(c)
 
+        # Stage 4.11 - mutable draft table (one row per run). The draft
+        # is the in-progress edit buffer; on submit it's snapshotted
+        # into a frozen `policy_versions` row and the draft is removed.
+        versions_io.init_drafts_table(c)
+
         # Stage 1.4 (multi-user): project membership + reviewer assignment
         # + actor attribution. Idempotent.
         users.init_user_tables(c)

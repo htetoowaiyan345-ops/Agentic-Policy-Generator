@@ -61,7 +61,7 @@ export async function login(username: string, password: string): Promise<LoginRe
   });
   if (!res.ok) {
     const text = await res.text();
-    let detail = text;
+    let detail = text;  
     try {
       const parsed = JSON.parse(text);
       detail = parsed.message || parsed.error || text;
@@ -161,7 +161,19 @@ export async function getPreview(runId: string): Promise<PreviewData> {
   const res = await apiFetch(`${API_BASE}/preview/${runId}`);
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Preview failed (${res.status}): ${text}`);
+    let parsed: { error?: string; message?: string; status?: string } | null = null;
+    try {
+      parsed = text ? JSON.parse(text) : null;
+    } catch {
+      parsed = null;
+    }
+    if (parsed && (parsed.message || parsed.error)) {
+      const detail = parsed.message || parsed.error || 'preview unavailable';
+      throw new Error(detail, {
+        cause: { status: res.status, ...parsed }
+      });
+    }
+    throw new Error(`Preview failed (${res.status})`);
   }
   return (await res.json()) as PreviewData;
 }
@@ -559,4 +571,91 @@ export async function assignReviewer(
     throw new Error(`assignReviewer failed (${res.status}): ${text}`);
   }
   return (await res.json());
+}
+
+// -----------------------------------------------------------------------
+// Stage 4.11 — Autosave-draft bridge
+// -----------------------------------------------------------------------
+
+export interface DraftRow {
+  run_id: string;
+  draft_id: number;
+  lines_json: string;
+  last_edit_id: string | null;
+  edit_count: number;
+  modified_by: string;
+  actor_user_id: number | null;
+  modified_at: string;
+}
+
+export interface SaveDraftResp {
+  edit_id: string;
+  edit_count: number;
+  saved_at: string;
+  modified_by: string;
+  draft_version_no: number;
+}
+
+export async function getDraft(runId: string): Promise<DraftRow | null> {
+  const res = await apiFetch(`${API_BASE}/runs/${runId}/draft`);
+  if (!res.ok) {
+    if (res.status === 404) return null;
+    throw new Error(`getDraft failed (${res.status})`);
+  }
+  const data = (await res.json()) as { draft: DraftRow | null };
+  return data.draft || null;
+}
+
+export async function saveDraft(
+  runId: string,
+  linesJson: string,
+  clientEditId: string
+): Promise<SaveDraftResp> {
+  const res = await apiFetch(`${API_BASE}/runs/${runId}/draft`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      lines_json: linesJson,
+      client_edit_id: clientEditId
+    })
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`saveDraft failed (${res.status}): ${text}`);
+  }
+  return (await res.json()) as SaveDraftResp;
+}
+
+/** Stage 4.11 — submit the autosave buffer as the next version.
+ *  Calls the existing `/api/versions/<id>/<n>/submit` route with
+ *  `from_draft=true`; the server snapshots the draft into a new
+ *  frozen row and transitions it to in_review in one atomic step.
+ *  `version_no` is informational (server picks the next one).
+ */
+export async function submitDraft(
+  runId: string,
+  versionNo: number | null,
+  draftEditCount?: number | null
+): Promise<VersionEntry> {
+  // Stage 4.12 — "Submit Only the Currently Viewed Version". If a
+  // `draftEditCount` is provided, the server consumes ONLY that draft
+  // row (other drafting rows remain as orphan history). Otherwise the
+  // server picks the latest drafting row.
+  const body: Record<string, unknown> = { from_draft: true };
+  if (draftEditCount != null) {
+    body.draft_edit_count = draftEditCount;
+  }
+  const res = await apiFetch(
+    `${API_BASE}/versions/${runId}/${versionNo ?? 0}/submit`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`submitDraft failed (${res.status}): ${text}`);
+  }
+  return (await res.json()) as VersionEntry;
 }

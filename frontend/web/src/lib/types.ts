@@ -195,6 +195,13 @@ export interface VersionEntry {
   published_at: string | null;
   source: 'pipeline' | 'user_edit' | 'restore' | string;
   lines_json?: PreviewLine[];
+  /** Stage 4.12 — 'frozen' for policy_versions rows, 'draft' for
+   *  policy_drafts rows returned by /api/versions/<id>. */
+  kind?: 'frozen' | 'draft';
+  /** Stage 4.12 — only present when kind === 'draft'. */
+  draft_id?: number;
+  /** Stage 4.12 — only present when kind === 'draft'. */
+  edit_count?: number;
 }
 
 export interface ReviewComment {

@@ -13,13 +13,13 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 from pathlib import Path
 
-# backend/api/server.py → backend/ (parent)
+# backend/api/server.py Ã¢â€ â€™ backend/ (parent)
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 PROJECT_ROOT = BACKEND_DIR
 sys.path.insert(0, str(BACKEND_DIR))
 
 # Load .env file if present (used for ADMIN_PASSWORD etc.). No external
-# dependency — stdlib only. Existing real-env vars are NOT overwritten.
+# dependency Ã¢â‚¬â€ stdlib only. Existing real-env vars are NOT overwritten.
 _env_path = BACKEND_DIR / '.env'
 if _env_path.exists():
     try:
@@ -51,10 +51,10 @@ CORS_HEADERS_ALLOWED = 'Content-Type, Accept, Authorization'
 
 
 # ---------------------------------------------------------------------------
-# Phase 10 — preview-cache memoization
+# Phase 10 Ã¢â‚¬â€ preview-cache memoization
 #
 # `build_preview_from_docx` walks the published .docx via python-docx and
-# paragraph-normalises each one — a cold call costs ~2–3s, a warm call
+# paragraph-normalises each one Ã¢â‚¬â€ a cold call costs ~2Ã¢â‚¬â€œ3s, a warm call
 # ~25ms. We memoize the result keyed on (run_id, docx_path, docx_mtime) in
 # an LRU so that subsequent Step-03 opens for the same run are instant.
 #
@@ -63,7 +63,7 @@ CORS_HEADERS_ALLOWED = 'Content-Type, Accept, Authorization'
 #     when `runs.audit_json` is rewritten (Phase 6/8 hook).
 #   * TTL: 5 minutes. Even without explicit invalidation, the entry
 #     expires and gets rebuilt on the next request.
-#   * Size: max 64 entries — old ones evicted (LRU).
+#   * Size: max 64 entries Ã¢â‚¬â€ old ones evicted (LRU).
 # ---------------------------------------------------------------------------
 PREVIEW_CACHE_TTL_SEC = 5 * 60
 PREVIEW_CACHE_MAX = 64
@@ -74,7 +74,7 @@ class PreviewCache:
 
     Each entry is `(value, expire_at_ts, signature_str)` where
     `signature_str` is the (docx_path, docx_mtime, audit_json_len) tuple
-    stringified — used to detect stale entries without DB read."""
+    stringified Ã¢â‚¬â€ used to detect stale entries without DB read."""
 
     def __init__(self) -> None:
         self._data: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
@@ -142,6 +142,25 @@ def invalidate_preview_cache(run_id: str) -> None:
         _preview_cache.invalidate(run_id)
     except Exception:
         pass
+
+
+def _looks_like_uuid(s: str) -> bool:
+    """Cheap UUID-shape check: 8-4-4-4-12 hex digits (case-insensitive).
+    Accepts canonical `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` and
+    `xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx` (32 hex, no dashes) shapes.
+    Reject anything that isn't a recognizable UUID so we don't accept
+    user-supplied nonsense as an edit id.
+    """
+    if not s:
+        return False
+    stripped = s.replace('-', '')
+    if len(stripped) != 32:
+        return False
+    try:
+        int(stripped, 16)
+        return True
+    except ValueError:
+        return False
 
 
 def cors_headers(handler):
@@ -246,14 +265,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        # Stage 1.5 — auth routes (public, no require_auth).
+        # Stage 1.5 Ã¢â‚¬â€ auth routes (public, no require_auth).
         if path == '/api/auth/login':
             return self.handle_login()
         if path == '/api/auth/logout':
             return self.handle_logout()
         if path == '/api/upload':
             return self.handle_upload()
-        # Stage 4.2 — project-member add + mark-seen routes.
+        # Stage 4.2 Ã¢â‚¬â€ project-member add + mark-seen routes.
         m = re.match(
             r'^/api/runs/([a-f0-9]+)/members$', path
         )
@@ -264,7 +283,13 @@ class Handler(BaseHTTPRequestHandler):
         )
         if m:
             return self.handle_mark_project_seen(m.group(1))
-        # Stage 4.2 — reviewer-assignment route for `submit`.
+        # Stage 4.11 Ã¢â‚¬â€ autosave-draft (POST /api/runs/<id>/draft).
+        m = re.match(
+            r'^/api/runs/([a-f0-9]+)/draft$', path
+        )
+        if m:
+            return self.handle_post_draft(m.group(1))
+        # Stage 4.2 Ã¢â‚¬â€ reviewer-assignment route for `submit`.
         m = re.match(
             r'^/api/versions/([a-f0-9]+)/(\d+)/assign$', path
         )
@@ -304,7 +329,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = urlparse(self.path).path
-        # Stage 4.2 — project-member remove (Approver only).
+        # Stage 4.2 Ã¢â‚¬â€ project-member remove (Approver only).
         m = re.match(
             r'^/api/runs/([a-f0-9]+)/members/(\d+)$', path
         )
@@ -316,7 +341,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
-        # Stage 1.5 — auth routes (public for /me since it requires a token;
+        # Stage 1.5 Ã¢â‚¬â€ auth routes (public for /me since it requires a token;
         # the handler itself enforces auth).
         if path == '/api/auth/me':
             return self.handle_me()
@@ -324,20 +349,24 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_list_users()
         if path == '/api/history':
             return self.handle_history()
-        # Stage 4.2 — shareable-users (for Flow 1 popup type-ahead).
+        # Stage 4.2 Ã¢â‚¬â€ shareable-users (for Flow 1 popup type-ahead).
         if path == '/api/auth/shareable-users':
             return self.handle_list_shareable_users()
-        # Stage 4.10 — shared-projects feed for the Flow 2 bell
+        # Stage 4.10 Ã¢â‚¬â€ shared-projects feed for the Flow 2 bell
         # ("you've been added to <project>" notifications).
         if path == '/api/auth/shared-projects':
             return self.handle_list_shared_projects()
-        # Stage 4.2 — Flow 2 reviewer queue (assigned-to-me).
+        # Stage 4.2 Ã¢â‚¬â€ Flow 2 reviewer queue (assigned-to-me).
         if path == '/api/reviewer/queue':
             return self.handle_reviewer_queue()
-        # Stage 4.2 — Flow 1 members list + Flow 2 mark-seen.
+        # Stage 4.2 Ã¢â‚¬â€ Flow 1 members list + Flow 2 mark-seen.
         m = re.match(r'^/api/runs/([a-f0-9]+)/members$', path)
         if m:
             return self.handle_list_project_members(m.group(1))
+        # Stage 4.11 Ã¢â‚¬â€ autosave-draft read.
+        m = re.match(r'^/api/runs/([a-f0-9]+)/draft$', path)
+        if m:
+            return self.handle_get_draft(m.group(1))
         m = re.match(r'^/api/status/([a-f0-9]+)$', path)
         if m:
             return self.handle_status(m.group(1))
@@ -389,7 +418,7 @@ class Handler(BaseHTTPRequestHandler):
             run_dir.mkdir(exist_ok=True)
             src_path = run_dir / f'source{ext}'
             src_path.write_bytes(data)
-            # Stage 3 — record who created this run; the creator is
+            # Stage 3 Ã¢â‚¬â€ record who created this run; the creator is
             # auto-added to project_members as 'approver' in db.insert_run.
             db.insert_run(
                 run_id, filename, len(data),
@@ -472,7 +501,7 @@ class Handler(BaseHTTPRequestHandler):
             if not run or not run.get('docx_path'):
                 return send_json(self, {'error': 'no docx'}, status=404)
 
-            # Optional `version_no` query param — when provided, serve
+            # Optional `version_no` query param Ã¢â‚¬â€ when provided, serve
             # THAT specific version's .docx instead of the run's main
             # docx_path. Lets the user download the currently-viewing
             # version directly without having to publish first.
@@ -509,7 +538,7 @@ class Handler(BaseHTTPRequestHandler):
                                 download_name=f'Policy_Output_v{requested_no}.docx',
                             )
                             return
-                        # Approved but not yet published → build on the fly
+                        # Approved but not yet published Ã¢â€ â€™ build on the fly
                         # so the user can download their edited .docx
                         # immediately after approval without an explicit
                         # publish step.
@@ -526,7 +555,7 @@ class Handler(BaseHTTPRequestHandler):
                                     document_name=f'{run_id}_v{requested_no}_preview',
                                     fail_on_validation=False,
                                 )
-                                # Phase 8 — apply the Word-style header /
+                                # Phase 8 Ã¢â‚¬â€ apply the Word-style header /
                                 # footer (strip brackets, preserve logo,
                                 # add page X of Y) so the on-the-fly
                                 # download matches what publish produces.
@@ -577,14 +606,14 @@ class Handler(BaseHTTPRequestHandler):
         """Bundle one `.docx` per file in the Results dropdown into a
         single zip and stream it to the browser.
 
-        Per the user's spec ("Download all files — each file's currently
+        Per the user's spec ("Download all files Ã¢â‚¬â€ each file's currently
         viewing version"):
           - The frontend passes the list of run_ids it's showing in the
             Results dropdown via the `ids` query param (comma-separated),
             plus the current view version per file via the `versions`
             query param (comma-separated, parallel to `ids`).
           - For each (run_id, version_no) pair: bundle EXACTLY ONE
-            `.docx` — the current view version's `.docx`. No other
+            `.docx` Ã¢â‚¬â€ the current view version's `.docx`. No other
             versions are included.
           - Source files are EXCLUDED. No `manifest.txt`. Only `.docx`
             files in the zip.
@@ -606,7 +635,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 ids_list = [run_id]
 
-            # Stage 4.3 — auth + per-run membership check for every
+            # Stage 4.3 Ã¢â‚¬â€ auth + per-run membership check for every
             # requested run_id. 401 / 403 wins over any 404.
             from api.auth_middleware import require_auth, get_current_user
             current = require_auth(self)
@@ -765,7 +794,7 @@ class Handler(BaseHTTPRequestHandler):
                     status=404,
                 )
 
-            # Source file is EXPLICITLY excluded — see header docstring.
+            # Source file is EXPLICITLY excluded Ã¢â‚¬â€ see header docstring.
             # No `manifest.txt` either.
 
             zip_name = (
@@ -841,7 +870,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             user_id = current['id']
             is_admin = int(current.get('is_admin', 0)) == 1
-            # Stage 4.3 — return only runs the user can access (i.e. is a
+            # Stage 4.3 Ã¢â‚¬â€ return only runs the user can access (i.e. is a
             # member of, or is admin). Admins see everything.
             with db._conn() as c:
                 if is_admin:
@@ -900,7 +929,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_logout(self):
         """POST /api/auth/logout  body: {token} or Authorization: Bearer
-        Deletes the session. Idempotent — returns 200 even if token absent."""
+        Deletes the session. Idempotent Ã¢â‚¬â€ returns 200 even if token absent."""
         try:
             token = None
             auth = self.headers.get('Authorization', '')
@@ -922,7 +951,7 @@ class Handler(BaseHTTPRequestHandler):
             return send_json(self, {'error': f'logout: {e}'}, status=500)
 
     def handle_me(self):
-        """GET /api/auth/me  — returns the current user, or 401."""
+        """GET /api/auth/me  Ã¢â‚¬â€ returns the current user, or 401."""
         from api.auth_middleware import require_auth
         user = require_auth(self)
         if user is None:
@@ -930,7 +959,7 @@ class Handler(BaseHTTPRequestHandler):
         return send_json(self, {'user': user})
 
     def handle_list_users(self):
-        """GET /api/auth/users  — list all users (any logged-in user)."""
+        """GET /api/auth/users  Ã¢â‚¬â€ list all users (any logged-in user)."""
         from api.auth_middleware import require_auth
         user = require_auth(self)
         if user is None:
@@ -942,6 +971,20 @@ class Handler(BaseHTTPRequestHandler):
     # Stage 2 - workflow / version-control read handlers (READ-ONLY).
 
     def handle_versions_list(self, run_id):
+        """Stage 4.14 — return BOTH frozen rows AND in-progress draft
+        rows. Each draft row gets a computed V# = latest_frozen + N,
+        where N is the draft's position (1-based) in the ordered list
+        sorted by `edit_count` ASC.
+
+        Each item includes:
+          - `kind`: 'frozen' or 'draft'
+          - `version_no`: computed V# (frozen = stored, draft = latest_frozen + position)
+          - `draft_id`: PK of the policy_drafts row (only for drafts)
+          - `edit_count`: 1, 2, 3, ... (increments per 60s window)
+          - `lines_json`: included for drafts (small payload; needed
+            for click-to-load); excluded for frozen (clients call
+            `getVersion` separately if they need full lines).
+        """
         try:
             from api.auth_middleware import require_project_access
             result = require_project_access(self, run_id, 'viewer')
@@ -951,12 +994,37 @@ class Handler(BaseHTTPRequestHandler):
             if not run:
                 return send_json(self, {'error': 'unknown run_id'}, status=404)
             with db._conn() as c:
-                items = versions_io.get_versions(c, run_id)
-            send_json(self, {'items': items})
+                frozen = versions_io.get_versions(c, run_id)
+                drafts = versions_io.list_drafts(c, run_id)
+            latest_frozen = max((v["version_no"] for v in frozen), default=0)
+            merged = []
+            for f in frozen:
+                merged.append({**f, "kind": "frozen"})
+            # Sort drafts by edit_count ASC so V# assignment is stable.
+            drafts_sorted = sorted(drafts, key=lambda d: int(d["edit_count"]))
+            for i, d in enumerate(drafts_sorted, start=1):
+                merged.append({
+                    "version_no": latest_frozen + i,
+                    "edit_count": int(d["edit_count"]),
+                    "draft_id": int(d["draft_id"]),
+                    "review_status": "drafting",
+                    "modified_by": d["modified_by"],
+                    "modified_at": d["modified_at"],
+                    "lines_json": d["lines_json"],
+                    "kind": "draft",
+                })
+            send_json(self, {'items': merged})
         except Exception as e:
             send_json(self, {'error': f'versions_list: {e}'}, status=500)
 
     def handle_version_get(self, run_id, version_no):
+        """Stage 4.14 — `version_no` may refer to a frozen row OR a
+        drafting row (computed V# = latest_frozen + N where N is the
+        draft's position in edit_count order).
+
+        For drafts, we return the matching draft row's `lines_json`
+        plus its `kind='draft'` and `draft_id`.
+        """
         try:
             from api.auth_middleware import require_project_access
             result = require_project_access(self, run_id, 'viewer')
@@ -966,9 +1034,38 @@ class Handler(BaseHTTPRequestHandler):
             if not run:
                 return send_json(self, {'error': 'unknown run_id'}, status=404)
             with db._conn() as c:
+                frozen = versions_io.get_versions(c, run_id)
+                drafts = versions_io.list_drafts(c, run_id)
+            latest_frozen = max((v["version_no"] for v in frozen), default=0)
+            if version_no > latest_frozen:
+                # Find the Nth draft (sorted by edit_count ASC).
+                drafts_sorted = sorted(
+                    drafts, key=lambda d: int(d["edit_count"])
+                )
+                idx = int(version_no) - latest_frozen - 1
+                if 0 <= idx < len(drafts_sorted):
+                    draft = drafts_sorted[idx]
+                    try:
+                        lines = json.loads(draft["lines_json"])
+                    except Exception:
+                        lines = []
+                    send_json(self, {
+                        'version_no': int(version_no),
+                        'kind': 'draft',
+                        'draft_id': int(draft["draft_id"]),
+                        'edit_count': int(draft["edit_count"]),
+                        'review_status': 'drafting',
+                        'modified_by': draft["modified_by"],
+                        'modified_at': draft["modified_at"],
+                        'lines_json': lines,
+                    })
+                    return
+                return send_json(self, {'error': 'version not found'}, status=404)
+            with db._conn() as c:
                 v = versions_io.get_version(c, run_id, version_no)
             if not v:
                 return send_json(self, {'error': 'version not found'}, status=404)
+            v['kind'] = 'frozen'
             send_json(self, v)
         except Exception as e:
             send_json(self, {'error': f'version_get: {e}'}, status=500)
@@ -1025,7 +1122,7 @@ class Handler(BaseHTTPRequestHandler):
                 return send_json(self, {'error': 'comment body required'}, status=400)
             anchor_kind = body.get('anchor_kind')
             anchor_key = body.get('anchor_key')
-            # Stage 3 — author identity comes from the session. The
+            # Stage 3 Ã¢â‚¬â€ author identity comes from the session. The
             # body `author` field is now ignored.
             author = current["username"]
             author_user_id = int(current["id"])
@@ -1057,7 +1154,7 @@ class Handler(BaseHTTPRequestHandler):
         """Create V(n+1) from edited lines_json. Always creates draft."""
         import traceback
         try:
-            # Stage 3 — auth first, then DB lookup. This ensures 401
+            # Stage 3 Ã¢â‚¬â€ auth first, then DB lookup. This ensures 401
             # is returned for unauthenticated requests even when the
             # run_id doesn't exist.
             from api.auth_middleware import require_auth
@@ -1085,7 +1182,7 @@ class Handler(BaseHTTPRequestHandler):
             change_summary = (body.get('change_summary') or '').strip()
             if not change_summary:
                 return send_json(self, {'error': 'change_summary required'}, status=400)
-            # Stage 3 — actor identity comes from the session, not the
+            # Stage 3 Ã¢â‚¬â€ actor identity comes from the session, not the
             # request body. The body `actor` field is now ignored.
             actor = current["username"]
             actor_user_id = int(current["id"])
@@ -1094,7 +1191,7 @@ class Handler(BaseHTTPRequestHandler):
                     c, run_id, lines_json_str, change_summary, actor,
                     author_user_id=actor_user_id,
                 )
-            # Phase 10 — drop the preview cache for this run. The next
+            # Phase 10 Ã¢â‚¬â€ drop the preview cache for this run. The next
             # /api/preview request will rebuild from the current .docx.
             invalidate_preview_cache(run_id)
             send_json(self, new_v)
@@ -1103,7 +1200,19 @@ class Handler(BaseHTTPRequestHandler):
             send_json(self, {'error': f'version_save: {e}'}, status=500)
 
     def handle_version_submit(self, run_id, version_no):
-        """draft -> in_review. Only if current status == draft."""
+        """draft -> in_review. Only if current status == draft.
+
+        Stage 4.11 - autosave-aware: if the request includes
+        `from_draft=true` in the body (or version_no is 0/None),
+        the current draft (if any) is snapshotted into a new frozen
+        `policy_versions` row first, then that new version is submitted.
+
+        Stage 4.12 - autosave-draft aware: with multiple draft rows per
+        run, the request may include `draft_id` (the policy_drafts row
+        PK) and/or `draft_edit_count` to specify WHICH draft to
+        consume. "Submit Only the Currently Viewed Version" semantics.
+        Other draft rows remain as orphan history.
+        """
         try:
             run = db.get_run(run_id)
             if not run:
@@ -1118,11 +1227,42 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.loads(raw) if raw else {}
             except Exception:
                 body = {}
-            # Stage 3 — actor identity comes from the session.
+            # Stage 3 - actor identity comes from the session.
             actor = current["username"]
             actor_user_id = int(current["id"])
+            from_draft = bool(body.get('from_draft'))
+            target_version_no = version_no
             with db._conn() as c:
-                cur = versions_io.get_version(c, run_id, version_no)
+                # Stage 4.11/4.12 - consume draft if requested. This creates
+                # the new frozen row AND removes that specific draft row.
+                # The submit then flips that brand-new row from draft to
+                # in_review. Other draft rows (if any) remain as orphans.
+                if from_draft:
+                    draft_edit_count = body.get('draft_edit_count')
+                    if draft_edit_count is not None:
+                        try:
+                            draft_edit_count = int(draft_edit_count)
+                        except Exception:
+                            draft_edit_count = None
+                    new_v = versions_io.consume_draft_into_version(
+                        c, run_id,
+                        change_summary=body.get('change_summary') or '',
+                        actor=actor,
+                        actor_user_id=actor_user_id,
+                        draft_edit_count=draft_edit_count,
+                    )
+                    if not new_v:
+                        return send_json(
+                            self,
+                            {'error': 'no_draft',
+                             'message': (
+                                 'No autosave draft to submit. '
+                                 'Open the editor and try again.'
+                             )},
+                            status=409,
+                        )
+                    target_version_no = int(new_v['version_no'])
+                cur = versions_io.get_version(c, run_id, target_version_no)
                 if not cur:
                     return send_json(self, {'error': 'version not found'}, status=404)
                 if cur.get('review_status') != 'draft':
@@ -1141,16 +1281,17 @@ class Handler(BaseHTTPRequestHandler):
                 updated = versions_io.set_review_status(
                     c,
                     run_id,
-                    version_no,
+                    target_version_no,
                     'in_review',
                     actor=actor,
                     reviewer=actor,
                     actor_user_id=actor_user_id,
                     event_type='submitted',
                     details=(
-                        f"V{version_no} submitted for review by {actor}"
+                        f"V{target_version_no} submitted for review by {actor}"
                     ),
                 )
+            invalidate_preview_cache(run_id)
             send_json(self, updated)
         except Exception as e:
             send_json(self, {'error': f'version_submit: {e}'}, status=500)
@@ -1177,7 +1318,7 @@ class Handler(BaseHTTPRequestHandler):
                     {'error': 'action must be approve or reject'},
                     status=400,
                 )
-            # Stage 3 — reviewer identity comes from the session.
+            # Stage 3 Ã¢â‚¬â€ reviewer identity comes from the session.
             reviewer = current["username"]
             reviewer_user_id = int(current["id"])
             note = (body.get('note') or '').strip()
@@ -1242,7 +1383,7 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.loads(raw) if raw else {}
             except Exception:
                 body = {}
-            # Stage 3 — actor identity comes from the session.
+            # Stage 3 Ã¢â‚¬â€ actor identity comes from the session.
             actor = current["username"]
             actor_user_id = int(current["id"])
             with db._conn() as c:
@@ -1278,7 +1419,7 @@ class Handler(BaseHTTPRequestHandler):
                         {'error': 'publish failed (brain verify or docx build)'},
                         status=500,
                     )
-            # Phase 10 — published docx path changed, drop the preview cache
+            # Phase 10 Ã¢â‚¬â€ published docx path changed, drop the preview cache
             # so the next /api/preview returns the brand-new content.
             invalidate_preview_cache(run_id)
             send_json(self, {
@@ -1291,12 +1432,12 @@ class Handler(BaseHTTPRequestHandler):
             send_json(self, {'error': f'version_publish: {e}'}, status=500)
 
     # ------------------------------------------------------------------
-    # Stage 4.2 — Flow 1 (share popup), Flow 2 (notifications), Flow 3
+    # Stage 4.2 Ã¢â‚¬â€ Flow 1 (share popup), Flow 2 (notifications), Flow 3
     # (reviewer queue + visibility) HTTP handlers.
     # ------------------------------------------------------------------
 
     def handle_list_shareable_users(self):
-        """GET /api/auth/shareable-users — non-admin users available to add
+        """GET /api/auth/shareable-users Ã¢â‚¬â€ non-admin users available to add
         to a project. Admins excluded (every admin implicitly already has
         access). Search via `?q=<substring>` is a pure client-side filter,
         but the same endpoint powers the type-ahead.
@@ -1318,14 +1459,14 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def handle_list_shared_projects(self):
-        """GET /api/auth/shared-projects — Flow 2 share-notification feed.
+        """GET /api/auth/shared-projects Ã¢â‚¬â€ Flow 2 share-notification feed.
 
         Returns every project the caller can access, joined with the
         `project_members` row so the bell can detect "you've been added
         since you last opened this" (`is_unread = True`).
 
         Powers the second section of the header `Notifications (N)`
-        dropdown — distinct from the reviewer-queue section above which
+        dropdown Ã¢â‚¬â€ distinct from the reviewer-queue section above which
         only shows in_review versions assigned to me. Together they
         cover both kinds of activity a project member cares about:
           - "you've been added to <project>" (this endpoint)
@@ -1341,7 +1482,7 @@ class Handler(BaseHTTPRequestHandler):
         return send_json(self, {'items': items})
 
     def handle_list_project_members(self, run_id):
-        """GET /api/runs/<id>/members  — Flow 1 popup listing.
+        """GET /api/runs/<id>/members  Ã¢â‚¬â€ Flow 1 popup listing.
 
         Visible to any member of the project. Returns each member's id,
         username, access_level, the username of the adder, and added_at.
@@ -1367,7 +1508,7 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def handle_add_project_member(self, run_id):
-        """POST /api/runs/<id>/members  — add or update a member.
+        """POST /api/runs/<id>/members  Ã¢â‚¬â€ add or update a member.
 
         Approver-only. Body: {user_id, access_level}.
         """
@@ -1443,7 +1584,7 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def handle_remove_project_member(self, run_id, target_user_id):
-        """DELETE /api/runs/<id>/members/<user_id>  — revoke membership.
+        """DELETE /api/runs/<id>/members/<user_id>  Ã¢â‚¬â€ revoke membership.
 
         Approver-only (admins bypass via `require_project_access`).
         """
@@ -1469,7 +1610,7 @@ class Handler(BaseHTTPRequestHandler):
         return send_json(self, {'ok': True, 'removed_user_id': target_user_id})
 
     def handle_mark_project_seen(self, run_id):
-        """POST /api/runs/<id>/seen  — mark Flow 2 notification as read."""
+        """POST /api/runs/<id>/seen  Ã¢â‚¬â€ mark Flow 2 notification as read."""
         from api.auth_middleware import require_project_access
         result = require_project_access(self, run_id, 'viewer')
         if result is None:
@@ -1479,8 +1620,116 @@ class Handler(BaseHTTPRequestHandler):
             ok = users.mark_project_seen(c, run_id, current['id'])
         return send_json(self, {'ok': ok})
 
+    # ------------------------------------------------------------------
+    # Stage 4.11 Ã¢â‚¬â€ autosave-draft handlers
+    # ------------------------------------------------------------------
+
+    def handle_get_draft(self, run_id):
+        """GET /api/runs/<id>/draft  Ã¢â‚¬â€ fetch the current autosave draft.
+
+        Returns `{draft: <row> | null}`. Viewers can read; the response
+        is identical regardless of access level (the draft is just the
+        in-progress edit buffer; viewers don't edit but may want to see
+        "last edited at HH:MM by X" in the future).
+        """
+        from api.auth_middleware import require_project_access
+        result = require_project_access(self, run_id, 'viewer')
+        if result is None:
+            return
+        with db._conn() as c:
+            draft = versions_io.get_draft(c, run_id)
+        return send_json(self, {'draft': draft})
+
+    def handle_post_draft(self, run_id):
+        """POST /api/runs/<id>/draft  Ã¢â‚¬â€ autosave the current edit buffer.
+
+        Body: `{lines_json: string, client_edit_id: string (UUID)}`.
+
+        Idempotent on `client_edit_id` (same UUID Ã¢â€ â€™ same `edit_count`,
+        no audit spam). Bumps `edit_count` when the UUID differs.
+
+        Requires `editor` access (viewer blocked).
+        """
+        from api.auth_middleware import require_project_access
+        result = require_project_access(self, run_id, 'editor')
+        if result is None:
+            return
+        current, _your_access = result
+        length = int(self.headers.get('Content-Length', 0) or 0)
+        raw = self.rfile.read(length).decode('utf-8') if length else '{}'
+        try:
+            body = json.loads(raw) if raw else {}
+        except Exception:
+            body = {}
+        lines_json_str = body.get('lines_json')
+        if not isinstance(lines_json_str, str) or not lines_json_str:
+            return send_json(
+                self,
+                {'error': 'lines_json required (string)'},
+                status=400,
+            )
+        try:
+            parsed = json.loads(lines_json_str)
+            if not isinstance(parsed, list):
+                raise ValueError('must be a list')
+        except Exception:
+            return send_json(
+                self,
+                {'error': 'lines_json invalid Ã¢â‚¬â€ must be a JSON list'},
+                status=400,
+            )
+        client_edit_id = body.get('client_edit_id') or ''
+        if not isinstance(client_edit_id, str) or not client_edit_id:
+            return send_json(
+                self,
+                {'error': 'client_edit_id required (UUID string)'},
+                status=400,
+            )
+        client_edit_id = client_edit_id.strip()
+        # Loose UUID-shape check: 8-4-4-4-12 hex digits, OR a reasonable
+        # fallback for clients that send `crypto.randomUUID()` output.
+        if not _looks_like_uuid(client_edit_id):
+            return send_json(
+                self,
+                {'error': 'client_edit_id must be a UUID string'},
+                status=400,
+            )
+        actor = current['username']
+        actor_user_id = int(current['id'])
+        with db._conn() as c:
+            # Confirm the run exists. require_project_access already
+            # gated 401/403, but a missing run_id would silently upsert
+            # an orphan. Defensive.
+            if not db.get_run(run_id):
+                return send_json(
+                    self,
+                    {'error': 'unknown run_id'},
+                    status=404,
+                )
+            row = versions_io.upsert_draft(
+                c, run_id, lines_json_str, client_edit_id,
+                actor=actor, actor_user_id=actor_user_id,
+            )
+# Stage 4.11: drop the preview cache so the next /api/preview
+        # reflects the new autosave (matches save_version's behaviour).
+        invalidate_preview_cache(run_id)
+        return send_json(self, {
+            'edit_id': row['last_edit_id'],
+            'edit_count': row['edit_count'],
+            'saved_at': row['modified_at'],
+            'modified_by': row['modified_by'],
+            # Stage 4.14 — V# = latest_frozen + edit_count_position.
+            # The draft row's edit_count tells us its position in the
+            # ordered list. V# ticks up when the server creates a new
+            # draft row (after 60s inactivity or different edit_id).
+            'draft_version_no': versions_io.latest_version_no(
+                db._conn(), run_id
+            ) + int(row['edit_count']),
+            'draft_id': row['draft_id'],
+        })
+
     def handle_reviewer_queue(self):
-        """GET /api/reviewer/queue  — projects assigned to me as reviewer.
+        """GET /api/reviewer/queue  Ã¢â‚¬â€ projects assigned to me as reviewer.
 
         Used by the Flow 2 notification dropdown. Returns each project's
         latest in-review version (the one waiting for me to act).
@@ -1538,7 +1787,7 @@ class Handler(BaseHTTPRequestHandler):
         return send_json(self, {'items': items})
 
     def handle_assign_reviewer(self, run_id, version_no):
-        """POST /api/versions/<id>/<n>/assign  — assign a reviewer (editor+).
+        """POST /api/versions/<id>/<n>/assign  Ã¢â‚¬â€ assign a reviewer (editor+).
 
         Body: {user_id}. Requires editor access. The submitter cannot
         self-assign themselves; a different editor/approver must review.
