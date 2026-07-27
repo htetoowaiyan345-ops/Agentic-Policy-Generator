@@ -651,9 +651,22 @@
     }
   });
 
+  // When the logged-in user changes (login / logout / re-login), force
+  // a full reload of the per-project state. Without this, a fresh login
+  // into the same `activeRunId` skips `refreshYourAccess` because the
+  // effect's gate `activeRunId !== lastLoadedRunId` is false.
+  let lastSeenUserId: number | null = null;
   $effect(() => {
-    if (activeRunId && activeRunId !== lastLoadedRunId) {
-      lastLoadedRunId = activeRunId;
+    const uid = $currentUser?.id ?? null;
+    // Read both reactive deps up front so the effect re-runs on either change.
+    const runId = activeRunId;
+    if (uid !== lastSeenUserId) {
+      lastSeenUserId = uid;
+      lastLoadedRunId = null;
+      yourAccess = null;
+    }
+    if (uid && runId && runId !== lastLoadedRunId) {
+      lastLoadedRunId = runId;
       // Stage 4.13 — when switching to a new run, generate a fresh
       // `autosaveClientEditId` so a new draft row is created for the
       // new run (and no collision with the previous run's draft).
@@ -669,14 +682,14 @@
         autosaveAbort.abort();
         autosaveAbort = null;
       }
-      loadPreview(activeRunId);
-      loadReviewData(activeRunId);
+      loadPreview(runId);
+      loadReviewData(runId);
       refreshDownloadLabel();
-      refreshYourAccess(activeRunId);
+      refreshYourAccess(runId);
       // Stage 4.13 — fetch the autosave draft and apply it on top
       // of whatever the latest frozen version was. This makes a
       // page refresh "resume" the in-progress edits.
-      loadDraftAndApply(activeRunId);
+      loadDraftAndApply(runId);
     }
   });
 
@@ -739,27 +752,18 @@ async function loadDraftAndApply(runId: string): Promise<void> {
   function doDownload(): void {
     const runId = activeRunId;
     if (!runId) return;
-    // Allow download whenever a version exists for this run — the
-    // backend now resolves the .docx for the currently-viewing
-    // version on the fly (approved → build, published → serve cached).
-    // We still surface a friendly alert only when there is literally
-    // no version yet to download.
-    if (currentStatus === 'draft' && !viewingVersionNo) {
-      alert(
-        'Save your edits as a version before downloading. ' +
-        'Enter a change summary and click "Save Version".'
-      );
-      return;
-    }
+    // Always download the LATEST PUBLISHED version of this run —
+    // never the viewing/draft version. Pass `null` so the backend
+    // resolves `latest_published_version_no` itself. If no published
+    // version exists yet, the backend returns 409 with a friendly
+    // message and `downloadDocx` surfaces it via alert().
     const sourceName = activeFilename;
     let customName: string | undefined;
     if (sourceName) {
       const stem = sourceName.replace(/\.[^/.]+$/, '');
-      const v = viewingVersionNo != null ? `_v${viewingVersionNo}` : '';
-      customName = `${stem}${v}.docx`;
+      customName = `${stem}.docx`;
     }
-    // Pass viewingVersionNo so the backend serves THIS version's .docx.
-    downloadDocx(runId, customName, viewingVersionNo);
+    downloadDocx(runId, customName, null);
     if (downloadBtn) downloadBtn.classList.add('hidden');
     if (downloadDoneBox) downloadDoneBox.classList.remove('hidden');
     const ts = document.getElementById('dl-timestamp');
@@ -774,19 +778,18 @@ async function loadDraftAndApply(runId: string): Promise<void> {
       downloadAllBtn.textContent = `Preparing ${items.length} file${items.length === 1 ? '' : 's'}…`;
     }
     try {
-      // Build the per-file current-view list. For each file in the
-      // Results dropdown, use that file's currently-viewing version
-      // (recorded in `viewingVersionByRunId` when the user clicks the
-      // timeline). If we don't have a recorded version for a file,
-      // pass 0 so the backend uses its latest-published default.
+      // "Download all files" = bundle each run's LATEST PUBLISHED
+      // version into one zip. Runs with no published version are
+      // SKIPPED (not included, no error). mode='published' tells the
+      // backend to use latest_published_version_no per run and skip
+      // the rest. If ALL runs are unpublished, the backend returns
+      // 409 and we surface a friendly alert below.
       const allItems = items.map((b) => ({
         runId: b.runId!,
-        versionNo: viewingVersionByRunId.get(b.runId!) ?? null
+        versionNo: null
       }));
 
-      // One ZIP for the whole batch — one .docx per file = that file's
-      // current view version. No source file, no manifest.
-      const blob = await fetchAllFilesZip(allItems);
+      const blob = await fetchAllFilesZip(allItems, 'published');
       const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
       const filename = `all_files_${ts}.zip`;
       triggerBlobDownload(blob, filename);
@@ -858,14 +861,26 @@ async function loadDraftAndApply(runId: string): Promise<void> {
         <option value={b.runId}>{b.name}</option>
       {/each}
     </select>
-    {#if yourAccess}
+    {#if yourAccess === 'approver'}
       <span
         class="share-badge share-{yourAccess}"
         data-testid="share-badge"
         title="Your access level for this project"
       >{yourAccess}</span>
+      <button
+        type="button"
+        id="share-btn"
+        class="pill-btn"
+        data-testid="share-btn"
+        onclick={onShareClick}
+      >Share</button>
     {/if}
-    {#if yourAccess === 'approver'}
+    {#if !yourAccess && isAdmin}
+      <span
+        class="share-badge share-approver"
+        data-testid="share-badge"
+        title="Admin — full access"
+      >approver</span>
       <button
         type="button"
         id="share-btn"

@@ -283,6 +283,12 @@ class Handler(BaseHTTPRequestHandler):
         )
         if m:
             return self.handle_mark_project_seen(m.group(1))
+        # Bulk-clear unread Flow 2 notifications (mark every project seen).
+        if path == '/api/auth/mark-all-projects-seen' and self.command == 'POST':
+            return self.handle_mark_all_projects_seen()
+        # Bulk-dismiss Flow 2 notifications permanently for the current user.
+        if path == '/api/auth/dismiss-all-notifications' and self.command == 'POST':
+            return self.handle_dismiss_all_notifications()
         # Stage 4.11 Ã¢â‚¬â€ autosave-draft (POST /api/runs/<id>/draft).
         m = re.match(
             r'^/api/runs/([a-f0-9]+)/draft$', path
@@ -629,6 +635,8 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(urlparse(self.path).query)
             ids_param = (qs.get('ids') or [''])[0]
             versions_param = (qs.get('versions') or [''])[0]
+            mode_param = (qs.get('mode') or [''])[0].lower()
+            published_only = mode_param == 'published'
 
             if ids_param:
                 ids_list = [s for s in ids_param.split(',') if s]
@@ -703,6 +711,16 @@ class Handler(BaseHTTPRequestHandler):
                     run_row = db.get_run(rid)
                 if not versions:
                     continue
+
+                # published_only mode (mode=published): bundle ONLY the
+                # latest published version per run. Runs with no
+                # published version are SKIPPED silently (no entry in
+                # the zip, no error). If every run is skipped, the
+                # 404 below fires with a friendly message.
+                if published_only:
+                    if latest_pub is None:
+                        continue
+                    current_version = int(latest_pub)
 
                 # Resolve target version: explicit current > latest
                 # published > highest-numbered.
@@ -781,6 +799,19 @@ class Handler(BaseHTTPRequestHandler):
                 files_to_zip.append((chosen_path, arcname))
 
             if not files_to_zip:
+                if published_only:
+                    return send_json(
+                        self,
+                        {
+                            'error': 'no_published_versions',
+                            'message': (
+                                'None of the requested files have a published '
+                                'version yet. Approve and publish at least '
+                                'one version per file before downloading.'
+                            ),
+                        },
+                        status=409,
+                    )
                 return send_json(
                     self,
                     {
@@ -1619,6 +1650,33 @@ class Handler(BaseHTTPRequestHandler):
         with db._conn() as c:
             ok = users.mark_project_seen(c, run_id, current['id'])
         return send_json(self, {'ok': ok})
+
+    def handle_mark_all_projects_seen(self):
+        """POST /api/auth/mark-all-projects-seen — reset the user's
+        `last_seen_at` for every project they're a member of. Wipes out
+        the backlog of unread Flow 2 notifications in one click.
+        """
+        from api.auth_middleware import require_auth
+        current = require_auth(self)
+        if current is None:
+            return
+        with db._conn() as c:
+            n = users.mark_all_projects_seen(c, current['id'])
+        return send_json(self, {'ok': True, 'updated': int(n or 0)})
+
+    def handle_dismiss_all_notifications(self):
+        """POST /api/auth/dismiss-all-notifications — per-user permanent
+        dismissal. Flags every project notification for the current user
+        as dismissed. Items will no longer appear in the bell for this
+        user; other members are unaffected.
+        """
+        from api.auth_middleware import require_auth
+        current = require_auth(self)
+        if current is None:
+            return
+        with db._conn() as c:
+            n = users.dismiss_all_notifications(c, current['id'])
+        return send_json(self, {'ok': True, 'dismissed': int(n or 0)})
 
     # ------------------------------------------------------------------
     # Stage 4.11 Ã¢â‚¬â€ autosave-draft handlers

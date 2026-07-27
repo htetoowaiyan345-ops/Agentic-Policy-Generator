@@ -221,10 +221,21 @@ export interface AllFilesItem {
   versionNo: number | null;
 }
 
-export async function fetchAllFilesZip(items: AllFilesItem[]): Promise<Blob> {
+export async function fetchAllFilesZip(
+  items: AllFilesItem[],
+  mode: 'viewing' | 'published' = 'viewing'
+): Promise<Blob> {
   // Multi-file "Download all files": one ZIP containing each file's
-  // CURRENT view version's `.docx` (one per file in the Results
-  // dropdown). No source file, no manifest — just the .docx files.
+  // `.docx` (one per file in the Results dropdown). No source file, no
+  // manifest — just the .docx files.
+  //
+  // mode='viewing' (default) — bundle each file's currently-viewing
+  // version (legacy behavior; per-file `versionNo` is honored).
+  //
+  // mode='published' — bundle each run's LATEST PUBLISHED version and
+  // SKIP any run that has no published version. Sends
+  // `mode=published` + `versions=0,0,...` so the backend knows to skip
+  // unpublished runs instead of erroring the whole batch.
   if (!items || items.length === 0 || !items[0]?.runId) {
     throw new Error('No files selected to download.');
   }
@@ -240,7 +251,8 @@ export async function fetchAllFilesZip(items: AllFilesItem[]): Promise<Blob> {
   }
   const ids = items.map((i) => i.runId).join(',');
   const versions = items.map((i) => i.versionNo ?? 0).join(',');
-  const url = `${API_BASE}/download/${firstId}/all?ids=${encodeURIComponent(ids)}&versions=${encodeURIComponent(versions)}`;
+  const modeParam = mode === 'published' ? '&mode=published' : '';
+  const url = `${API_BASE}/download/${firstId}/all?ids=${encodeURIComponent(ids)}&versions=${encodeURIComponent(versions)}${modeParam}`;
   const res = await apiFetch(url);
   if (!res.ok) {
     const text = await res.text().catch(() => '');
@@ -551,6 +563,22 @@ export async function getMySharedProjects(): Promise<SharedProjectItem[]> {
   if (!res.ok) throw new Error(`getMySharedProjects failed (${res.status})`);
   const data = (await res.json()) as { items: SharedProjectItem[] };
   return data.items || [];
+}
+
+export async function markAllProjectsSeen(): Promise<{ ok: boolean; updated: number }> {
+  const res = await apiFetch(`${API_BASE}/auth/mark-all-projects-seen`, {
+    method: 'POST'
+  });
+  if (!res.ok) throw new Error(`markAllProjectsSeen failed (${res.status})`);
+  return (await res.json()) as { ok: boolean; updated: number };
+}
+
+export async function dismissAllNotifications(): Promise<{ ok: boolean; dismissed: number }> {
+  const res = await apiFetch(`${API_BASE}/auth/dismiss-all-notifications`, {
+    method: 'POST'
+  });
+  if (!res.ok) throw new Error(`dismissAllNotifications failed (${res.status})`);
+  return (await res.json()) as { ok: boolean; dismissed: number };
 }
 
 export async function assignReviewer(

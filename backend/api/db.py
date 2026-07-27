@@ -96,6 +96,13 @@ def init_db():
         if 'last_seen_at' not in pm_cols:
             c.execute("ALTER TABLE project_members ADD COLUMN last_seen_at TEXT")
 
+        # Stage 4.x — project_members.dismissed_at (nullable; per-user
+        # dismissal flag for Flow 2 notifications). When set, the row is
+        # excluded from `get_my_shared_projects` so the bell no longer
+        # surfaces it for this user. Idempotent.
+        if 'dismissed_at' not in pm_cols:
+            c.execute("ALTER TABLE project_members ADD COLUMN dismissed_at TEXT")
+
         c.commit()
 
 

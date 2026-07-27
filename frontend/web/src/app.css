@@ -45,6 +45,27 @@ header {
 
 nav { display: flex; gap: 24px; margin-bottom: 16px }
 nav a { font-family: var(--mono); font-size: 0.625rem; font-weight: 500; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
+/* Logout sits next to the nav links but is a <button>. Match the same
+   typography (mono caps, underline) with red color + red underline so
+   it reads as a destructive action without looking like a pill button. */
+#logout-btn {
+  font-family: var(--mono);
+  font-size: 0.625rem;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #d62828;
+  background: transparent;
+  border: none;
+  text-decoration: underline;
+  text-decoration-color: #d62828;
+  text-underline-offset: 3px;
+  cursor: pointer;
+  padding: 0;
+  outline: none;
+}
+#logout-btn:hover { color: #b71c1c; text-decoration-color: #b71c1c; }
+#logout-btn:focus { outline: none; }
 
 main { padding: 32px; max-width: 2000px; margin: 0 auto; }
 
@@ -1152,6 +1173,30 @@ input, select, textarea {
   padding: 8px 10px;
   border-bottom: 1px solid var(--ink);
 }
+.nb-section-label {
+  padding: 6px 10px 4px 10px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.nb-clear-btn {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border: 1px solid var(--ink);
+  background: #fff;
+  color: var(--ink);
+  cursor: pointer;
+}
+.nb-clear-btn:hover { background: var(--ink); color: var(--cream); }
 .nb-empty, .nb-error {
   padding: 12px 10px;
   font-size: 11px;
@@ -1218,6 +1263,11 @@ input, select, textarea {
   border-top: 1px solid var(--ink);
   border-bottom: 1px solid var(--ink);
   color: #111;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
 }
 .nb-row-share[data-unread="true"] {
   background: rgba(200, 230, 201, 0.5);  /* pale green — distinct

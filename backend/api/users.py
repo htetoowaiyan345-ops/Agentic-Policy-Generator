@@ -434,6 +434,7 @@ def get_my_shared_projects(conn, user_id: int) -> list[dict]:
                JOIN project_members pm ON pm.run_id = r.run_id
                LEFT JOIN users u_added ON u_added.user_id = pm.added_by_user_id
                WHERE pm.user_id = ?
+                 AND pm.dismissed_at IS NULL
                ORDER BY r.created_at DESC LIMIT 50""",
             (int(user_id),),
         ).fetchall()
@@ -481,4 +482,48 @@ def mark_project_seen(conn, run_id: str, user_id: int) -> bool:
     )
     conn.commit()
     return cur.rowcount > 0
+
+
+def mark_all_projects_seen(conn, user_id: int) -> int:
+    """Reset `last_seen_at` for every project the user is a member of.
+    Clears out the backlog of unread Flow 2 notifications in one shot.
+    Returns the number of rows updated.
+    """
+    cur = conn.execute(
+        """UPDATE project_members SET last_seen_at = ?
+           WHERE user_id = ?""",
+        (_now(), int(user_id)),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def dismiss_notification(conn, run_id: str, user_id: int) -> bool:
+    """Per-user dismissal: flag a single project notification as
+    dismissed for `user_id`. Returns True if the row was updated.
+
+    The `project_members` row is preserved (access is unaffected) — only
+    the `dismissed_at` flag is set, which excludes the row from
+    `get_my_shared_projects` so the bell stops surfacing it.
+    """
+    cur = conn.execute(
+        """UPDATE project_members SET dismissed_at = ?
+           WHERE run_id = ? AND user_id = ?""",
+        (_now(), run_id, int(user_id)),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def dismiss_all_notifications(conn, user_id: int) -> int:
+    """Bulk-dismiss every project notification for `user_id` in one
+    shot. Returns the number of rows flagged.
+    """
+    cur = conn.execute(
+        """UPDATE project_members SET dismissed_at = ?
+           WHERE user_id = ? AND dismissed_at IS NULL""",
+        (_now(), int(user_id)),
+    )
+    conn.commit()
+    return cur.rowcount
 

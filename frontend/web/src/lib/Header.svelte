@@ -48,7 +48,8 @@
       <button
         id="logout-btn"
         type="button"
-        class="font-mono text-[10px] font-medium tracking-[0.12em] uppercase text-[#111111] underline underline-offset-[3px] bg-transparent border-0 cursor-pointer p-0"
+        class="font-mono text-[10px] font-medium tracking-[0.12em] uppercase text-[#d62828] underline underline-offset-[3px] decoration-[#d62828] bg-transparent border-0 cursor-pointer p-0 outline-none focus:outline-none"
+        style="border: none; background: transparent;"
         onclick={onLogout}
       >Log out</button>
     {/if}
