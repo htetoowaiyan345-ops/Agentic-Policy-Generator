@@ -5,7 +5,7 @@
   import Process from '$lib/Process.svelte';
   import Review from '$lib/Review.svelte';
   import WorkflowTracker from '$lib/WorkflowTracker.svelte';
-  import { appState, resetAppState, setFromHistory } from '$lib/stores';
+  import { appState, resetAppState, setFromHistory, setActiveRun } from '$lib/stores';
   import { onMount } from 'svelte';
   import type { StepId } from '$lib/types';
 
@@ -49,6 +49,14 @@
     historyOpen = !historyOpen;
   }
 
+  // Stage 4.6 — Flow 2 notification "Open" navigation. Sets the
+  // active run and jumps to Step 03 (Review).
+  function onSelectRun(runId: string): void {
+    setActiveRun(runId, null);
+    historyOpen = false;
+    showStep(3);
+  }
+
   onMount(() => {
     showStep(1);
   });
@@ -60,7 +68,11 @@
   <link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,300..700;1,8..60,300..700&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 </svelte:head>
 
-<Header historyOpen={historyOpen} onToggleHistory={toggleHistory} />
+<Header
+  historyOpen={historyOpen}
+  onToggleHistory={toggleHistory}
+  onSelectRun={onSelectRun}
+/>
 
 <main class="p-8">
   <History open={historyOpen} onClose={() => (historyOpen = false)} />

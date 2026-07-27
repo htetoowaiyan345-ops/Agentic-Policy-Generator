@@ -401,12 +401,14 @@ def add_audit(
     actor: str = 'system',
     version_no: int | None = None,
     details: str | None = None,
+    actor_user_id: int | None = None,
 ) -> int:
     """Append to audit_log manually. Returns new audit_id."""
     cur = conn.execute(
-        """INSERT INTO audit_log (run_id, version_no, event_type, actor, details, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (run_id, version_no, event_type, actor, details, _now()),
+        """INSERT INTO audit_log
+           (run_id, version_no, event_type, actor, actor_user_id, details, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (run_id, version_no, event_type, actor, actor_user_id, details, _now()),
     )
     conn.commit()
     return int(cur.lastrowid or 0)

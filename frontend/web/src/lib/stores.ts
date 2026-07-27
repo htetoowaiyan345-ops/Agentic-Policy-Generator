@@ -77,3 +77,12 @@ export function setCurrentUser(user: User | null): void {
 export function clearCurrentUser(): void {
   currentUser.set(null);
 }
+
+// Stage 4.4 — Flow 2 unread-shared-projects counter (header bell).
+// Computed/polled by `NotificationBell.svelte` and shown in the
+// header dropdown as `Notifications (N)`. `0` means "no unread items".
+export const unreadSharedCount = writable<number>(0);
+
+export function setUnreadSharedCount(n: number): void {
+  unreadSharedCount.set(Math.max(0, n | 0));
+}

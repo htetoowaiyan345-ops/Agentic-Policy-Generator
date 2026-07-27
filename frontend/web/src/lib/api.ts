@@ -426,3 +426,137 @@ export async function publishVersion(
   }
   return (await res.json()) as PublishVersionResp;
 }
+
+// -----------------------------------------------------------------------
+// Stage 4.4 — Flow 1 / Flow 2 / Flow 3 backend bridge
+// -----------------------------------------------------------------------
+
+export type AccessLevel = 'viewer' | 'editor' | 'approver';
+
+export interface ProjectMember {
+  run_id: string;
+  user_id: number;
+  username: string;
+  access_level: AccessLevel;
+  added_by_user_id: number;
+  added_at: string;
+}
+
+export interface ProjectSharingResp {
+  project: { run_id: string; filename?: string };
+  items: ProjectMember[];
+  your_access: AccessLevel | null;
+}
+
+export async function listProjectMembers(runId: string): Promise<ProjectSharingResp> {
+  const res = await apiFetch(`${API_BASE}/runs/${runId}/members`);
+  if (!res.ok) throw new Error(`listProjectMembers failed (${res.status})`);
+  return (await res.json()) as ProjectSharingResp;
+}
+
+export async function addProjectMember(
+  runId: string,
+  userId: number,
+  accessLevel: AccessLevel
+): Promise<ProjectMember> {
+  const res = await apiFetch(`${API_BASE}/runs/${runId}/members`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: userId, access_level: accessLevel })
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`addProjectMember failed (${res.status}): ${text}`);
+  }
+  return (await res.json()) as ProjectMember;
+}
+
+export async function removeProjectMember(
+  runId: string,
+  userId: number
+): Promise<void> {
+  const res = await apiFetch(`${API_BASE}/runs/${runId}/members/${userId}`, {
+    method: 'DELETE'
+  });
+  if (!res.ok) throw new Error(`removeProjectMember failed (${res.status})`);
+}
+
+export async function markProjectSeen(runId: string): Promise<void> {
+  const res = await apiFetch(`${API_BASE}/runs/${runId}/seen`, {
+    method: 'POST'
+  });
+  if (!res.ok) throw new Error(`markProjectSeen failed (${res.status})`);
+}
+
+export interface ShareableUser {
+  id: number;
+  username: string;
+}
+
+export async function listShareableUsers(): Promise<ShareableUser[]> {
+  const res = await apiFetch(`${API_BASE}/auth/shareable-users`);
+  if (!res.ok) throw new Error(`listShareableUsers failed (${res.status})`);
+  const data = (await res.json()) as { items: ShareableUser[] };
+  return data.items || [];
+}
+
+export interface ReviewerQueueItem {
+  run_id: string;
+  filename: string;
+  version_no: number;
+  submitted_at: string;
+  submitted_by: string;
+  assigned_reviewer_user_id: number | null;
+  your_access: AccessLevel | null;
+  is_unread: boolean;
+}
+
+export async function getReviewerQueue(): Promise<ReviewerQueueItem[]> {
+  const res = await apiFetch(`${API_BASE}/reviewer/queue`);
+  if (!res.ok) throw new Error(`getReviewerQueue failed (${res.status})`);
+  const data = (await res.json()) as { items: ReviewerQueueItem[] };
+  return data.items || [];
+}
+
+// Stage 4.10 — Flow 2 share-notification feed ("you've been added
+// to <project>"). Distinct from the reviewer queue above: this
+// endpoint reports membership changes (Flow 1 events) whereas the
+// queue reports review-task changes (Stage 5/6 events).
+export interface SharedProjectItem {
+  run_id: string;
+  filename: string;
+  created_at: string;
+  status: string;
+  your_access: AccessLevel;
+  shared_by: string | null;
+  added_at: string | null;
+  last_seen_at: string | null;
+  is_unread: boolean;
+}
+
+export async function getMySharedProjects(): Promise<SharedProjectItem[]> {
+  const res = await apiFetch(`${API_BASE}/auth/shared-projects`);
+  if (!res.ok) throw new Error(`getMySharedProjects failed (${res.status})`);
+  const data = (await res.json()) as { items: SharedProjectItem[] };
+  return data.items || [];
+}
+
+export async function assignReviewer(
+  runId: string,
+  versionNo: number,
+  userId: number
+): Promise<{ assigned_reviewer_user_id: number; assigned_reviewer: string }> {
+  const res = await apiFetch(
+    `${API_BASE}/versions/${runId}/${versionNo}/assign`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_id: userId })
+    }
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`assignReviewer failed (${res.status}): ${text}`);
+  }
+  return (await res.json());
+}

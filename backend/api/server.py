@@ -253,6 +253,25 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_logout()
         if path == '/api/upload':
             return self.handle_upload()
+        # Stage 4.2 — project-member add + mark-seen routes.
+        m = re.match(
+            r'^/api/runs/([a-f0-9]+)/members$', path
+        )
+        if m:
+            return self.handle_add_project_member(m.group(1))
+        m = re.match(
+            r'^/api/runs/([a-f0-9]+)/seen$', path
+        )
+        if m:
+            return self.handle_mark_project_seen(m.group(1))
+        # Stage 4.2 — reviewer-assignment route for `submit`.
+        m = re.match(
+            r'^/api/versions/([a-f0-9]+)/(\d+)/assign$', path
+        )
+        if m:
+            return self.handle_assign_reviewer(
+                m.group(1), int(m.group(2))
+            )
         m = re.match(r'^/api/process/([a-f0-9]+)$', path)
         if m:
             return self.handle_process(m.group(1))
@@ -283,6 +302,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_version_publish(m.group(1), int(m.group(2)))
         send_json(self, {'error': 'not found'}, status=404)
 
+    def do_DELETE(self):
+        path = urlparse(self.path).path
+        # Stage 4.2 — project-member remove (Approver only).
+        m = re.match(
+            r'^/api/runs/([a-f0-9]+)/members/(\d+)$', path
+        )
+        if m:
+            return self.handle_remove_project_member(
+                m.group(1), int(m.group(2))
+            )
+        send_json(self, {'error': 'not found'}, status=404)
+
     def do_GET(self):
         path = urlparse(self.path).path
         # Stage 1.5 — auth routes (public for /me since it requires a token;
@@ -293,6 +324,20 @@ class Handler(BaseHTTPRequestHandler):
             return self.handle_list_users()
         if path == '/api/history':
             return self.handle_history()
+        # Stage 4.2 — shareable-users (for Flow 1 popup type-ahead).
+        if path == '/api/auth/shareable-users':
+            return self.handle_list_shareable_users()
+        # Stage 4.10 — shared-projects feed for the Flow 2 bell
+        # ("you've been added to <project>" notifications).
+        if path == '/api/auth/shared-projects':
+            return self.handle_list_shared_projects()
+        # Stage 4.2 — Flow 2 reviewer queue (assigned-to-me).
+        if path == '/api/reviewer/queue':
+            return self.handle_reviewer_queue()
+        # Stage 4.2 — Flow 1 members list + Flow 2 mark-seen.
+        m = re.match(r'^/api/runs/([a-f0-9]+)/members$', path)
+        if m:
+            return self.handle_list_project_members(m.group(1))
         m = re.match(r'^/api/status/([a-f0-9]+)$', path)
         if m:
             return self.handle_status(m.group(1))
@@ -374,6 +419,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_status(self, run_id):
         try:
+            from api.auth_middleware import require_project_access
+            result = require_project_access(self, run_id, 'viewer')
+            if result is None:
+                return
             run = db.get_run(run_id)
             if not run:
                 return send_json(self, {'error': 'unknown run_id'}, status=404)
@@ -391,6 +440,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_result(self, run_id):
         try:
+            from api.auth_middleware import require_project_access
+            result = require_project_access(self, run_id, 'viewer')
+            if result is None:
+                return
             run = db.get_run(run_id)
             if not run:
                 return send_json(self, {'error': 'unknown run_id'}, status=404)
@@ -411,6 +464,10 @@ class Handler(BaseHTTPRequestHandler):
     def handle_download(self, run_id):
         try:
             from urllib.parse import parse_qs, urlparse
+            from api.auth_middleware import require_project_access
+            result = require_project_access(self, run_id, 'viewer')
+            if result is None:
+                return
             run = db.get_run(run_id)
             if not run or not run.get('docx_path'):
                 return send_json(self, {'error': 'no docx'}, status=404)
@@ -545,9 +602,33 @@ class Handler(BaseHTTPRequestHandler):
             versions_param = (qs.get('versions') or [''])[0]
 
             if ids_param:
+                ids_list = [s for s in ids_param.split(',') if s]
+            else:
+                ids_list = [run_id]
+
+            # Stage 4.3 — auth + per-run membership check for every
+            # requested run_id. 401 / 403 wins over any 404.
+            from api.auth_middleware import require_auth, get_current_user
+            current = require_auth(self)
+            if current is None:
+                return
+            user_id = current['id']
+            is_admin = int(current.get('is_admin', 0)) == 1
+            with db._conn() as c:
+                for rid_check in ids_list:
+                    if not is_admin:
+                        access = users.get_user_project_access(c, user_id, rid_check)
+                        if access is None:
+                            return send_json(
+                                self,
+                                {'error': 'forbidden',
+                                 'message': f'No access to {rid_check}.'},
+                                status=403,
+                            )
+
+            if ids_param:
                 # Multi-file mode: ids + versions are comma-separated,
                 # parallel lists.
-                ids_list = [s for s in ids_param.split(',') if s]
                 versions_list_raw = [s for s in versions_param.split(',') if s]
                 if len(versions_list_raw) != len(ids_list):
                     return send_json(
@@ -726,6 +807,10 @@ class Handler(BaseHTTPRequestHandler):
         `(run_id, docx_path, docx_mtime, audit_json_len)`. Cold backend
         first-call: ~2-3s. Warm: <5ms."""
         try:
+            from api.auth_middleware import require_project_access
+            result = require_project_access(self, run_id, 'viewer')
+            if result is None:
+                return
             run = db.get_run(run_id)
             if not run:
                 return send_json(self, {'error': 'unknown run_id'}, status=404)
@@ -750,8 +835,34 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_history(self):
         try:
-            rows = db.list_done_runs()
-            send_json(self, rows)
+            from api.auth_middleware import require_auth
+            current = require_auth(self)
+            if current is None:
+                return
+            user_id = current['id']
+            is_admin = int(current.get('is_admin', 0)) == 1
+            # Stage 4.3 — return only runs the user can access (i.e. is a
+            # member of, or is admin). Admins see everything.
+            with db._conn() as c:
+                if is_admin:
+                    rows = c.execute(
+                        """SELECT run_id, filename, created_at, status,
+                                  sections_filled, markers_count
+                           FROM runs WHERE status='done'
+                           ORDER BY created_at DESC LIMIT 50"""
+                    ).fetchall()
+                else:
+                    rows = c.execute(
+                        """SELECT r.run_id, r.filename, r.created_at,
+                                  r.status, r.sections_filled, r.markers_count
+                           FROM runs r
+                           JOIN project_members pm
+                             ON pm.run_id = r.run_id
+                           WHERE r.status='done' AND pm.user_id = ?
+                           ORDER BY r.created_at DESC LIMIT 50""",
+                        (user_id,),
+                    ).fetchall()
+            send_json(self, [dict(r) for r in rows])
         except Exception as e:
             send_json(self, {'error': f'history: {e}'}, status=500)
 
@@ -832,6 +943,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_versions_list(self, run_id):
         try:
+            from api.auth_middleware import require_project_access
+            result = require_project_access(self, run_id, 'viewer')
+            if result is None:
+                return
             run = db.get_run(run_id)
             if not run:
                 return send_json(self, {'error': 'unknown run_id'}, status=404)
@@ -843,6 +958,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_version_get(self, run_id, version_no):
         try:
+            from api.auth_middleware import require_project_access
+            result = require_project_access(self, run_id, 'viewer')
+            if result is None:
+                return
             run = db.get_run(run_id)
             if not run:
                 return send_json(self, {'error': 'unknown run_id'}, status=404)
@@ -856,6 +975,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_comments_list(self, run_id, version_no):
         try:
+            from api.auth_middleware import require_project_access
+            result = require_project_access(self, run_id, 'viewer')
+            if result is None:
+                return
             run = db.get_run(run_id)
             if not run:
                 return send_json(self, {'error': 'unknown run_id'}, status=404)
@@ -867,6 +990,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_audit_list(self, run_id):
         try:
+            from api.auth_middleware import require_project_access
+            result = require_project_access(self, run_id, 'viewer')
+            if result is None:
+                return
             run = db.get_run(run_id)
             if not run:
                 return send_json(self, {'error': 'unknown run_id'}, status=404)
@@ -1162,6 +1289,313 @@ class Handler(BaseHTTPRequestHandler):
             })
         except Exception as e:
             send_json(self, {'error': f'version_publish: {e}'}, status=500)
+
+    # ------------------------------------------------------------------
+    # Stage 4.2 — Flow 1 (share popup), Flow 2 (notifications), Flow 3
+    # (reviewer queue + visibility) HTTP handlers.
+    # ------------------------------------------------------------------
+
+    def handle_list_shareable_users(self):
+        """GET /api/auth/shareable-users — non-admin users available to add
+        to a project. Admins excluded (every admin implicitly already has
+        access). Search via `?q=<substring>` is a pure client-side filter,
+        but the same endpoint powers the type-ahead.
+        """
+        from api.auth_middleware import require_auth
+        current = require_auth(self)
+        if current is None:
+            return
+        with db._conn() as c:
+            rows = c.execute(
+                """SELECT user_id, username, is_admin FROM users
+                   WHERE is_admin = 0 ORDER BY username"""
+            ).fetchall()
+        return send_json(self, {
+            'items': [
+                {'id': r['user_id'], 'username': r['username']}
+                for r in rows
+            ]
+        })
+
+    def handle_list_shared_projects(self):
+        """GET /api/auth/shared-projects — Flow 2 share-notification feed.
+
+        Returns every project the caller can access, joined with the
+        `project_members` row so the bell can detect "you've been added
+        since you last opened this" (`is_unread = True`).
+
+        Powers the second section of the header `Notifications (N)`
+        dropdown — distinct from the reviewer-queue section above which
+        only shows in_review versions assigned to me. Together they
+        cover both kinds of activity a project member cares about:
+          - "you've been added to <project>" (this endpoint)
+          - "<version> is awaiting your review" (reviewer queue)
+        """
+        from api.auth_middleware import require_auth
+        current = require_auth(self)
+        if current is None:
+            return
+        user_id = current['id']
+        with db._conn() as c:
+            items = users.get_my_shared_projects(c, user_id)
+        return send_json(self, {'items': items})
+
+    def handle_list_project_members(self, run_id):
+        """GET /api/runs/<id>/members  — Flow 1 popup listing.
+
+        Visible to any member of the project. Returns each member's id,
+        username, access_level, the username of the adder, and added_at.
+        """
+        from api.auth_middleware import require_project_access
+        result = require_project_access(self, run_id, 'viewer')
+        if result is None:
+            return
+        current, your_access = result
+        with db._conn() as c:
+            items = users.list_project_members(c, run_id)
+            run_row = c.execute(
+                "SELECT filename FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return send_json(self, {
+            'project': (
+                {'run_id': run_id, 'filename': run_row['filename']}
+                if run_row else {'run_id': run_id}
+            ),
+            'items': items,
+            'your_access': your_access,
+        })
+
+    def handle_add_project_member(self, run_id):
+        """POST /api/runs/<id>/members  — add or update a member.
+
+        Approver-only. Body: {user_id, access_level}.
+        """
+        from api.auth_middleware import require_project_access
+        result = require_project_access(self, run_id, 'approver')
+        if result is None:
+            return
+        current, _your_access = result
+        length = int(self.headers.get('Content-Length', 0) or 0)
+        raw = self.rfile.read(length).decode('utf-8') if length else '{}'
+        try:
+            body = json.loads(raw) if raw else {}
+        except Exception:
+            body = {}
+        try:
+            target_user_id = int(body.get('user_id'))
+            level = (body.get('access_level') or '').strip()
+        except Exception:
+            return send_json(
+                self, {'error': 'user_id + access_level required'},
+                status=400,
+            )
+        if level not in ('viewer', 'editor', 'approver'):
+            return send_json(
+                self,
+                {'error': 'access_level must be viewer/editor/approver'},
+                status=400,
+            )
+        with db._conn() as c:
+            exists = c.execute(
+                "SELECT 1 FROM users WHERE user_id = ?",
+                (target_user_id,),
+            ).fetchone()
+            if not exists:
+                return send_json(
+                    self, {'error': 'target user not found'},
+                    status=404,
+                )
+            run_row = c.execute(
+                "SELECT 1 FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if not run_row:
+                return send_json(
+                    self, {'error': 'project not found'},
+                    status=404,
+                )
+            users.add_project_member(
+                c, run_id, target_user_id, level,
+                added_by_user_id=current['id'],
+            )
+            # Reset `last_seen_at` so the new member sees the share as
+            # "unread" (Flow 2).
+            c.execute(
+                """UPDATE project_members SET last_seen_at = NULL
+                   WHERE run_id = ? AND user_id = ?""",
+                (run_id, target_user_id),
+            )
+            member = c.execute(
+                """SELECT pm.access_level,
+                          u.username AS added_by_username,
+                          pm.added_at
+                   FROM project_members pm
+                   JOIN users u ON u.user_id = pm.added_by_user_id
+                   WHERE pm.run_id = ? AND pm.user_id = ?""",
+                (run_id, target_user_id),
+            ).fetchone()
+        return send_json(self, {
+            'user_id': target_user_id,
+            'access_level': member['access_level'],
+            'added_by': member['added_by_username'],
+            'added_at': member['added_at'],
+        })
+
+    def handle_remove_project_member(self, run_id, target_user_id):
+        """DELETE /api/runs/<id>/members/<user_id>  — revoke membership.
+
+        Approver-only (admins bypass via `require_project_access`).
+        """
+        from api.auth_middleware import require_project_access
+        result = require_project_access(self, run_id, 'approver')
+        if result is None:
+            return
+        current, _your_access = result
+        with db._conn() as c:
+            # Block removing the project's creator (they always remain
+            # implicit owner).
+            creator = c.execute(
+                "SELECT created_by_user_id FROM runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if creator and creator['created_by_user_id'] == target_user_id:
+                return send_json(
+                    self,
+                    {'error': 'cannot remove the project creator'},
+                    status=409,
+                )
+            users.remove_project_member(c, run_id, target_user_id)
+        return send_json(self, {'ok': True, 'removed_user_id': target_user_id})
+
+    def handle_mark_project_seen(self, run_id):
+        """POST /api/runs/<id>/seen  — mark Flow 2 notification as read."""
+        from api.auth_middleware import require_project_access
+        result = require_project_access(self, run_id, 'viewer')
+        if result is None:
+            return
+        current, _your_access = result
+        with db._conn() as c:
+            ok = users.mark_project_seen(c, run_id, current['id'])
+        return send_json(self, {'ok': ok})
+
+    def handle_reviewer_queue(self):
+        """GET /api/reviewer/queue  — projects assigned to me as reviewer.
+
+        Used by the Flow 2 notification dropdown. Returns each project's
+        latest in-review version (the one waiting for me to act).
+        """
+        from api.auth_middleware import require_auth
+        current = require_auth(self)
+        if current is None:
+            return
+        user_id = current['id']
+        is_admin = int(current.get('is_admin', 0)) == 1
+        with db._conn() as c:
+            if is_admin:
+                pv_rows = c.execute(
+                    """SELECT pv.run_id, pv.version_no, pv.modified_at,
+                              pv.modified_by, pv.assigned_reviewer_user_id,
+                              r.filename, r.status AS run_status
+                       FROM policy_versions pv
+                       JOIN runs r ON r.run_id = pv.run_id
+                       WHERE pv.review_status = 'in_review'
+                       ORDER BY pv.modified_at DESC LIMIT 50"""
+                ).fetchall()
+            else:
+                pv_rows = c.execute(
+                    """SELECT pv.run_id, pv.version_no, pv.modified_at,
+                              pv.modified_by, pv.assigned_reviewer_user_id,
+                              r.filename, r.status AS run_status
+                       FROM policy_versions pv
+                       JOIN runs r ON r.run_id = pv.run_id
+                       WHERE pv.review_status = 'in_review'
+                         AND pv.assigned_reviewer_user_id = ?
+                       ORDER BY pv.modified_at DESC LIMIT 50""",
+                    (user_id,),
+                ).fetchall()
+            items = []
+            for pv in pv_rows:
+                run_id = pv['run_id']
+                shared = users.get_my_shared_projects(c, user_id)
+                your_access = None
+                is_unread = False
+                for s in shared:
+                    if s['run_id'] == run_id:
+                        your_access = s['your_access']
+                        is_unread = s['is_unread']
+                        break
+                items.append({
+                    'run_id': run_id,
+                    'filename': pv['filename'],
+                    'version_no': pv['version_no'],
+                    'submitted_at': pv['modified_at'],
+                    'submitted_by': pv['modified_by'],
+                    'assigned_reviewer_user_id': pv['assigned_reviewer_user_id'],
+                    'your_access': your_access,
+                    'is_unread': is_unread,
+                })
+        return send_json(self, {'items': items})
+
+    def handle_assign_reviewer(self, run_id, version_no):
+        """POST /api/versions/<id>/<n>/assign  — assign a reviewer (editor+).
+
+        Body: {user_id}. Requires editor access. The submitter cannot
+        self-assign themselves; a different editor/approver must review.
+        """
+        from api.auth_middleware import require_project_access
+        result = require_project_access(self, run_id, 'editor')
+        if result is None:
+            return
+        current, _your_access = result
+        length = int(self.headers.get('Content-Length', 0) or 0)
+        raw = self.rfile.read(length).decode('utf-8') if length else '{}'
+        try:
+            body = json.loads(raw) if raw else {}
+        except Exception:
+            body = {}
+        try:
+            reviewer_id = int(body.get('user_id'))
+        except Exception:
+            return send_json(
+                self, {'error': 'user_id required'},
+                status=400,
+            )
+        with db._conn() as c:
+            target = c.execute(
+                "SELECT username FROM users WHERE user_id = ?",
+                (reviewer_id,),
+            ).fetchone()
+            if not target:
+                return send_json(
+                    self, {'error': 'reviewer not found'}, status=404,
+                )
+            v = versions_io.get_version(c, run_id, version_no)
+            if not v:
+                return send_json(
+                    self, {'error': 'version not found'},
+                    status=404,
+                )
+            existing_assignee = v.get('assigned_reviewer_user_id')
+            reviewer_username = target['username']
+            c.execute(
+                """UPDATE policy_versions
+                   SET assigned_reviewer_user_id = ?
+                   WHERE run_id = ? AND version_no = ?""",
+                (reviewer_id, run_id, version_no),
+            )
+            # Audit row for the assignment.
+            versions_io.add_audit(
+                c, run_id, event_type='assign_reviewer',
+                actor=current['username'],
+                actor_user_id=current['id'],
+                version_no=version_no,
+                details=f"assigned {reviewer_username} (was {existing_assignee})",
+            )
+        return send_json(self, {
+            'assigned_reviewer_user_id': reviewer_id,
+            'assigned_reviewer': reviewer_username,
+        })
 
 
 if __name__ == '__main__':

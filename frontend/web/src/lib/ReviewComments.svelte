@@ -9,8 +9,11 @@
     /** Optional: invoked after a comment is added or resolved so the parent
      *  can refresh derived UI (e.g. the workflow-tracker's comment count). */
     onCommentChange?: () => void;
+    /** Stage 4.7 — when `false`, the comment-add form is hidden
+     *  (viewers can read but not post / resolve). */
+    editable?: boolean;
   }
-  let { runId, versionNo, onCommentChange }: Props = $props();
+  let { runId, versionNo, onCommentChange, editable = true }: Props = $props();
 
   let comments = $state<ReviewComment[]>([]);
   let loading = $state(false);
@@ -150,39 +153,45 @@
 <div class="rc-wrap" aria-label="Comments">
   <div class="rc-header mono-label">COMMENTS</div>
 
-  <form class="rc-form" onsubmit={onSubmit}>
-    <div class="rc-author-row">
-      <span class="mono-label">AUTHOR</span>
-      <span class="rc-author-display" data-testid="comment-author">
-        {commentAuthor}
-      </span>
+  {#if editable}
+    <form class="rc-form" onsubmit={onSubmit}>
+      <div class="rc-author-row">
+        <span class="mono-label">AUTHOR</span>
+        <span class="rc-author-display" data-testid="comment-author">
+          {commentAuthor}
+        </span>
+      </div>
+      <select
+        class="rc-anchor-select"
+        onchange={onAnchorChange}
+        value={newAnchorKind && newAnchorKey
+          ? `${newAnchorKind}:${newAnchorKey}`
+          : ''}
+      >
+        <option value="">General (no anchor)</option>
+        {#each ANCHOR_OPTIONS as opt (opt.value)}
+          <option value={opt.label}>{opt.label}</option>
+        {/each}
+      </select>
+      <textarea
+        class="rc-body-textarea"
+        placeholder="Add a comment or feedback..."
+        bind:value={newBody}
+        rows="3"
+      ></textarea>
+      <button
+        class="pill-btn rc-submit"
+        type="submit"
+        disabled={!newBody.trim() || !runId || !versionNo || submitting}
+      >
+        {submitting ? 'Posting…' : 'Post Comment'}
+      </button>
+    </form>
+  {:else}
+    <div class="rc-readonly mono-underline">
+      You have read-only access to this project.
     </div>
-    <select
-      class="rc-anchor-select"
-      onchange={onAnchorChange}
-      value={newAnchorKind && newAnchorKey
-        ? `${newAnchorKind}:${newAnchorKey}`
-        : ''}
-    >
-      <option value="">General (no anchor)</option>
-      {#each ANCHOR_OPTIONS as opt (opt.value)}
-        <option value={opt.value}>{opt.label}</option>
-      {/each}
-    </select>
-    <textarea
-      class="rc-body-textarea"
-      placeholder="Add a comment or feedback..."
-      bind:value={newBody}
-      rows="3"
-    ></textarea>
-    <button
-      class="pill-btn rc-submit"
-      type="submit"
-      disabled={!newBody.trim() || !runId || !versionNo || submitting}
-    >
-      {submitting ? 'Posting…' : 'Post Comment'}
-    </button>
-  </form>
+  {/if}
 
   {#if error}
     <div class="rc-error mono-underline">Error: {error}</div>
@@ -204,7 +213,7 @@
             <div class="rc-anchor mono-underline">{displayAnchor(c)}</div>
           {/if}
           <div class="rc-body">{c.body}</div>
-          {#if !c.resolved}
+          {#if !c.resolved && editable}
             <button
               type="button"
               class="mono-underline rc-resolve-btn"

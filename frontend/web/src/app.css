@@ -160,6 +160,15 @@ input, select, textarea {
 .rc-form { display: grid; gap: 8px; margin-bottom: 12px; }
 .rc-author-input, .rc-anchor-select { font-family: var(--mono); font-size: 11px; padding: 6px 8px; border: 1px solid var(--ink); background: var(--cream); width: 100%; color: var(--ink); }
 .rc-author-row { display: flex; gap: 8px; align-items: center; }
+.rc-readonly {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-style: italic;
+  margin: 8px 0;
+  padding: 6px 8px;
+  background: #f6f6f6;
+  border: 1px dashed var(--ink);
+}
 .rc-author-display { font-family: var(--mono); font-size: 11px; padding: 4px 8px; border: 1px solid var(--ink); background: var(--cream); color: var(--ink); font-weight: 500; }
 .rc-body-textarea { font-family: var(--sans); font-size: 13px; padding: 8px 10px; border: 1px solid var(--ink); background: #fff; width: 100%; resize: vertical; color: var(--ink); }
 .rc-submit { align-self: flex-start; }
@@ -838,4 +847,311 @@ input, select, textarea {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+}
+
+/* -----------------------------------------------------------------------
+   Stage 4.5 — Project Sharing popup (Flow 1)
+   ----------------------------------------------------------------------- */
+.ps-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(17, 17, 17, 0.32);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1200;
+}
+.ps-modal {
+  background: var(--cream);
+  border: 1px solid var(--ink);
+  width: min(560px, 92vw);
+  max-height: 86vh;
+  overflow-y: auto;
+  padding: 18px 20px;
+  font-family: var(--mono);
+  color: var(--ink);
+}
+.ps-header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  border-bottom: 1px solid var(--ink);
+  padding-bottom: 8px;
+  margin-bottom: 12px;
+}
+.ps-project {
+  font-size: 11px;
+  flex: 1;
+  word-break: break-all;
+}
+.ps-close {
+  margin-left: auto;
+  background: none;
+  border: 1px solid var(--ink);
+  width: 24px;
+  height: 24px;
+  font-family: var(--mono);
+  cursor: pointer;
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1;
+}
+.ps-close:hover { background: var(--ink); color: var(--cream); }
+.ps-search-row { margin-bottom: 10px; }
+.ps-search-input {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--ink);
+  background: #fff;
+  width: 100%;
+  color: var(--ink);
+}
+.ps-pick-list {
+  border: 1px dashed var(--ink);
+  background: #fff;
+  max-height: 160px;
+  overflow-y: auto;
+  margin-bottom: 12px;
+}
+.ps-pick {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 10px;
+  border-bottom: 1px dotted var(--ink);
+}
+.ps-pick:last-child { border-bottom: 0; }
+.ps-pick-name { font-size: 12px; }
+.ps-pick-actions { display: flex; gap: 4px; }
+.ps-pick-level {
+  font-family: var(--mono);
+  font-size: 10px;
+  border: 1px solid var(--ink);
+  background: var(--cream);
+  padding: 3px 8px;
+  cursor: pointer;
+  color: var(--ink);
+}
+.ps-pick-level:hover { background: var(--ink); color: var(--cream); }
+.ps-members {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-top: 4px;
+  margin-bottom: 6px;
+}
+.ps-empty, .ps-readonly {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-style: italic;
+  margin: 8px 0;
+}
+.ps-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--ink);
+  background: #fff;
+}
+.ps-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--ink);
+}
+.ps-row:last-child { border-bottom: 0; }
+.ps-row[data-uncommitted="true"] { background: rgba(255, 200, 0, 0.18); }
+.ps-row-name { font-size: 12px; }
+.ps-row-level {
+  font-family: var(--mono);
+  font-size: 11px;
+  border: 1px solid var(--ink);
+  padding: 4px 6px;
+  background: var(--cream);
+  color: var(--ink);
+}
+.ps-row-remove {
+  background: none;
+  border: 1px solid var(--ink);
+  width: 24px;
+  height: 24px;
+  font-family: var(--mono);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--ink);
+}
+.ps-row-remove:hover { background: var(--ink); color: var(--cream); }
+.ps-error {
+  color: var(--ink);
+  background: rgba(255, 0, 0, 0.12);
+  border: 1px solid var(--ink);
+  padding: 6px 8px;
+  margin-top: 8px;
+  font-size: 11px;
+}
+.ps-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--ink);
+}
+.ps-cancel-btn, .ps-save-btn {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 6px 14px;
+  border: 1px solid var(--ink);
+  cursor: pointer;
+  color: var(--ink);
+  background: var(--cream);
+}
+.ps-save-btn:not(:disabled):hover { background: var(--ink); color: var(--cream); }
+.ps-save-btn:disabled, .ps-cancel-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Stage 4.7 — share access badge (Flow 3) */
+.share-badge {
+  font-family: var(--mono);
+  font-size: 11px;
+  border: 1px solid var(--ink);
+  padding: 2px 8px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  background: var(--cream);
+  color: var(--ink);
+}
+.share-badge.share-viewer { background: #e0e0e0; }
+.share-badge.share-editor { background: #fff1c2; }
+.share-badge.share-approver { background: #c8e6c9; }
+
+/* -----------------------------------------------------------------------
+   Stage 4.6 — Notification bell (Flow 2)
+   ----------------------------------------------------------------------- */
+.nb-wrap {
+  position: relative;
+  display: inline-block;
+}
+.nb-trigger {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: #111111;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  padding: 0;
+}
+.nb-trigger:hover { color: #555; }
+.nb-dropdown {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  width: min(360px, 90vw);
+  background: var(--cream);
+  border: 1px solid var(--ink);
+  z-index: 900;
+  font-family: var(--mono);
+  color: var(--ink);
+  box-shadow: 2px 2px 0 var(--ink);
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.nb-head {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--ink);
+}
+.nb-empty, .nb-error {
+  padding: 12px 10px;
+  font-size: 11px;
+  font-style: italic;
+}
+.nb-error {
+  background: rgba(255, 0, 0, 0.08);
+  border-top: 1px solid var(--ink);
+  font-style: normal;
+}
+.nb-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.nb-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border-bottom: 1px solid var(--ink);
+}
+.nb-row:last-child { border-bottom: 0; }
+.nb-row[data-unread="true"] { background: rgba(255, 244, 196, 0.5); }
+.nb-row-text { flex: 1; min-width: 0; }
+.nb-row-title {
+  font-size: 12px;
+  word-break: break-all;
+}
+.nb-vtag {
+  font-size: 10px;
+  border: 1px solid var(--ink);
+  padding: 0 4px;
+  margin-left: 6px;
+  letter-spacing: 0.04em;
+}
+.nb-row-sub {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+  margin-top: 2px;
+}
+.nb-open-btn {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border: 1px solid var(--ink);
+  background: var(--cream);
+  padding: 4px 10px;
+  cursor: pointer;
+  color: var(--ink);
+}
+.nb-open-btn:hover { background: var(--ink); color: var(--cream); }
+
+/* Stage 4.10 — Flow 2 split-feed: "Awaiting your review" vs
+   "Shared with you" sections in the dropdown. */
+.nb-section-label {
+  padding: 6px 10px 4px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  background: rgba(17, 17, 17, 0.05);
+  border-top: 1px solid var(--ink);
+  border-bottom: 1px solid var(--ink);
+  color: #111;
+}
+.nb-row-share[data-unread="true"] {
+  background: rgba(200, 230, 201, 0.5);  /* pale green — distinct
+                                            from reviewer-yellow */
+}
+.nb-row-share[data-unread="false"] {
+  background: #fafafa;
+  opacity: 0.85;
+}
+.nb-access-tag {
+  font-size: 9px;
+  margin-left: 6px;
+  padding: 1px 6px;
+  letter-spacing: 0.04em;
+  vertical-align: 1px;
 }

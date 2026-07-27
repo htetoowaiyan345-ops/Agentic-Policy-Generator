@@ -85,6 +85,12 @@ def init_db():
         if 'author_user_id' not in rc_cols:
             c.execute("ALTER TABLE review_comments ADD COLUMN author_user_id INTEGER")
 
+        # Stage 4.1.1 — project_members.last_seen_at (nullable; used by Flow 2
+        # to count unread shared projects for the header bell). Idempotent.
+        pm_cols = {row[1] for row in c.execute("PRAGMA table_info(project_members)").fetchall()}
+        if 'last_seen_at' not in pm_cols:
+            c.execute("ALTER TABLE project_members ADD COLUMN last_seen_at TEXT")
+
         c.commit()
 
 

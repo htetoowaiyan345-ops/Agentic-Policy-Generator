@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS project_members (
     access_level     TEXT NOT NULL,
     added_by_user_id INTEGER,
     added_at         TEXT NOT NULL,
+    last_seen_at     TEXT,
     PRIMARY KEY (run_id, user_id),
     FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
 );
@@ -381,3 +382,103 @@ def meets_access(user_level: str | None, required: str) -> bool:
     if user_level is None:
         return False
     return ACCESS_RANK.get(user_level, 0) >= ACCESS_RANK.get(required, 0)
+
+
+# ---------------------------------------------------------------------------
+# Stage 4.1.2 — Flow 2 helper queries
+# ---------------------------------------------------------------------------
+
+def get_my_shared_projects(conn, user_id: int) -> list[dict]:
+    """Return every run `user_id` can access, joined with `project_members`
+    metadata for Flow 2's header notification + Flow 3's access badge.
+
+    Each row contains:
+      - run_id, filename, created_at, status (from `runs`)
+      - your_access  : access_level on this project
+      - shared_by    : username of the user who added `user_id` to the
+                       project (NULL if `user_id` is the project creator)
+      - added_at     : timestamp when `user_id` was added to the project
+      - last_seen_at : last time `user_id` opened this project (NULL if never)
+
+    Admin users (`is_admin=1`) get every run, with `your_access='approver'`
+    and `shared_by=NULL`.
+    """
+    user_row = conn.execute(
+        "SELECT is_admin FROM users WHERE user_id = ?", (int(user_id),)
+    ).fetchone()
+    if not user_row:
+        return []
+    if int(user_row["is_admin"]) == 1:
+        rows = conn.execute(
+            """SELECT r.run_id, r.filename, r.created_at, r.status,
+                      'approver' AS your_access,
+                      u_creator.username AS shared_by,
+                      NULL AS added_at,
+                      NULL AS last_seen_at
+               FROM runs r
+               LEFT JOIN users u_creator ON u_creator.user_id = r.created_by_user_id
+               ORDER BY r.created_at DESC LIMIT 50"""
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT r.run_id, r.filename, r.created_at, r.status,
+                      pm.access_level AS your_access,
+                      CASE
+                        WHEN pm.added_by_user_id = pm.user_id
+                          THEN NULL
+                        ELSE u_added.username
+                      END AS shared_by,
+                      pm.added_at,
+                      pm.last_seen_at
+               FROM runs r
+               JOIN project_members pm ON pm.run_id = r.run_id
+               LEFT JOIN users u_added ON u_added.user_id = pm.added_by_user_id
+               WHERE pm.user_id = ?
+               ORDER BY r.created_at DESC LIMIT 50""",
+            (int(user_id),),
+        ).fetchall()
+    return [
+        {
+            "run_id": r["run_id"],
+            "filename": r["filename"],
+            "created_at": r["created_at"],
+            "status": r["status"],
+            "your_access": r["your_access"],
+            # `shared_by` is NULL when the current user is the creator
+            # (their own project); otherwise it is the username of the
+            # user who added them.
+            "shared_by": r["shared_by"],
+            "added_at": r["added_at"],
+            "last_seen_at": r["last_seen_at"],
+            # True when `last_seen_at` is NULL or older than `added_at`
+            # (i.e. there has been a new share since the user last looked).
+            "is_unread": (
+                r["last_seen_at"] is None
+                or (r["added_at"] is not None and r["last_seen_at"] < r["added_at"])
+            ),
+        }
+        for r in rows
+    ]
+
+
+def get_unread_count(conn, user_id: int) -> int:
+    """Return the count of shared projects that have NOT been opened (or
+    have new activity) since the user's `last_seen_at`. Used by the Flow 2
+    header notification badge.
+    """
+    rows = get_my_shared_projects(conn, user_id)
+    return sum(1 for r in rows if r.get("is_unread"))
+
+
+def mark_project_seen(conn, run_id: str, user_id: int) -> bool:
+    """Mark `user_id`'s view of `run_id` as 'just now'. Returns True if the
+    row was updated, False if the user is not a member of the project.
+    """
+    cur = conn.execute(
+        """UPDATE project_members SET last_seen_at = ?
+           WHERE run_id = ? AND user_id = ?""",
+        (_now(), run_id, int(user_id)),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+

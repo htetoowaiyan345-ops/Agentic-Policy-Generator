@@ -21,12 +21,16 @@
     saveVersion,
     submitForReview,
     reviewVersion,
-    publishVersion
+    publishVersion,
+    listProjectMembers,
+    markProjectSeen,
+    type AccessLevel
   } from './api';
   import type { PreviewData, BatchEntry, VersionEntry, PreviewLine } from './types';
   import VersionTimeline from './VersionTimeline.svelte';
   import ReviewComments from './ReviewComments.svelte';
   import ReviewEditor from './ReviewEditor.svelte';
+  import ProjectSharing from './ProjectSharing.svelte';
 
   interface Props {
     onBack: () => void;
@@ -236,6 +240,50 @@
   let actorName = $derived($currentUser?.username ?? 'anonymous');
   let isAdmin = $derived(!!$currentUser?.is_admin);
 
+  // Stage 4.5/4.7 — per-project access (server reports it back via
+  // the share-popup endpoint). When `null` the badge hides.
+  let yourAccess = $state<AccessLevel | null>(null);
+  let shareOpen = $state(false);
+  // Maps each batch file's runId to its access (populated whenever a
+  // file becomes active). Drives the per-file Flow 3 badge on the
+  // Results dropdown line.
+  let yourAccessByRunId = $state<Map<string, AccessLevel>>(new Map());
+
+  async function refreshYourAccess(runId: string): Promise<void> {
+    if (!runId) return;
+    try {
+      const data = await listProjectMembers(runId);
+      const lvl = (data.your_access ?? null) as AccessLevel | null;
+      yourAccess = lvl;
+      const next = new Map(yourAccessByRunId);
+      if (lvl) next.set(runId, lvl);
+      else next.delete(runId);
+      yourAccessByRunId = next;
+    } catch {
+      yourAccess = null;
+    }
+  }
+
+  async function onShareClick(): Promise<void> {
+    if (!activeRunId) return;
+    shareOpen = true;
+    try {
+      await markProjectSeen(activeRunId);
+    } catch {
+      /* non-fatal — the modal will still open */
+    }
+  }
+
+  // Stage 4.7 — per-action visibility derived from `yourAccess`.
+  // Viewer: read-only (no editor / no status-machine writes / no comments).
+  // Editor: editor + submit + comments + reviewer-assign — no approve/publish.
+  // Approver: every action allowed.
+  let canEdit = $derived(yourAccess === 'editor' || yourAccess === 'approver');
+  let canComment = $derived(yourAccess === 'editor' || yourAccess === 'approver');
+  let canSubmit = $derived(yourAccess === 'editor' || yourAccess === 'approver');
+  let canReview = $derived(yourAccess === 'approver');
+  let canPublish = $derived(yourAccess === 'approver');
+
   let currentVersionEntry = $derived(
     versionsLoaded.find((v) => v.version_no === viewingVersionNo) || null
   );
@@ -443,6 +491,7 @@
       loadPreview(activeRunId);
       loadReviewData(activeRunId);
       refreshDownloadLabel();
+      refreshYourAccess(activeRunId);
     }
   });
 
@@ -549,6 +598,7 @@
     onReset();
   }
 
+  // Stage 4.5 — Flow 1 popup (only opened from the Share button).
   function addAnotherFile(): void {
     onAddAnother();
   }
@@ -576,6 +626,22 @@
         <option value={b.runId}>{b.name}</option>
       {/each}
     </select>
+    {#if yourAccess}
+      <span
+        class="share-badge share-{yourAccess}"
+        data-testid="share-badge"
+        title="Your access level for this project"
+      >{yourAccess}</span>
+    {/if}
+    {#if yourAccess === 'approver'}
+      <button
+        type="button"
+        id="share-btn"
+        class="pill-btn"
+        data-testid="share-btn"
+        onclick={onShareClick}
+      >Share</button>
+    {/if}
   </div>
 
   <div id="slots-container" class="max-w-4xl mb-12">
@@ -614,6 +680,7 @@
           runId={activeRunId}
           versionNo={viewingVersionNo}
           onCommentChange={onCommentChange}
+          editable={canComment}
         />
       </div>
     </div>
@@ -657,18 +724,20 @@
           bind:value={changeSummary}
           maxlength="200"
         />
-        <button
-          class="pill-btn"
-          onclick={onSaveVersion}
-          disabled={!editorDirty || !changeSummary.trim() || savingVersion}
-        >
-          {savingVersion ? 'Saving…' : 'Save as new version'}
-        </button>
-        <button class="pill-btn-ghost" onclick={cancelEditor} disabled={savingVersion}>
-          Discard edits
-        </button>
+        {#if canEdit}
+          <button
+            class="pill-btn"
+            onclick={onSaveVersion}
+            disabled={!editorDirty || !changeSummary.trim() || savingVersion}
+          >
+            {savingVersion ? 'Saving…' : 'Save as new version'}
+          </button>
+          <button class="pill-btn-ghost" onclick={cancelEditor} disabled={savingVersion}>
+            Discard edits
+          </button>
+        {/if}
 
-        {#if currentStatus === 'draft' || currentStatus === 'rejected'}
+        {#if canSubmit && (currentStatus === 'draft' || currentStatus === 'rejected')}
           <button
             class="pill-btn"
             onclick={onSubmit}
@@ -676,7 +745,7 @@
           >
             {submitting ? 'Submitting…' : 'Submit for Review'}
           </button>
-        {:else if currentStatus === 'in_review'}
+        {:else if canReview && currentStatus === 'in_review'}
           <button
             class="pill-btn"
             onclick={() => (approveModalOpen = true)}
@@ -691,7 +760,7 @@
           >
             Request Changes…
           </button>
-        {:else if currentStatus === 'approved'}
+        {:else if canReview && currentStatus === 'approved'}
           <button
             class="pill-btn"
             onclick={onPublish}
@@ -836,8 +905,15 @@
       <button id="download-again-btn" class="pill-btn" onclick={doDownloadAgain}>Download Again</button>
     </div>
     <div id="download-all-done" class="hidden mt-4" bind:this={downloadAllDoneBox}>
-      <div class="mono-label mb-2" id="dl-all-timestamp">—</div>
+      <div class="mono-label mb-2" id="dl-all-timestamp">?"</div>
       <button id="download-all-again-btn" class="pill-btn" onclick={doDownloadAllAgain}>Download all again</button>
     </div>
   </div>
 </section>
+
+{#if shareOpen && activeRunId}
+  <ProjectSharing
+    runId={activeRunId}
+    onClose={() => (shareOpen = false)}
+  />
+{/if}

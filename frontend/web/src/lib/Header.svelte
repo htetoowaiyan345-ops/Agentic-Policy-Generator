@@ -2,12 +2,14 @@
   import { currentUser, clearCurrentUser, resetAppState } from './stores';
   import { logout } from './api';
   import { clearToken } from './auth';
+  import NotificationBell from './NotificationBell.svelte';
 
   interface Props {
     historyOpen: boolean;
     onToggleHistory: () => void;
+    onSelectRun?: (runId: string) => void;
   }
-  let { historyOpen, onToggleHistory }: Props = $props();
+  let { historyOpen, onToggleHistory, onSelectRun }: Props = $props();
 
   let user = $derived($currentUser);
 
@@ -16,6 +18,10 @@
     clearToken();
     clearCurrentUser();
     resetAppState();
+  }
+
+  function handleSelectRun(runId: string): void {
+    onSelectRun?.(runId);
   }
 </script>
 
@@ -32,6 +38,7 @@
       }}
     >Run History</a>
     {#if user}
+      <NotificationBell onSelectRun={handleSelectRun} />
       <span
         class="font-mono text-[10px] font-medium tracking-[0.08em] uppercase text-[#555]"
         data-testid="current-user"
