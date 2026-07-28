@@ -131,6 +131,7 @@ def run_from_lines_json(
     run_id: Optional[str] = None,
     document_name: str = "reviewer-edit-lines-json",
     fail_on_validation: bool = False,
+    reviewer_bindings: Optional[dict] = None,
 ) -> AuditResult:
     """Phase 6 — re-run the Brain pipeline end-to-end against the
     reviewer's saved lines_json (rich or legacy). Useful for the
@@ -150,6 +151,13 @@ def run_from_lines_json(
     title-extractor can otherwise pick a long body paragraph (e.g. a
     scope statement) as the title because of length-based scoring —
     the explicit value short-circuits that path.
+
+    `reviewer_bindings` (optional): `{slot_id: [reviewer_paragraph, ...]}`
+    map produced by `api.lines_json_extractor.reviewer_slot_bindings`.
+    When provided, the pipeline overrides each bound slot's
+    `placed_paragraphs` with the reviewer's text BEFORE the render
+    step. Slots not in the map are filled by RAG as usual (hybrid:
+    edited slots are locked, unedited slots keep RAG content).
     """
     from api.lines_json_extractor import LinesJsonExtractor
     from api.docx_approved_export import extract_explicit_title_and_version
@@ -203,6 +211,7 @@ def run_from_lines_json(
         header_text=explicit_title,
         header_version=explicit_version,
         fail_on_validation=fail_on_validation,
+        reviewer_bindings=reviewer_bindings,
     )
 
 
@@ -219,6 +228,7 @@ def _run_extracted_pipeline(
     header_text: Optional[str],
     header_version: Optional[str],
     fail_on_validation: bool,
+    reviewer_bindings: Optional[dict] = None,
 ) -> AuditResult:
     """Shared post-extraction body for `process` and `run_from_lines_json`."""
     # Step 2.5: Extract header info from the cleaned first page
@@ -356,6 +366,46 @@ def _run_extracted_pipeline(
     except Exception as e:
         steps.append(_step(4, "Apply", False, str(e)))
         raise PipelineError(f"Step 4 Apply failed: {e}") from e
+
+    # Step 4.5: Reviewer-bindings override. When the caller supplied a
+    # `reviewer_bindings` map (publish path), override each bound slot's
+    # `placed_paragraphs` AND `content_paragraphs` with the reviewer's
+    # text BEFORE the render step so the renderer's `placed_paragraphs`
+    # is what gets written to the .docx. Unbound slots keep RAG output.
+    # slot=0 entries (reviewer additions outside any known slot) are
+    # ignored here — the renderer's existing fallback path handles
+    # them.
+    if reviewer_bindings:
+        try:
+            bound_count = 0
+            for sid, slot in classified.sections.items():
+                # Normalise sid key types (JSON returns str, dataclass
+                # may store int; check both).
+                key_candidates = [sid, int(sid)] if isinstance(sid, str) and sid.isdigit() else [sid]
+                reviewer_paras = None
+                for k in key_candidates:
+                    if k in reviewer_bindings:
+                        reviewer_paras = reviewer_bindings[k]
+                        break
+                if not reviewer_paras:
+                    continue
+                # Replace both placed (rendered) and content (audit)
+                # lists. The status flips to "Found" so the renderer
+                # treats it as a populated slot.
+                slot.placed_paragraphs = list(reviewer_paras)
+                slot.content_paragraphs = list(reviewer_paras)
+                slot.status = "Found"
+                bound_count += 1
+            steps.append(
+                _step(
+                    4, "Reviewer-Bind", True,
+                    f"bound_slots={bound_count}/{len(reviewer_bindings or {})}",
+                )
+            )
+        except Exception as e:
+            print(f'[_run_extracted_pipeline] reviewer-bind failed: {e}', flush=True)
+            steps.append(_step(4, "Reviewer-Bind", False, str(e)))
+            # Non-fatal: continue without binding.
 
     # Step 5+6: Render
     try:
@@ -597,6 +647,46 @@ def _run_extracted_pipeline(
     except Exception as e:
         steps.append(_step(4, "Apply", False, str(e)))
         raise PipelineError(f"Step 4 Apply failed: {e}") from e
+
+    # Step 4.5: Reviewer-bindings override. When the caller supplied a
+    # `reviewer_bindings` map (publish path), override each bound slot's
+    # `placed_paragraphs` AND `content_paragraphs` with the reviewer's
+    # text BEFORE the render step so the renderer's `placed_paragraphs`
+    # is what gets written to the .docx. Unbound slots keep RAG output.
+    # slot=0 entries (reviewer additions outside any known slot) are
+    # ignored here — the renderer's existing fallback path handles
+    # them.
+    if reviewer_bindings:
+        try:
+            bound_count = 0
+            for sid, slot in classified.sections.items():
+                # Normalise sid key types (JSON returns str, dataclass
+                # may store int; check both).
+                key_candidates = [sid, int(sid)] if isinstance(sid, str) and sid.isdigit() else [sid]
+                reviewer_paras = None
+                for k in key_candidates:
+                    if k in reviewer_bindings:
+                        reviewer_paras = reviewer_bindings[k]
+                        break
+                if not reviewer_paras:
+                    continue
+                # Replace both placed (rendered) and content (audit)
+                # lists. The status flips to "Found" so the renderer
+                # treats it as a populated slot.
+                slot.placed_paragraphs = list(reviewer_paras)
+                slot.content_paragraphs = list(reviewer_paras)
+                slot.status = "Found"
+                bound_count += 1
+            steps.append(
+                _step(
+                    4, "Reviewer-Bind", True,
+                    f"bound_slots={bound_count}/{len(reviewer_bindings or {})}",
+                )
+            )
+        except Exception as e:
+            print(f'[_run_extracted_pipeline] reviewer-bind failed: {e}', flush=True)
+            steps.append(_step(4, "Reviewer-Bind", False, str(e)))
+            # Non-fatal: continue without binding.
 
     # Step 5+6: Render
     try:

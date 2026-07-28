@@ -1283,16 +1283,31 @@ class Handler(BaseHTTPRequestHandler):
                         draft_edit_count=draft_edit_count,
                     )
                     if not new_v:
-                        return send_json(
-                            self,
-                            {'error': 'no_draft',
-                             'message': (
-                                 'No autosave draft to submit. '
-                                 'Open the editor and try again.'
-                             )},
-                            status=409,
+                        # No autosave draft to consume. Fall back: if
+                        # the requested version_no is itself a valid
+                        # draft row in policy_versions (e.g. V1, the
+                        # initial pipeline draft), submit that row
+                        # directly. Otherwise return 409 no_draft.
+                        existing = versions_io.get_version(
+                            c, run_id, target_version_no
                         )
-                    target_version_no = int(new_v['version_no'])
+                        if (
+                            existing
+                            and existing.get('review_status') == 'draft'
+                        ):
+                            target_version_no = int(existing['version_no'])
+                        else:
+                            return send_json(
+                                self,
+                                {'error': 'no_draft',
+                                 'message': (
+                                     'No autosave draft to submit. '
+                                     'Open the editor and try again.'
+                                 )},
+                                status=409,
+                            )
+                    else:
+                        target_version_no = int(new_v['version_no'])
                 cur = versions_io.get_version(c, run_id, target_version_no)
                 if not cur:
                     return send_json(self, {'error': 'version not found'}, status=404)

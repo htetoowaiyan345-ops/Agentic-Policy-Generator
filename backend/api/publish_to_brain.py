@@ -108,15 +108,29 @@ def publish_approved_version(
     output_path = Path(output_dir) / f'{run_id}_approved_v{version_no}.docx'
 
     # 3) Re-run the pipeline against the reviewer's saved lines_json.
+    #    We pass a `reviewer_bindings` map so the pipeline overrides
+    #    RAG-retrieved slot content with the reviewer's saved text for
+    #    any slot the reviewer touched. Unbound slots still use RAG.
     try:
         from policy_platform.pipeline import run_from_lines_json
-        from api.lines_json_extractor import normalise_lines_json
+        from api.lines_json_extractor import (
+            normalise_lines_json,
+            reviewer_slot_bindings,
+        )
+        normalised_lines = normalise_lines_json(ver.get('lines_json', []) or [])
+        bindings = reviewer_slot_bindings(normalised_lines)
+        print(
+            f'[publish_to_brain] run={run_id} v{version_no} '
+            f'bindings={list(bindings.keys())}',
+            flush=True,
+        )
         result = run_from_lines_json(
-            lines_json=normalise_lines_json(ver.get('lines_json', [])),
+            lines_json=normalised_lines,
             output_path=output_path,
             run_id=run_id,
             document_name=f'{run_id}_v{version_no}',
             fail_on_validation=False,
+            reviewer_bindings=bindings,
         )
     except Exception as e:
         print(f'[publish_to_brain] pipeline re-run failed: {e}', flush=True)

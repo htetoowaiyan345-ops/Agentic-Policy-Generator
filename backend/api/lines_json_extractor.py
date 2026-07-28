@@ -68,6 +68,51 @@ def normalise_lines_json(lines_json: Iterable) -> list:
     return out
 
 
+def reviewer_slot_bindings(lines_json: Iterable) -> dict[int, list[str]]:
+    """Build a `{slot_id: [paragraph_text, ...]}` map from a reviewer's
+    saved `lines_json`. Used by the publish pipeline to override
+    RAG-retrieved slot content with the reviewer's edits.
+
+    Only `['p', ...]` paragraphs are included; tables are excluded
+    (the publish pipeline keeps RAG-rendered table content unless
+    tables are explicitly bound, which the current data model does
+    not support).
+
+    Paragraphs whose `slot` is 0 (or missing) are bucketed under
+    slot 0 and represent additions the reviewer placed outside any
+    known slot — these are returned but should generally be ignored
+    by the binding step (they are appended to the body verbatim by
+    the reviewer; the pipeline's downstream steps handle them).
+
+    Empty/whitespace-only paragraphs are skipped.
+    """
+    bindings: dict[int, list[str]] = {}
+    for raw in lines_json or []:
+        if not isinstance(raw, list) or len(raw) != 2:
+            continue
+        kind, payload = raw[0], raw[1]
+        if kind != 'p':
+            continue
+        if isinstance(payload, str):
+            slot = 0
+            text = payload
+        elif isinstance(payload, dict):
+            try:
+                slot = int(payload.get('slot', 0) or 0)
+            except (TypeError, ValueError):
+                slot = 0
+            text = (
+                payload.get('text')
+                or _strip_html_to_plain(payload.get('html') or '')
+            )
+        else:
+            continue
+        if not text or not text.strip():
+            continue
+        bindings.setdefault(slot, []).append(text)
+    return bindings
+
+
 class LinesJsonExtractor:
     """Convert an approved lines_json payload into an ExtractedDocument.
 
