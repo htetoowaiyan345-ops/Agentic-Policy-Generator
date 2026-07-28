@@ -354,6 +354,20 @@
   let canReview = $derived(yourAccess === 'approver');
   let canPublish = $derived(yourAccess === 'approver');
 
+  // Share controls (badge + Share button) are visible whenever the
+  // current user has approver access on this run, OR is an admin
+  // (admins get implicit approver access). Independent of `hasResults`
+  // so the controls still appear when the user opens the page from
+  // a notification before any uploads populate the local batch.
+  let showShareControls = $derived(
+    yourAccess === 'approver' || (!yourAccess && isAdmin)
+  );
+
+  // Viewer role — read-only. They don't get the state-machine action
+  // bar (CURRENT STATE / ACTOR / Submit / Approve / etc.). Only the
+  // preview pane + comments are visible.
+  let isViewer = $derived(yourAccess === 'viewer');
+
   let currentVersionEntry = $derived(
     versionsLoaded.find((v) => v.version_no === viewingVersionNo) || null
   );
@@ -861,6 +875,13 @@ async function loadDraftAndApply(runId: string): Promise<void> {
         <option value={b.runId}>{b.name}</option>
       {/each}
     </select>
+  </div>
+
+  <div
+    id="share-row"
+    class="max-w-4xl mb-6 flex items-center gap-3"
+    class:hidden={!showShareControls}
+  >
     {#if yourAccess === 'approver'}
       <span
         class="share-badge share-{yourAccess}"
@@ -934,7 +955,7 @@ async function loadDraftAndApply(runId: string): Promise<void> {
   {/if}
 
   <!-- Stage 5/6 - state-machine action bar + editor + modals. -->
-  {#if activeRunId && (currentVersionEntry || onDraft)}
+  {#if activeRunId && (currentVersionEntry || onDraft) && !isViewer}
     <div id="review-action-bar" class="max-w-4xl mb-12">
       <div class="ra-status-row">
         <span class="mono-label">CURRENT STATE</span>
