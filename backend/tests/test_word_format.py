@@ -125,8 +125,8 @@ def test_calibri_10pt_body_runs(tmp_path):
     assert found, "intro body paragraph not found"
 
 
-def test_line_spacing_1_5_body(tmp_path):
-    """Every body paragraph carries 1.5 line spacing + 4pt before/after."""
+def test_line_spacing_2_0_body(tmp_path):
+    """Every body paragraph carries 2.0 line spacing + 4pt before/after."""
     p = tmp_path / "inp.txt"
     p.write_text("Type: HR\n", encoding="utf-8")
     from policy_platform import pipeline
@@ -137,20 +137,20 @@ def test_line_spacing_1_5_body(tmp_path):
         text = _para_text(para).strip()
         if not text:
             continue
-        # Find paragraph-level <w:spacing w:line="360">. The run-level
+        # Find paragraph-level <w:spacing w:line="480">. The run-level
         # <w:spacing val="0"/> (run character spacing) is unrelated.
         # Use a regex that explicitly looks for the line-bearing spacing
         # element at the pPr level (NOT inside an inner rPr).
         sp_matches = re.findall(
-            r"<w:spacing[^/>]*w:line=\"360\"[^/>]*/>",
+            r"<w:spacing[^/>]*w:line=\"480\"[^/>]*/>",
             para,
         )
         assert sp_matches, (
-            f"paragraph missing paragraph-level <w:spacing w:line=360>: "
+            f"paragraph missing paragraph-level <w:spacing w:line=480>: "
             f"{para[:300]}"
         )
         attr = sp_matches[0]
-        assert 'w:line="360"' in attr, f"line not 360: {attr}"
+        assert 'w:line="480"' in attr, f"line not 480: {attr}"
         assert 'w:lineRule="auto"' in attr, f"lineRule not auto: {attr}"
         # Default is 80 (4pt). Two Header paragraphs get modified by
         # the renderer's Header decoration pass:
@@ -261,7 +261,7 @@ def test_header_label_decoration_1px_line_below_targets(tmp_path):
                     f"(w:space=240): {next_para[:300]}"
                 )
                 m_before = re.search(
-                    r'<w:spacing[^/>]*w:line="360"[^/>]*'
+                    r'<w:spacing[^/>]*w:line="480"[^/>]*'
                     r'w:before="0"[^/>]*/>',
                     next_para,
                 )

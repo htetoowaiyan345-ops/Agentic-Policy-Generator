@@ -344,8 +344,15 @@
           const n = parseInt(slotVal, 10);
           if (Number.isFinite(n)) return n as SlotKind;
         }
+        // Stage 1: never let `fallbackSlot=0` (free paragraph) overwrite a
+        // non-zero `lastSlot`. User additions inherit the slot of the
+        // nearest preceding section so they reach the correct slot in
+        // the published .docx instead of being silently dropped into
+        // the free-paragraph zone.
+        if (lastSlot != null && lastSlot !== 0) return lastSlot;
+        if (fallbackSlot !== 0) return fallbackSlot;
         if (lastSlot != null) return lastSlot;
-        return fallbackSlot;
+        return 0 as SlotKind;
       })();
       lastSlot = slot;
 

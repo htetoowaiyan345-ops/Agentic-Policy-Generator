@@ -1717,11 +1717,11 @@ def _normalize_word_format(doc) -> None:
         jc = OxmlElement("w:jc")
         jc.set(qn("w:val"), "both")
         pPr.append(jc)
-        # Force spacing (1.5 line + 4pt before + 4pt after).
+        # Force spacing (2.0 line + 4pt before + 4pt after).
         for el in pPr.findall(qn("w:spacing")):
             pPr.remove(el)
         spacing = OxmlElement("w:spacing")
-        spacing.set(qn("w:line"), "360")
+        spacing.set(qn("w:line"), "480")
         spacing.set(qn("w:lineRule"), "auto")
         spacing.set(qn("w:before"), "80")
         spacing.set(qn("w:after"), "80")

@@ -22,10 +22,171 @@ import re
 from typing import Any, Iterable, List, Optional
 
 from policy_platform.extractors.base import ExtractedDocument
-from policy_platform.framework.brain_slot_map import BRAIN_SLOT_RANGES
+from policy_platform.framework.brain_slot_map import BRAIN_SLOT_RANGES, SLOT_HEADINGS
 
 
 HTML_TAG_RE = re.compile(r'<[^>]+>')
+
+
+# Slot-1 metadata field patterns (case-insensitive prefix match on the
+# paragraph text after stripping HTML). These mirror the brain template's
+# header field labels (Type, Policy Title, Policy Number, etc.).
+_METADATA_SLOT1_PATTERNS = (
+    re.compile(r'^Type\s*[:\u00A0]', re.IGNORECASE),
+    re.compile(r'^Policy\s*Title\s*[:\u00A0]', re.IGNORECASE),
+    re.compile(r'^Policy\s*Number\s*[:\u00A0]', re.IGNORECASE),
+    re.compile(r'^Applicable\s+Sector', re.IGNORECASE),
+    re.compile(r'^Functional\s+Area', re.IGNORECASE),
+)
+
+# Slot-3 metadata field patterns (Approval & Governance).
+_METADATA_SLOT3_PATTERNS = (
+    re.compile(r'^Effective\s+Date', re.IGNORECASE),
+    re.compile(r'^Approved\s+by\s*[:\u00A0]', re.IGNORECASE),
+    re.compile(r'^Prepared\s+by\s*[:\u00A0]', re.IGNORECASE),
+    re.compile(r'^Responsible\s+Function', re.IGNORECASE),
+    re.compile(r'^Supersedes\s*[:\u00A0]', re.IGNORECASE),
+    re.compile(r'^Last\s+Reviewed', re.IGNORECASE),
+    re.compile(r'^Applies\s+to\s*[:\u00A0]', re.IGNORECASE),
+)
+
+_METADATA_SLOT2_PATTERN = re.compile(r'^Brief\s+Description\s*[:\u00A0]', re.IGNORECASE)
+_METADATA_SLOT4_PATTERN = re.compile(r'^Reason\s+for\s+Policy\s*[:\u00A0]', re.IGNORECASE)
+
+
+def _classify_slot_from_text(text: str) -> int:
+    """Return the Brain slot id for a single paragraph by matching its
+    text against the framework's heading labels + metadata prefixes.
+
+    Returns 0 when no slot can be confidently identified.
+    """
+    if not text:
+        return 0
+    t = text.strip()
+    upper = t.upper()
+    # Section headings (exact or near-exact match).
+    if upper in {'INTRODUCTION', 'POLICY STATEMENT', 'DEFINITIONS', 'HISTORY'}:
+        return {'INTRODUCTION': 5, 'POLICY STATEMENT': 6, 'DEFINITIONS': 12, 'HISTORY': 14}[upper]
+    if upper.startswith('RELATED POLICIES'):
+        return 13
+    if upper.startswith('1. PURPOSE') or upper == 'PURPOSE':
+        return 7
+    if upper.startswith('2. SCOPE') or upper == 'SCOPE & BENEFICIARIES':
+        return 8
+    if upper.startswith('3. EXCLUSIONS') or upper == 'EXCLUSIONS':
+        return 9
+    if upper.startswith('4. AWARD STRUCTURE') or upper == 'AWARD STRUCTURE & PAYOUT TIERS':
+        return 10
+    if upper.startswith('POLICY REVIEW NOTE'):
+        return 11
+    # Metadata prefixes.
+    for pat in _METADATA_SLOT1_PATTERNS:
+        if pat.match(t):
+            return 1
+    if _METADATA_SLOT2_PATTERN.match(t):
+        return 2
+    for pat in _METADATA_SLOT3_PATTERNS:
+        if pat.match(t):
+            return 3
+    if _METADATA_SLOT4_PATTERN.match(t):
+        return 4
+    return 0
+
+
+def _set_slot(payload: dict, slot: int) -> dict:
+    """Return a copy of `payload` with `slot` set to `slot`. Tables keep
+    their `slot` (mirrors paragraphs)."""
+    out = dict(payload)
+    out['slot'] = slot
+    return out
+
+
+def infer_anchor_slots(lines_json: Iterable) -> list:
+    """Pattern-based slot inference for the saved `lines_json`.
+
+    Walks the saved lines in order. For every paragraph whose
+    `slot == 0` (i.e. was typed as a free paragraph by the reviewer or
+    saved without a slot), try to assign a slot id by matching its
+    text against the Brain framework headings + metadata prefixes.
+
+    Slot inheritance: after assigning a slot to a paragraph, subsequent
+    `slot=0` paragraphs inherit that slot until the next recognised
+    heading. This matches the editor's `lastSlot` behaviour so the
+    published .docx routes content into the right slot body.
+
+    Only paragraphs with `slot == 0` are rewritten. Paragraphs that
+    already carry a non-zero slot (e.g. from the editor's `data-slot`
+    attribute or `anchor_slot`) are left alone — those assignments are
+    explicit and trusted.
+
+    Returns a new list; the input is not mutated.
+    """
+    out: list = []
+    last_slot = 0
+    for raw in lines_json or []:
+        if not isinstance(raw, list) or len(raw) != 2:
+            continue
+        kind, payload = raw[0], raw[1]
+        if kind == 'p':
+            p = payload if isinstance(payload, dict) else {'slot': 0, 'text': str(payload), 'html': str(payload)}
+            current_slot = int(p.get('slot', 0) or 0)
+            text = (
+                p.get('text')
+                or _strip_html_to_plain(p.get('html') or '')
+            )
+            if current_slot != 0:
+                last_slot = current_slot
+                out.append(['p', p])
+                continue
+            inferred = _classify_slot_from_text(text)
+            if inferred != 0:
+                last_slot = inferred
+                out.append(['p', _set_slot(p, inferred)])
+                continue
+            if last_slot != 0:
+                out.append(['p', _set_slot(p, last_slot)])
+                continue
+            out.append(['p', p])
+        elif kind == 't':
+            p = payload if isinstance(payload, dict) else {'slot': 0, 'rows': (payload or [])}
+            current_slot = int(p.get('slot', 0) or 0)
+            if current_slot != 0:
+                out.append(['t', p])
+                continue
+            if last_slot != 0:
+                out.append(['t', _set_slot(p, last_slot)])
+                continue
+            out.append(['t', p])
+        else:
+            out.append([kind, payload])
+    return out
+
+
+def preserve_editor_anchor_slot(lines_json: Iterable) -> list:
+    """Propagate the editor-set `anchor_slot` field onto `slot` when
+    `slot == 0`. The editor attaches `data-slot` to its paragraphs but
+    earlier pipelines dropped that field on save — this helper recovers
+    the assignment from any surviving `anchor_slot` sidecar.
+
+    Returns a new list; the input is not mutated.
+    """
+    out: list = []
+    for raw in lines_json or []:
+        if not isinstance(raw, list) or len(raw) != 2:
+            continue
+        kind, payload = raw[0], raw[1]
+        if kind in ('p', 't') and isinstance(payload, dict):
+            current_slot = int(payload.get('slot', 0) or 0)
+            anchor = payload.get('anchor_slot')
+            try:
+                anchor_slot = int(anchor) if anchor is not None else 0
+            except (TypeError, ValueError):
+                anchor_slot = 0
+            if current_slot == 0 and anchor_slot != 0:
+                out.append([kind, _set_slot(payload, anchor_slot)])
+                continue
+        out.append([kind, payload])
+    return out
 
 
 def _strip_html_to_plain(text: str) -> str:

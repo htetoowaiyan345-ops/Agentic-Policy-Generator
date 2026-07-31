@@ -261,7 +261,14 @@ def _make_rpr(*,
 
 
 def _build_run(text: str, style: dict) -> OxmlElement:
-    """Build a `<w:r>` run from a (text, inline-style) pair."""
+    """Build a `<w:r>` run from a (text, inline-style) pair.
+
+    No default font/size is emitted: when the user HTML doesn't specify
+    inline styling, the run inherits the brain framework's native
+    styling (font, size, alignment, indent) via the surrounding `pPr`.
+    Explicit user styling (bold/italic/color/font-family/font-size via
+    `<span style="...">`) is honoured and overrides the scaffold.
+    """
     r = OxmlElement('w:r')
     fw = (style.get('font-weight') or '').strip().lower()
     bold = fw in ('bold', 'bolder', '700', '800', '900')
@@ -376,6 +383,15 @@ def write_paragraph(p_elem, html: str, footnote_id_map: Optional[Dict[str, int]]
         p_elem.append(OxmlElement('w:r'))
         return
     spans = _parse_spans(html)
+    # Strip trailing '\n'-only spans (they come from the closing </p>
+    # in the user's HTML). When write_paragraph is called on an
+    # existing <w:p> element, the paragraph break is the <w:p> itself
+    # — emitting a soft <w:br/> at the end renders a blank line in Word.
+    while spans and (spans[-1].text or '') == '\n':
+        spans.pop()
+    if not spans:
+        p_elem.append(OxmlElement('w:r'))
+        return
     for span in spans:
         # Footnote anchor span
         if span.footnoteId:
