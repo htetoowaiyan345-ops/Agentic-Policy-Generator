@@ -126,7 +126,11 @@ def test_calibri_10pt_body_runs(tmp_path):
 
 
 def test_line_spacing_2_0_body(tmp_path):
-    """Every body paragraph carries 2.0 line spacing + 4pt before/after."""
+    """Every body paragraph carries 2.0 line spacing. The legacy header
+    label-decoration pass (which boosted `after=240` on Functional
+    Area(s): / Applies to: and zeroed `before` on the following
+    paragraph) has been removed — the new scheme uses dedicated divider
+    paragraphs instead."""
     p = tmp_path / "inp.txt"
     p.write_text("Type: HR\n", encoding="utf-8")
     from policy_platform import pipeline
@@ -137,10 +141,6 @@ def test_line_spacing_2_0_body(tmp_path):
         text = _para_text(para).strip()
         if not text:
             continue
-        # Find paragraph-level <w:spacing w:line="480">. The run-level
-        # <w:spacing val="0"/> (run character spacing) is unrelated.
-        # Use a regex that explicitly looks for the line-bearing spacing
-        # element at the pPr level (NOT inside an inner rPr).
         sp_matches = re.findall(
             r"<w:spacing[^/>]*w:line=\"480\"[^/>]*/>",
             para,
@@ -152,39 +152,6 @@ def test_line_spacing_2_0_body(tmp_path):
         attr = sp_matches[0]
         assert 'w:line="480"' in attr, f"line not 480: {attr}"
         assert 'w:lineRule="auto"' in attr, f"lineRule not auto: {attr}"
-        # Default is 80 (4pt). Two Header paragraphs get modified by
-        # the renderer's Header decoration pass:
-        #   - `Functional Area(s):` and `Applies to:` → `after=240`
-        #     (12pt gap below the label, above the black line).
-        #   - The paragraph that follows each target (the one with the
-        #     1px black top-border) → `before=0` (flush under the line).
-        #     The 12pt white space below the line is provided by the
-        #     border's own `w:space=240`, not by paragraph `w:before`.
-        #     When input has `Functional Area(s): Human Resources`,
-        #     this paragraph reads `Brief Description:`. When input
-        #     has `Applies to: All eligible employees`, it reads
-        #     `Reason for Policy:`.
-        is_target_label = (
-            text.startswith("Functional Area(s):")
-            or text.startswith("Applies to:")
-        )
-        is_line_bearing = (
-            text.startswith("Brief Description:")
-            or text.startswith("Reason for Policy:")
-        )
-        if is_target_label:
-            assert 'w:before="80"' in attr, f"target before not 80: {attr}"
-            assert 'w:after="240"' in attr, (
-                f"boosted label after not 240: {attr}"
-            )
-        elif is_line_bearing:
-            assert 'w:before="0"' in attr, (
-                f"line-bearing before not 0: {attr}"
-            )
-            assert 'w:after="80"' in attr, f"line-bearing after not 80: {attr}"
-        else:
-            assert 'w:before="80"' in attr, f"before not 80: {attr}"
-            assert 'w:after="80"' in attr, f"after not 80: {attr}"
 
 
 def test_introduction_heading_keeps_bold(tmp_path):
@@ -212,13 +179,14 @@ def test_introduction_heading_keeps_bold(tmp_path):
     assert found, "INTRODUCTION heading not found"
 
 
-def test_header_label_decoration_1px_line_below_targets(tmp_path):
-    """The 1px black top-border lives on the paragraph that FOLLOWS
-    `Functional Area(s):` and `Applies to:` — i.e., the line visually
-    appears BELOW the target label, not above it. The top-border
-    carries a 12pt `w:space` so there is 12pt of white space BELOW the
-    line before the next paragraph's text starts (symmetric with the
-    12pt `after=240` on the target label above the line)."""
+def test_header_label_decoration_old_dividers_removed(tmp_path):
+    """The legacy 1px black top-border on the NEXT paragraph after
+    `Functional Area(s):` and `Applies to:` has been REMOVED. The new
+    divider scheme uses dedicated empty divider paragraphs (inserted by
+    `lines_json_renderer._apply_slot1_metadata_styling_post_pass`)
+    instead of inline `<w:top>` borders on content paragraphs.
+
+    This test asserts the absence of the legacy inline border."""
     p = tmp_path / "inp.txt"
     p.write_text(
         "Type: HR\n"
@@ -235,45 +203,23 @@ def test_header_label_decoration_1px_line_below_targets(tmp_path):
         for text in [_para_text(para).strip()]
         if text
     ]
-    found_fa_line = False
-    found_at_line = False
     target_labels = {"Functional Area(s):", "Applies to:"}
+    legacy_pattern = re.compile(
+        r'<w:pBdr[^>]*>\s*<w:top\b'
+        r'(?=[^/>]*\bw:val="single")'
+        r'(?=[^/>]*\bw:sz="6")'
+        r'(?=[^/>]*\bw:space="240")'
+        r'(?=[^/>]*\bw:color="000000")'
+        r'[^/>]*/>\s*</w:pBdr>',
+        re.DOTALL,
+    )
     for idx, (text, para) in enumerate(body_paras):
         for target in target_labels:
             if text.startswith(target):
-                # The next paragraph in document order must carry the
-                # 1px black top-border with 12pt `w:space` (gap below
-                # line) and `w:before=0` (flush under the line).
                 next_text, next_para = body_paras[idx + 1]
-                m_line = re.search(
-                    r'<w:pBdr[^>]*>\s*<w:top\b'
-                    r'(?=[^/>]*\bw:val="single")'
-                    r'(?=[^/>]*\bw:sz="6")'
-                    r'(?=[^/>]*\bw:space="240")'
-                    r'(?=[^/>]*\bw:color="000000")'
-                    r'[^/>]*/>\s*</w:pBdr>',
-                    next_para,
-                    re.DOTALL,
+                m_line = legacy_pattern.search(next_para)
+                assert not m_line, (
+                    f"legacy 1px black top-border still present on "
+                    f"paragraph after {target!r}: {next_para[:300]}"
                 )
-                assert m_line, (
-                    f"next paragraph after {target!r} is missing "
-                    f"1px black top-border with 12pt under-line gap "
-                    f"(w:space=240): {next_para[:300]}"
-                )
-                m_before = re.search(
-                    r'<w:spacing[^/>]*w:line="480"[^/>]*'
-                    r'w:before="0"[^/>]*/>',
-                    next_para,
-                )
-                assert m_before, (
-                    f"line-bearing next paragraph after {target!r} "
-                    f"missing w:before=0 (must be flush under line): "
-                    f"{next_para[:300]}"
-                )
-                if target.startswith("Functional Area"):
-                    found_fa_line = True
-                else:
-                    found_at_line = True
                 break
-    assert found_fa_line, "1px line below Functional Area(s): not found"
-    assert found_at_line, "1px line below Applies to: not found"

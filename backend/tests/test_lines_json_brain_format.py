@@ -479,8 +479,9 @@ def test_type_has_divider_before(renderer_mod, brain_path, out_dir):
 
 def test_english_sections_have_divider_after(renderer_mod, brain_path, out_dir):
     """Both [English] paragraphs get a divider paragraph (empty +
-    bottom-border + 8px margins) immediately AFTER them (dividers 4
-    and 5 per user spec)."""
+    bottom-border + 5px top / 8px bottom margins) immediately AFTER
+    them. The [English] TEXT paragraph itself gets a 6px top margin
+    (120 twips) per user spec for breathing room above the label."""
     lines_json = [
         ["p", {"slot": 5, "text": "This is intro body.", "html": "<p>This is intro body.</p>"}],
         ["p", {"slot": 5, "text": "[English]", "html": "<p>[English]</p>"}],
@@ -497,6 +498,17 @@ def test_english_sections_have_divider_after(renderer_mod, brain_path, out_dir):
             english_indices.append(i)
     assert len(english_indices) == 2, f"expected 2 [English], got {len(english_indices)}"
     for idx in english_indices:
+        # 1) [English] TEXT paragraph itself: 6px top margin (120 twips).
+        english_p = paragraphs[idx]._element
+        eng_pPr = english_p.find(qn("w:pPr"))
+        assert eng_pPr is not None, "[English] paragraph missing pPr"
+        eng_spacing = eng_pPr.find(qn("w:spacing"))
+        assert eng_spacing is not None, "[English] paragraph missing spacing"
+        assert eng_spacing.get(qn("w:before")) == "120", (
+            f"[English] top margin should be 120 twips (6px), "
+            f"got {eng_spacing.get(qn('w:before'))!r}"
+        )
+        # 2) Divider paragraph AFTER [English]: 5px top, 8px bottom.
         next_p = paragraphs[idx + 1]
         assert (next_p.text or "").strip() == "", "paragraph after [English] should be empty divider"
         next_pPr = next_p._element.find(qn("w:pPr"))
@@ -508,9 +520,15 @@ def test_english_sections_have_divider_after(renderer_mod, brain_path, out_dir):
         assert next_bottom.get(qn("w:val")) == "single"
         next_spacing = next_pPr.find(qn("w:spacing"))
         assert next_spacing is not None
-        # [English] dividers use 5px (100 twips) margins per user spec.
-        assert next_spacing.get(qn("w:before")) == "100"
-        assert next_spacing.get(qn("w:after")) == "100"
+        # [English] divider: 5px (100 twips) top, 8px (160 twips) bottom.
+        assert next_spacing.get(qn("w:before")) == "100", (
+            f"[English] divider top margin should be 100 (5px), "
+            f"got {next_spacing.get(qn('w:before'))!r}"
+        )
+        assert next_spacing.get(qn("w:after")) == "160", (
+            f"[English] divider bottom margin should be 160 (8px), "
+            f"got {next_spacing.get(qn('w:after'))!r}"
+        )
 
 
 def test_all_5_dividers_in_full_doc(renderer_mod, brain_path, out_dir):
@@ -571,14 +589,14 @@ def test_all_5_dividers_in_full_doc(renderer_mod, brain_path, out_dir):
             continue
         before = spacing.get(qn("w:before"))
         after = spacing.get(qn("w:after"))
-        # Slot-1 dividers (Type, Functional Area, Applies to): 8px
+        # Slot-1 dividers (Type, Functional Area, Applies to): 8px top/bottom.
         if before == "160" and after == "160":
             divider_indices.append(i)
-        # [English] dividers: 5px
-        elif before == "100" and after == "100":
+        # [English] dividers: 5px top, 8px bottom (per user spec).
+        elif before == "100" and after == "160":
             english_divider_indices.append(i)
     assert len(divider_indices) == 3, f"expected 3 slot-1 dividers (8px), got {len(divider_indices)}: {divider_indices}"
-    assert len(english_divider_indices) == 2, f"expected 2 [English] dividers (5px), got {len(english_divider_indices)}: {english_divider_indices}"
+    assert len(english_divider_indices) == 2, f"expected 2 [English] dividers (5px top / 8px bottom), got {len(english_divider_indices)}: {english_divider_indices}"
 
     # Verify each divider is in the correct position relative to anchors.
     type_idx = next(i for i, p in enumerate(paragraphs) if (p.text or "").strip().lower().startswith("type:"))
@@ -591,7 +609,7 @@ def test_all_5_dividers_in_full_doc(renderer_mod, brain_path, out_dir):
     assert (functional_idx + 1) in divider_indices, "divider missing after Functional Area(s)"
     assert (applies_idx + 1) in divider_indices, "divider missing after Applies to:"
     for idx in english_indices:
-        assert (idx + 1) in english_divider_indices, f"[English] divider (5px) missing after [English] at {idx}"
+        assert (idx + 1) in english_divider_indices, f"[English] divider (5px top / 8px bottom) missing after [English] at {idx}"
 
 
 def test_faded_table_borders_stripped(renderer_mod, brain_path, out_dir):
@@ -630,6 +648,159 @@ def test_faded_table_borders_stripped(renderer_mod, brain_path, out_dir):
                         f"faded border color {color} still present in "
                         f"document.xml: ...{ctx[-150:]}"
                     )
+
+
+def test_inherited_table_style_borders_preserved(renderer_mod, brain_path, out_dir):
+    """The brain's table styles `TableGridLight` and `PlainTable3`
+    define borders (BFBFBF / 7F7F7F) in `word/styles.xml`. These are
+    inherited by tables via `<w:tblStyle>` references and render as
+    the brain's original table lines — which the user wants KEPT.
+
+    This test verifies that the renderer does NOT mutate these style
+    border definitions: every side in TableGridLight's `<w:tblBorders>`
+    and PlainTable3's conditional `<w:tcBorders>` retains its original
+    `val="single"` (or similar non-nil value).
+    """
+    lines_json = [
+        ["p", {"slot": 1, "text": "Type: HR Policy", "html": "<p>Type: HR Policy</p>"}],
+        ["p", {"slot": 10, "text": "Award tier data.", "html": "<p>Award tier data.</p>"}],
+        ["t", {"slot": 10, "rows": [["Tier", "Detail"]]}],
+        ["t", {"slot": 14, "rows": [["Date", "Change"]]}],
+    ]
+    out = out_dir / "styles_borders_preserved.docx"
+    renderer_mod.render_lines_json_to_brain(lines_json, brain_path, out)
+    import zipfile, re
+    with zipfile.ZipFile(str(out)) as zf:
+        styles_xml = zf.read("word/styles.xml").decode("utf-8")
+    # TableGridLight: at least one side must retain val="single"
+    # (the brain's original BFBFBF single border).
+    m = re.search(
+        r'<w:style w:type="table" w:styleId="TableGridLight">'
+        r'(.*?)</w:style>',
+        styles_xml,
+        re.DOTALL,
+    )
+    assert m is not None, "TableGridLight style not found in styles.xml"
+    bm = re.search(
+        r"<w:tblBorders>(.*?)</w:tblBorders>",
+        m.group(1),
+        re.DOTALL,
+    )
+    assert bm is not None, "TableGridLight missing tblBorders in styles.xml"
+    sides = re.findall(
+        r"<w:(top|left|bottom|right|insideH|insideV)\b[^/>]*w:val=\"([^\"]+)\"",
+        bm.group(1),
+    )
+    assert sides, "TableGridLight tblBorders has no side elements"
+    vals = [v for _, v in sides]
+    assert "single" in vals, (
+        "TableGridLight borders were mutated (no single sides remain). "
+        "Brain's original table lines must be preserved. Found vals: "
+        + str(vals)
+    )
+
+
+def test_page_header_separator_suppressed(renderer_mod, brain_path, out_dir):
+    """The brain template contains line elements that render as
+    visible horizontal lines in the published docx:
+
+    1. `<v:line>` connectors (legacy VML) in `header2.xml` and
+       `document.xml` — removed by stripping every `<v:line>` and
+       dropping `<mc:AlternateContent>` whose Fallback is purely
+       `<w:pict><v:line/></w:pict>`.
+
+    2. Zero-height `<w:drawing>` elements (modern DrawingML) — these
+       are degenerate drawings with `<wp:extent cy="0">` that Word
+       renders as horizontal lines on every page where the header
+       appears. The brain has one in `header2.xml` (cx=467.46pt,
+       cy=0) which was the persistent "2nd line" the user kept
+       seeing.
+
+    The renderer's `_suppress_page_header_separator` pass handles
+    both forms. Legitimate drawings (logo images with cy > 0) and
+    header text content are NOT touched.
+
+    This test verifies that no `<v:line>` AND no zero-height
+    `<w:drawing>` survives in any XML in the published docx.
+    """
+    lines_json = [
+        ["p", {"slot": 1, "text": "Type: HR Policy", "html": "<p>Type: HR Policy</p>"}],
+    ]
+    out = out_dir / "no_lines_anywhere.docx"
+    renderer_mod.render_lines_json_to_brain(lines_json, brain_path, out)
+    import zipfile, re
+    with zipfile.ZipFile(str(out)) as zf:
+        for name in zf.namelist():
+            if not name.endswith(".xml"):
+                continue
+            xml = zf.read(name).decode("utf-8")
+            # 1) No <v:line> anywhere
+            vlines = re.findall(r"<v:line\b", xml)
+            assert not vlines, (
+                name + " still contains " + str(len(vlines)) + " "
+                "<v:line> element(s)."
+            )
+            # 2) No zero-height <w:drawing> elements
+            zero_h = re.findall(
+                r'<wp:extent\s+cx="\d+"\s+cy="0"',
+                xml,
+            )
+            assert not zero_h, (
+                name + " still contains " + str(len(zero_h)) + " "
+                "drawing(s) with zero-height extent (cy=0); these "
+                "render as horizontal lines on every page. Logo "
+                "drawings (cy > 0) must be preserved."
+            )
+
+
+def test_inherited_table_style_borders_preserved(renderer_mod, brain_path, out_dir):
+    """The brain's table styles `TableGridLight` and `PlainTable3`
+    define borders (BFBFBF / 7F7F7F) in `word/styles.xml`. These are
+    inherited by tables via `<w:tblStyle>` references and render as
+    the brain's original table lines — which the user wants KEPT.
+
+    This test verifies that the renderer does NOT mutate these style
+    border definitions: every side in TableGridLight's `<w:tblBorders>`
+    and PlainTable3's conditional `<w:tcBorders>` retains its original
+    `val="single"` (or similar non-nil value).
+    """
+    lines_json = [
+        ["p", {"slot": 1, "text": "Type: HR Policy", "html": "<p>Type: HR Policy</p>"}],
+        ["p", {"slot": 10, "text": "Award tier data.", "html": "<p>Award tier data.</p>"}],
+        ["t", {"slot": 10, "rows": [["Tier", "Detail"]]}],
+        ["t", {"slot": 14, "rows": [["Date", "Change"]]}],
+    ]
+    out = out_dir / "styles_borders_preserved.docx"
+    renderer_mod.render_lines_json_to_brain(lines_json, brain_path, out)
+    import zipfile, re
+    with zipfile.ZipFile(str(out)) as zf:
+        styles_xml = zf.read("word/styles.xml").decode("utf-8")
+    # TableGridLight: at least one side must retain val="single"
+    # (the brain's original BFBFBF single border).
+    m = re.search(
+        r'<w:style w:type="table" w:styleId="TableGridLight">'
+        r'(.*?)</w:style>',
+        styles_xml,
+        re.DOTALL,
+    )
+    assert m is not None, "TableGridLight style not found in styles.xml"
+    bm = re.search(
+        r"<w:tblBorders>(.*?)</w:tblBorders>",
+        m.group(1),
+        re.DOTALL,
+    )
+    assert bm is not None, "TableGridLight missing tblBorders in styles.xml"
+    sides = re.findall(
+        r"<w:(top|left|bottom|right|insideH|insideV)\b[^/>]*w:val=\"([^\"]+)\"",
+        bm.group(1),
+    )
+    assert sides, "TableGridLight tblBorders has no side elements"
+    vals = [v for _, v in sides]
+    assert "single" in vals, (
+        "TableGridLight borders were mutated (no single sides remain). "
+        "Brain's original table lines must be preserved. Found vals: "
+        + str(vals)
+    )
 
 
 def test_explicit_font_size_still_works(renderer_mod, brain_path, out_dir):

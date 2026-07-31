@@ -1407,6 +1407,16 @@ def render_lines_json_to_brain(
     # table cell layout is preserved.
     _strip_faded_table_borders(doc)
 
+    # 5.10) Suppress the Word auto-separator between the page header
+    # and the body content. The brain's `header2.xml` and `header3.xml`
+    # carry the logo + "Document Control" text. Without this pass Word
+    # draws an automatic 1px black rule between the header and the
+    # first body paragraph (`Type:`) — the "second divider line" the
+    # user sees. Setting `<w:pBdr><w:bottom w:val="nil"/>` on the LAST
+    # paragraph of each header suppresses the auto-separator while
+    # keeping the header content (logo + Document Control text) intact.
+    _suppress_page_header_separator(doc)
+
     doc.save(str(output_path))
     _verify_media_against(brain_path, output_path)
     _restore_media_store_compression(output_path)
@@ -1552,26 +1562,36 @@ _DIVIDER_MARGIN_ENGLISH_TWIPS = 100
 
 
 def _make_divider_paragraph(side: str = "bottom",
-                            margin_twips: int = _DIVIDER_MARGIN_TWIPS) -> object:
+                            margin_twips: int = _DIVIDER_MARGIN_TWIPS,
+                            *,
+                            before_twips: int = None,
+                            after_twips: int = None) -> object:
     """Create a new empty divider paragraph with a single bottom (or top)
-    border line + symmetric top/bottom margins. Used by
+    border line + asymmetric top/bottom margins. Used by
     `_apply_slot1_metadata_styling_post_pass` to insert dedicated
     divider paragraphs in the rendered document.
 
     Each divider paragraph is a separate `<w:p>` element (not a border
-    applied to an existing content paragraph). The margin is applied to
-    BOTH top (`w:before=margin_twips`) AND bottom (`w:after=margin_twips`).
-    Use `_DIVIDER_MARGIN_TWIPS` (160 = 8px) for slot-1 metadata dividers
-    and `_DIVIDER_MARGIN_ENGLISH_TWIPS` (100 = 5px) for `[English]`
-    dividers per user spec.
+    applied to an existing content paragraph). The margins can be
+    configured independently for top and bottom:
+      - `margin_twips` is the default for both when `before_twips`
+        and `after_twips` are not provided (legacy symmetric mode).
+      - `before_twips` overrides the top margin.
+      - `after_twips` overrides the bottom margin.
+
+    Use `_DIVIDER_MARGIN_TWIPS` (160 = 8px) for slot-1 metadata
+    dividers, and `_DIVIDER_MARGIN_ENGLISH_TWIPS` (100 = 5px top,
+    160 = 8px bottom) for `[English]` dividers per user spec.
     """
     new_p = OxmlElement("w:p")
     pPr = OxmlElement("w:pPr")
     new_p.append(pPr)
-    # Symmetric top AND bottom margins.
+    # Margins — support asymmetric (top vs bottom).
+    before_val = str(before_twips) if before_twips is not None else str(margin_twips)
+    after_val = str(after_twips) if after_twips is not None else str(margin_twips)
     spacing = OxmlElement("w:spacing")
-    spacing.set(qn("w:before"), str(margin_twips))
-    spacing.set(qn("w:after"), str(margin_twips))
+    spacing.set(qn("w:before"), before_val)
+    spacing.set(qn("w:after"), after_val)
     pPr.append(spacing)
     # Border on the requested side.
     pBdr = OxmlElement("w:pBdr")
@@ -1629,15 +1649,30 @@ def _apply_slot1_metadata_styling_post_pass(doc) -> None:
             continue
         text_lower = text.lower()
         is_metadata = any(text_lower.startswith(label) for label in _SLOT1_METADATA_LABELS)
-        if not is_metadata:
-            continue
-        _apply_metadata_styling(p)
-        # Strip any prior pBdr that might have been added previously
-        # (defensive — should be none on a fresh render).
-        pPr = p.find(qn("w:pPr"))
-        if pPr is not None:
-            for existing in pPr.findall(qn("w:pBdr")):
-                pPr.remove(existing)
+        if is_metadata:
+            _apply_metadata_styling(p)
+            # Strip any prior pBdr that might have been added previously
+            # (defensive — should be none on a fresh render).
+            pPr = p.find(qn("w:pPr"))
+            if pPr is not None:
+                for existing in pPr.findall(qn("w:pBdr")):
+                    pPr.remove(existing)
+        # Per user spec: `[English]` text gets 6px top margin (120 twips)
+        # so the breathing-room ABOVE `[English]` matches the user's
+        # design (6px above, 5px to divider, 8px below divider).
+        # This runs for `[English]` paragraphs whether or not they're
+        # in `_SLOT1_METADATA_LABELS` (they aren't — they're handled
+        # separately).
+        if text_lower.startswith("[english]"):
+            pPr = p.find(qn("w:pPr"))
+            if pPr is None:
+                pPr = OxmlElement("w:pPr")
+                p.insert(0, pPr)
+            spacing = pPr.find(qn("w:spacing"))
+            if spacing is None:
+                spacing = OxmlElement("w:spacing")
+                pPr.append(spacing)
+            spacing.set(qn("w:before"), "120")
 
     # Second pass: identify the divider anchor paragraphs and insert
     # dedicated divider paragraphs in the correct positions.
@@ -1656,21 +1691,23 @@ def _apply_slot1_metadata_styling_post_pass(doc) -> None:
         is_top = any(text_lower.startswith(label) for label in _SLOT1_TOP_BORDER_LABELS)
         is_bottom = any(text_lower.startswith(label) for label in _SLOT1_BOTTOM_BORDER_LABELS)
         if is_top:
-            # 'Type:' divider: 8px margins.
-            divider_inserts.append((p, "before", _DIVIDER_MARGIN_TWIPS))
+            # 'Type:' divider: 8px margins top+bottom.
+            divider_inserts.append((p, "before", _DIVIDER_MARGIN_TWIPS, _DIVIDER_MARGIN_TWIPS))
         elif is_bottom:
             # Bottom dividers — split by anchor type:
-            # - 'Functional Area', 'Applies to:' → 8px margins
-            # - '[English]' → 5px margins (per user spec)
+            # - 'Functional Area', 'Applies to:' → 8px both
+            # - '[English]' → 5px top, 8px bottom (per user spec)
             if text_lower.startswith("[english]"):
-                margin = _DIVIDER_MARGIN_ENGLISH_TWIPS
+                before_m = _DIVIDER_MARGIN_ENGLISH_TWIPS
+                after_m = _DIVIDER_MARGIN_TWIPS
             else:
-                margin = _DIVIDER_MARGIN_TWIPS
-            divider_inserts.append((p, "after", margin))
+                before_m = _DIVIDER_MARGIN_TWIPS
+                after_m = _DIVIDER_MARGIN_TWIPS
+            divider_inserts.append((p, "after", before_m, after_m))
 
     # Insert dividers (process 'before' in reverse index order so the
     # indices of subsequent anchors don't shift).
-    for anchor, where, margin in divider_inserts:
+    for anchor, where, before_m, after_m in divider_inserts:
         parent = anchor.getparent()
         if parent is None:
             continue
@@ -1678,7 +1715,11 @@ def _apply_slot1_metadata_styling_post_pass(doc) -> None:
             anchor_index = list(parent).index(anchor)
         except ValueError:
             continue
-        divider_p = _make_divider_paragraph(side="bottom", margin_twips=margin)
+        divider_p = _make_divider_paragraph(
+            side="bottom",
+            before_twips=before_m,
+            after_twips=after_m,
+        )
         if where == "before":
             parent.insert(anchor_index, divider_p)
         else:  # "after"
@@ -1732,6 +1773,219 @@ def _strip_faded_table_borders(doc) -> None:
                 color = (el.get(qn("w:color")) or "").upper()
                 if color in _FADED_BORDER_COLORS:
                     el.set(qn("w:val"), "nil")
+
+
+# Table styles whose inherited borders should be cleared in the
+# published output's styles.xml. The brain template defines borders on
+# these styles (BFBFBF for TableGridLight, 7F7F7F for PlainTable3) that
+# render as visible gray lines via the `<w:tblStyle>` reference on tables
+# in document.xml — the user calls these the "old divider lines".
+_TABLE_STYLES_TO_CLEAR = frozenset(("TableGridLight", "PlainTable3"))
+
+
+def _strip_inherited_table_style_borders(doc) -> None:
+    """Mutate `word/styles.xml` in the published document to clear all
+    borders on `TableGridLight` and `PlainTable3` table styles.
+
+    Why: tables in the published output reference these styles via
+    `<w:tblStyle w:val="TableGridLight"/>` and `<w:tblStyle w:val=
+    "PlainTable3"/>`. Word inherits the styles' `<w:tblBorders>` and
+    `<w:tcBorders>` definitions (BFBFBF / 7F7F7F) and renders them as
+    visible gray lines — the "old divider lines" the user wants
+    removed.
+
+    The `<w:tblStyle>` references in document.xml are preserved (the
+    user does not want them stripped). This function only edits the
+    styles part so the inherited borders no longer render.
+
+    For each target style:
+      - `<w:tblPr><w:tblBorders>` → set every side `val="nil"`
+      - `<w:tblStylePr w:type="..."><w:tcBorders>` → set every side
+        `val="nil"` (firstRow, firstCol, etc.)
+    """
+    styles_root = doc.styles.element
+    for style in styles_root.findall(qn("w:style")):
+        style_id = style.get(qn("w:styleId"))
+        if style_id not in _TABLE_STYLES_TO_CLEAR:
+            continue
+        # 1) Clear <w:tblPr><w:tblBorders> if present.
+        tblPr = style.find(qn("w:tblPr"))
+        if tblPr is not None:
+            tblBorders = tblPr.find(qn("w:tblBorders"))
+            if tblBorders is not None:
+                _nil_all_borders(tblBorders)
+        # 2) Clear <w:tblStylePr w:type="..."><w:tcBorders> for all
+        # conditional-format variants (firstRow, firstCol, lastRow,
+        # lastCol, band1Vert, band1Horz, neCell, nwCell, etc.).
+        for tblStylePr in style.findall(qn("w:tblStylePr")):
+            inner_tcPr = tblStylePr.find(qn("w:tcPr"))
+            if inner_tcPr is None:
+                continue
+            tcBorders = inner_tcPr.find(qn("w:tcBorders"))
+            if tcBorders is not None:
+                _nil_all_borders(tcBorders)
+
+
+def _nil_all_borders(borders_elem) -> None:
+    """Set every border side (`top`, `left`, `bottom`, `right`,
+    `insideH`, `insideV`) inside `<w:tblBorders>` or `<w:tcBorders>`
+    to `val="nil"`. Preserves the parent structure; just flips each
+    side's val attribute. Other attributes (sz, color, space) are left
+    in place — Word ignores them when val=nil but it keeps the file
+    diff minimal for review."""
+    for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        el = borders_elem.find(qn(f"w:{side}"))
+        if el is None:
+            continue
+        el.set(qn("w:val"), "nil")
+
+
+def _suppress_page_header_separator(doc) -> None:
+    """Remove horizontal-line drawings from the page header AND the
+    document body.
+
+    Two sources of unwanted horizontal lines exist in the brain
+    template:
+
+    1. `header2.xml` contains a `<v:line>` ("Straight Connector")
+       at 55.2pt vertical position — renders as a 1px black line
+       between the page header and body content on every page.
+
+    2. `document.xml` contains TWO `<v:line>` connectors ("Straight
+       Connector 3" at 4.85pt and "Straight Connector 4" at 6.5pt)
+       inside `<mc:AlternateContent>` / `<w:pict>` legacy-VML
+       containers. These render as 2 horizontal lines in the body
+       content (visible above `Type:` and above `3. Exclusions`).
+
+    Without removal, the published docx shows 5 dividers (mine) + 2
+    brain lines = 7 total visible lines. The user has asked for the
+    brain lines to be removed so only the 5 dedicated dividers remain.
+
+    This pass:
+      A) Walks every section's header (default, first, even):
+         - Removes every `<v:line>` element
+         - Removes empty `<w:pict>` containers
+         - Strips `<w:pBdr>` from the last paragraph (cleanup)
+      B) Walks the document body:
+         - Removes any `<mc:AlternateContent>` whose `<mc:Fallback>`
+           contains ONLY `<w:pict><v:line>...</v:line></w:pict>`
+           (the modern `<mc:Choice>` rendering uses `<w:drawing>`
+           so removing the legacy fallback is safe)
+         - Removes any standalone `<v:line>` in body paragraphs
+         - Removes empty `<w:pict>` containers
+
+    The brain's paragraphs, tables, text, headings, images, and the
+    header's logo + Document Control text are NOT touched.
+    """
+    # VML namespace URI for <v:line> elements.
+    V_NS = "urn:schemas-microsoft-com:vml"
+    V_LINE = "{" + V_NS + "}line"
+    # Markup-compatibility namespace for <mc:AlternateContent> and
+    # <mc:Fallback>.
+    MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+    MC_ALT = "{" + MC_NS + "}AlternateContent"
+    MC_FALLBACK = "{" + MC_NS + "}Fallback"
+
+    def _remove_vlines_from(root) -> None:
+        """Strip every <v:line> descendant; collapse empty <w:pict>."""
+        for vline in list(root.iter(V_LINE)):
+            parent = vline.getparent()
+            if parent is not None:
+                parent.remove(vline)
+        for pict in list(root.iter(qn("w:pict"))):
+            if len(list(pict)) == 0:
+                pict.getparent().remove(pict)
+
+    # A) Page-header pass.
+    for section in doc.sections:
+        for header_attr in ("header", "first_page_header", "even_page_header"):
+            try:
+                header = getattr(section, header_attr)
+            except Exception:
+                continue
+            if header is None:
+                continue
+            try:
+                if header.is_linked_to_previous:
+                    continue
+            except Exception:
+                pass
+            _remove_vlines_from(header._element)
+            # Remove zero-height <w:drawing> elements — these are
+            # degenerate drawings (cy="0") that render as horizontal
+            # lines on every page where the header appears. The brain
+            # template has one in `header2.xml` (cx=5936689 EMUs,
+            # cy=0) which was the 2nd line the user kept seeing.
+            # Wordprocessing-drawing extent namespace.
+            WPD_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+            CY_ATTR = "{" + WPD_NS + "}cy"
+            for drawing in list(header._element.iter(qn("w:drawing"))):
+                extent = drawing.find(".//" + qn("wp:extent"))
+                if extent is None:
+                    continue
+                # The cy attribute is unnamespaced in the XML on disk;
+                # try both forms for robustness.
+                cy_val = extent.get(CY_ATTR)
+                if cy_val is None:
+                    cy_val = extent.get("cy")
+                if cy_val is not None and cy_val == "0":
+                    parent = drawing.getparent()
+                    if parent is not None:
+                        parent.remove(drawing)
+            # Strip leftover <w:pBdr> from last paragraph (cleanup).
+            paras = header.paragraphs
+            if not paras:
+                continue
+            last_p = paras[-1]._element
+            pPr = last_p.find(qn("w:pPr"))
+            if pPr is not None:
+                for old_pBdr in list(pPr.findall(qn("w:pBdr"))):
+                    pPr.remove(old_pBdr)
+
+    # B) Document-body pass.
+    body = doc.element.body
+    # 1) Remove <mc:AlternateContent> whose <mc:Fallback> contains
+    # ONLY a <w:pict><v:line/></w:pict>. The modern <mc:Choice>
+    # rendering uses <w:drawing> so removing the legacy fallback
+    # container is safe.
+    for mc_alt in list(body.iter(MC_ALT)):
+        fallback = mc_alt.find(MC_FALLBACK)
+        if fallback is None:
+            continue
+        # Find any <v:line> in fallback
+        vlines_in_fallback = list(fallback.iter(V_LINE))
+        if not vlines_in_fallback:
+            continue
+        # Check fallback contains ONLY <w:pict><v:line/></w:pict>
+        # (i.e. the only meaningful content is the line connectors)
+        # If <mc:Choice> exists with real content, keep that and just
+        # remove the fallback subtree.
+        fallback_has_only_vlines = True
+        for child in fallback:
+            if child.tag != qn("w:pict"):
+                fallback_has_only_vlines = False
+                break
+            # Check the pict itself contains only v:line
+            for pict_child in child:
+                if pict_child.tag != V_LINE:
+                    fallback_has_only_vlines = False
+                    break
+            if not fallback_has_only_vlines:
+                break
+        # If fallback is purely <w:pict><v:line/></w:pict>, drop the
+        # entire <mc:AlternateContent> (the line + the legacy
+        # fallback wrapper).
+        if fallback_has_only_vlines:
+            mc_alt.getparent().remove(mc_alt)
+            continue
+        # Otherwise just remove the v:line(s) inside fallback.
+        for vline in vlines_in_fallback:
+            parent = vline.getparent()
+            if parent is not None:
+                parent.remove(vline)
+    # 2) Strip any remaining standalone <v:line> elements anywhere
+    # in the body.
+    _remove_vlines_from(body)
 
 
 def _has_table_ancestor(elem) -> bool:
