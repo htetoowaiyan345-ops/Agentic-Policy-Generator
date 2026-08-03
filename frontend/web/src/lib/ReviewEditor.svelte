@@ -70,6 +70,17 @@
     if (!prev) return;
     redoStack.push(snapshot(lines));
     if (redoStack.length > MAX_HISTORY) redoStack.shift();
+    // Sync the CKEditor 5 HTML so the visible editor reflects the
+    // restored state. Without this, Ctrl+Z would update the `lines`
+    // state but leave the editor's HTML unchanged, making the undo
+    // appear to "do nothing" to the user.
+    if (ckEditorRef) {
+      // Set suppressNextChange BEFORE setHtml because setHtml fires
+      // change:data synchronously, which would otherwise pollute the
+      // history stack with the restored state.
+      suppressNextChange = true;
+      ckEditorRef.setHtml(buildUnifiedInitialHtml(prev));
+    }
     emitChange(prev);
   }
   export function redo(): void {
@@ -77,6 +88,16 @@
     if (!next) return;
     history.push(snapshot(lines));
     if (history.length > MAX_HISTORY) history.shift();
+    // Sync the CKEditor 5 HTML so the visible editor reflects the
+    // restored state. Without this, Ctrl+Y/Ctrl+Shift+Z would update
+    // the `lines` state but leave the editor's HTML unchanged.
+    if (ckEditorRef) {
+      // Set suppressNextChange BEFORE setHtml because setHtml fires
+      // change:data synchronously, which would otherwise pollute the
+      // history stack with the restored state.
+      suppressNextChange = true;
+      ckEditorRef.setHtml(buildUnifiedInitialHtml(next));
+    }
     emitChange(next);
   }
 
@@ -181,7 +202,8 @@
   function buildUnifiedInitialHtml(input: PreviewLine[] | null | undefined): string {
     type Bucket =
       | { kind: 'p'; rich: RichParagraph; slot: SlotKind }
-      | { kind: 't'; slot: SlotKind; rows: { text: string; html: string }[][] };
+      | { kind: 't'; slot: SlotKind; rows: { text: string; html: string }[][] }
+      | { kind: 'divider'; slot: SlotKind };
     const buckets: Bucket[] = [];
     for (const ln of input || []) {
       const norm = normalisePreviewLine(ln);
@@ -195,6 +217,14 @@
         const tbl = payload as { slot: SlotKind; rows: { text: string; html: string }[][] };
         const slot = ((tbl.slot ?? 0) as SlotKind) || 0;
         buckets.push({ kind: 't', slot, rows: tbl.rows || [] });
+      } else if (kind === 'divider') {
+        // User-inserted <hr> via CKEditor toolbar. Carry the slot so
+        // `htmlToLines` can place the divider back in the same slot when
+        // round-tripping through a version switch. Without this, dividers
+        // were silently dropped from the editor on version switch.
+        const divPayload = payload as { slot?: SlotKind } | undefined;
+        const slot = ((divPayload?.slot ?? 0) as SlotKind) || 0;
+        buckets.push({ kind: 'divider', slot });
       }
     }
     if (buckets.length === 0) return '';
@@ -265,6 +295,14 @@
               .join('')}</tbody>`
           : '';
         parts.push(`<p data-slot="${slot}"></p><table data-slot="${slot}">${thead}${tbody}</table>`);
+        prevSlotSawParagraph = true;
+      } else if (b.kind === 'divider') {
+        // User-inserted <hr> via CKEditor toolbar. Emit as <hr data-slot="X">
+        // so `htmlToLines` can place the divider back in the same slot when
+        // round-tripping through a version switch. The `.filter()` in
+        // htmlToLines only drops `<hr data-slot-bar="...">`, not
+        // `<hr data-slot="X">`, so this survives the round-trip.
+        parts.push(`<hr data-slot="${slot}">`);
         prevSlotSawParagraph = true;
       } else {
         const rich = b.rich;

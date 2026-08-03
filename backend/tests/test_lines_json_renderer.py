@@ -336,12 +336,139 @@ def test_normalise_lines_json(renderer_mod):
         ["t", {"slot": 10, "rows": [["a"]]}],
         ["t", [["b"]]],
     ]
-    paragraphs, tables, dividers = renderer_mod._normalise_lines_json(lines_json)
+    paragraphs, tables, dividers, free_zone_items = renderer_mod._normalise_lines_json(lines_json)
     assert 3 in paragraphs
     assert 0 in paragraphs  # the legacy string falls into slot=0
     assert 10 in tables
     assert 0 in tables  # legacy rows fall into slot=0
     assert dividers == []  # no divider entries in this fixture
+    # free_zone_items: legacy paragraph + legacy table, in that order.
+    assert [k for k, _ in free_zone_items] == ['p', 't']
+
+
+def test_free_zone_items_preserves_insertion_order(renderer_mod):
+    """The normaliser preserves the original insertion order of slot=0
+    items (paragraphs, tables, dividers). The renderer uses this to keep
+    toolbar-inserted content in the SAME visual order the user inserted it.
+    """
+    lines_json = [
+        ["p", {"slot": 0, "text": "para A", "html": "<p>para A</p>"}],
+        ["divider", {"slot": 0}],
+        ["t", {"slot": 0, "rows": [["hdr", "col"], ["a", "b"]]}],
+        ["p", {"slot": 0, "text": "para B", "html": "<p>para B</p>"}],
+        ["divider", {"slot": 0}],
+        ["p", {"slot": 5, "text": "slot 5", "html": "<p>slot 5</p>"}],  # not free zone
+    ]
+    paragraphs, tables, dividers, free_zone_items = renderer_mod._normalise_lines_json(lines_json)
+    # Only slot=0 items are in free_zone_items
+    assert [k for k, _ in free_zone_items] == ['p', 'divider', 't', 'p', 'divider']
+    # Named-slot paragraph is in paragraphs[5], not in free_zone_items
+    assert 5 in paragraphs
+    assert 0 in paragraphs
+    # Dividers list has both slot=0 dividers (for backwards compat)
+    assert len(dividers) == 2
+
+
+def test_slot0_table_renders_in_free_paragraph_zone(renderer_mod, brain_path, out_dir):
+    """A toolbar-inserted table (slot=0) renders as a real <w:tbl> in the
+    free paragraph zone, with all cell content preserved. Before this
+    fix, slot=0 tables were silently dropped from the published output.
+    """
+    lines_json = [
+        ["p", {"slot": 0, "text": "before table", "html": "<p>before table</p>"}],
+        ["t", {
+            "slot": 0,
+            "rows": [
+                ["Header1", "Header2"],
+                ["cell1a", "cell1b"],
+                ["cell2a", "cell2b"],
+            ],
+        }],
+        ["p", {"slot": 0, "text": "after table", "html": "<p>after table</p>"}],
+    ]
+    out = out_dir / "slot0_table.docx"
+    renderer_mod.render_lines_json_to_brain(lines_json, brain_path, out)
+    doc = Document(str(out))
+    # All three paragraphs render
+    assert _has_text(doc, "before table"), "before-text missing"
+    assert _has_text(doc, "after table"), "after-text missing"
+    # All five table cells render
+    assert _has_text(doc, "Header1"), "Header1 missing"
+    assert _has_text(doc, "Header2"), "Header2 missing"
+    assert _has_text(doc, "cell1a"), "cell1a missing"
+    assert _has_text(doc, "cell1b"), "cell1b missing"
+    assert _has_text(doc, "cell2a"), "cell2a missing"
+    assert _has_text(doc, "cell2b"), "cell2b missing"
+    # Verify a real <w:tbl> exists in the output
+    body = doc.element.body
+    tables = list(body.findall(".//" + qn("w:tbl")))
+    assert len(tables) >= 1, "no <w:tbl> in output"
+
+    # Verify the table is in the FREE paragraph zone (before slot 1's "Type:" heading)
+    # by checking the document.xml ordering: the table appears before the
+    # "Type:" scaffold paragraph.
+    body_children = list(body)
+    type_idx = None
+    tbl_idx = None
+    for i, ch in enumerate(body_children):
+        if ch.tag.endswith("}p"):
+            txt = "".join((t.text or "") for t in ch.iter(qn("w:t"))).strip()
+            if txt == "Type" or txt.startswith("Type:"):
+                type_idx = i
+        elif ch.tag.endswith("}tbl") and tbl_idx is None and i > 0:
+            # First table = our free-zone table (should be before "Type:")
+            tbl_idx = i
+    if tbl_idx is not None and type_idx is not None:
+        assert tbl_idx < type_idx, (
+            "free-zone table should appear BEFORE slot-1 'Type:' heading"
+        )
+
+
+def test_free_zone_preserves_mixed_order(renderer_mod, brain_path, out_dir):
+    """Paragraphs, tables, and dividers in slot=0 are rendered in the
+    EXACT order they were inserted — not group-sorted by kind.
+    """
+    lines_json = [
+        ["p", {"slot": 0, "text": "first paragraph", "html": "<p>first paragraph</p>"}],
+        ["divider", {"slot": 0}],
+        ["t", {"slot": 0, "rows": [["col1", "col2"], ["a", "b"]]}],
+        ["p", {"slot": 0, "text": "middle paragraph", "html": "<p>middle paragraph</p>"}],
+        ["p", {"slot": 0, "text": "last paragraph", "html": "<p>last paragraph</p>"}],
+    ]
+    out = out_dir / "free_zone_order.docx"
+    renderer_mod.render_lines_json_to_brain(lines_json, brain_path, out)
+    doc = Document(str(out))
+    # Confirm all elements present
+    assert _has_text(doc, "first paragraph"), "first paragraph missing"
+    assert _has_text(doc, "middle paragraph"), "middle paragraph missing"
+    assert _has_text(doc, "last paragraph"), "last paragraph missing"
+    assert _has_text(doc, "col1"), "col1 missing"
+    assert _has_text(doc, "a"), "cell a missing"
+
+    # Verify order: in the body XML, the first paragraph precedes the
+    # table, and the table precedes the middle paragraph.
+    body = doc.element.body
+    body_children = list(body)
+    pos = {}
+    for i, ch in enumerate(body_children):
+        if ch.tag.endswith("}p"):
+            txt = "".join((t.text or "") for t in ch.iter(qn("w:t"))).strip()
+            if txt == "first paragraph":
+                pos["first"] = i
+            elif txt == "middle paragraph":
+                pos["middle"] = i
+            elif txt == "last paragraph":
+                pos["last"] = i
+        elif ch.tag.endswith("}tbl"):
+            if "table" not in pos:
+                pos["table"] = i
+    assert pos["first"] < pos["table"] < pos["middle"], (
+        f"order broken: first={pos.get('first')}, table={pos.get('table')}, "
+        f"middle={pos.get('middle')}"
+    )
+    assert pos["middle"] < pos["last"], (
+        f"middle should precede last: middle={pos.get('middle')}, last={pos.get('last')}"
+    )
 
 
 def test_import_rich_writer_works_under_importlib_load(renderer_mod):

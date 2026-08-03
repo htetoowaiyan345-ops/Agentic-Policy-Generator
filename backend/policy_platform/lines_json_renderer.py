@@ -122,12 +122,18 @@ def _normalise_table_payload(payload: Any) -> dict:
     return {'slot': 0, 'rows': []}
 
 
-def _normalise_lines_json(lines_json: Iterable) -> tuple[list[dict], list[dict]]:
-    """Return (paragraphs_by_slot, tables_by_slot) — both keyed by slot id.
+def _normalise_lines_json(lines_json: Iterable) -> tuple[list[dict], list[dict], list[dict], list[tuple]]:
+    """Return (paragraphs_by_slot, tables_by_slot, dividers, free_zone_items).
 
-    Each dict is `{slot_id: [entries...]}`. Slot 0 entries (free paragraphs)
-    are kept under key `0` and rendered into the free-paragraph zone at the
-    top of the body.
+    - `paragraphs_by_slot` / `tables_by_slot`: dicts keyed by slot id. Slot 0
+      entries (free paragraphs) are kept under key `0` and rendered into the
+      free-paragraph zone at the top of the body.
+    - `dividers`: flat list of `{'slot': N}` for named-slot dividers (used by
+      `_render_dividers_in_slot` for slots 1-14).
+    - `free_zone_items`: ordered list of `(kind, payload)` tuples for ALL
+      slot=0 entries (paragraphs, tables, dividers). The renderer iterates
+      this in order so toolbar-inserted content preserves its original
+      insertion order in the free paragraph zone.
 
     Entries are dicts; for paragraphs `{'slot', 'text', 'html'}`; for tables
     `{'slot', 'rows'}` where `rows` is a list of rows of either dict cells
@@ -136,6 +142,7 @@ def _normalise_lines_json(lines_json: Iterable) -> tuple[list[dict], list[dict]]
     paragraphs: dict[int, list[dict]] = {}
     tables: dict[int, list[dict]] = {}
     dividers: list[dict] = []
+    free_zone_items: list[tuple[str, dict]] = []
     for raw in lines_json or []:
         if not isinstance(raw, (list, tuple)) or len(raw) != 2:
             continue
@@ -144,10 +151,14 @@ def _normalise_lines_json(lines_json: Iterable) -> tuple[list[dict], list[dict]]
             p = _normalise_paragraph_payload(payload)
             slot = p['slot']
             paragraphs.setdefault(slot, []).append(p)
+            if slot == 0:
+                free_zone_items.append(('p', p))
         elif kind == 't':
             t = _normalise_table_payload(payload)
             slot = t['slot']
             tables.setdefault(slot, []).append(t)
+            if slot == 0:
+                free_zone_items.append(('t', t))
         elif kind == 'divider':
             # User-inserted <hr> via CKEditor toolbar. Carry slot for
             # render positioning; renderer inserts a divider paragraph
@@ -157,7 +168,9 @@ def _normalise_lines_json(lines_json: Iterable) -> tuple[list[dict], list[dict]]
             except (TypeError, ValueError):
                 d_slot = 0
             dividers.append({'slot': d_slot})
-    return paragraphs, tables, dividers
+            if d_slot == 0:
+                free_zone_items.append(('divider', {'slot': d_slot}))
+    return paragraphs, tables, dividers, free_zone_items
 
 
 # ---------------------------------------------------------------------------
@@ -1375,15 +1388,22 @@ def _render_dividers_in_slot(doc, slot_id: int, dividers: list[dict]) -> None:
         insert_pos += 1
 
 
-def _render_free_paragraph_zone(doc, free_paragraphs: list[dict]) -> None:
-    """Render slot=0 (free) paragraphs into a free-paragraph zone at the
-    top of the body — AFTER the header but BEFORE slot 1.
+def _render_free_paragraph_zone(doc, free_zone_items: list) -> None:
+    """Render slot=0 items (paragraphs + tables + dividers) into a free
+    paragraph zone at the top of the body — AFTER the header but BEFORE
+    slot 1.
+
+    `free_zone_items` is an ordered list of `(kind, payload)` tuples from
+    `_normalise_lines_json`. The order is preserved so toolbar-inserted
+    content (paragraphs, tables, dividers) lands in the SAME visual order
+    as the user inserted it in the editor.
 
     This is the graceful-degradation path: when the user has paragraphs
     with no slot assigned (or whose slot is unknown), we still emit them
     so the user doesn't lose data. They appear at the top of the body
-    so the rest of the brain scaffold is preserved."""
-    if not free_paragraphs:
+    so the rest of the brain scaffold is preserved.
+    """
+    if not free_zone_items:
         return
     body = doc.element.body
     children = list(body)
@@ -1423,23 +1443,104 @@ def _render_free_paragraph_zone(doc, free_paragraphs: list[dict]) -> None:
             zone_pPr.remove(numPr)
     body.insert(insert_pos, zone_label)
     insert_pos += 1
-    # Insert the free paragraphs.
-    for entry in free_paragraphs:
-        text = entry.get('text') or ''
-        html = entry.get('html') or text or ''
-        if not text.strip() and not html.strip():
-            continue
-        new_p = _make_new_paragraph(template_pPr, html, is_html=True)
-        # Strip <w:numPr> from the user-written paragraph so it doesn't
-        # render as a bullet (the brain's free-paragraph zone templates
-        # inherit <w:numPr> from the scaffold, which would make ALL
-        # user-typed text render as Roman-numeral bullets).
-        new_pPr = new_p.find(qn("w:pPr"))
-        if new_pPr is not None:
-            for numPr in new_pPr.findall(qn("w:numPr")):
-                new_pPr.remove(numPr)
-        body.insert(insert_pos, new_p)
-        insert_pos += 1
+    # Insert the free-zone items in original insertion order.
+    for kind, payload in free_zone_items:
+        if kind == 'p':
+            text = payload.get('text') or ''
+            html = payload.get('html') or text or ''
+            if not text.strip() and not html.strip():
+                continue
+            new_p = _make_new_paragraph(template_pPr, html, is_html=True)
+            # Strip <w:numPr> from the user-written paragraph so it doesn't
+            # render as a bullet (the brain's free-paragraph zone templates
+            # inherit <w:numPr> from the scaffold, which would make ALL
+            # user-typed text render as Roman-numeral bullets).
+            new_pPr = new_p.find(qn("w:pPr"))
+            if new_pPr is not None:
+                for numPr in new_pPr.findall(qn("w:numPr")):
+                    new_pPr.remove(numPr)
+            body.insert(insert_pos, new_p)
+            insert_pos += 1
+        elif kind == 't':
+            # Toolbar-inserted table with slot=0. Render as a standalone
+            # table in the free zone. Uses the same styling as the
+            # extra-table fallback in slot rendering.
+            rows = payload.get('rows') or []
+            if not rows:
+                continue
+            new_tbl = _build_free_zone_table(rows)
+            if new_tbl is not None:
+                body.insert(insert_pos, new_tbl)
+                insert_pos += 1
+        elif kind == 'divider':
+            # User-inserted <hr> divider. Render as an empty paragraph
+            # with a bottom border + 8px margins (matches slot-1
+            # divider style).
+            new_p = _make_divider_paragraph()
+            body.insert(insert_pos, new_p)
+            insert_pos += 1
+
+
+def _build_free_zone_table(rows: list) -> object:
+    """Build a standalone <w:tbl> element for a slot=0 table (free
+    paragraph zone). Mirrors the styling of the extra-table fallback in
+    `_render_slot_direct` (single black border, 100% width, fixed grid).
+    """
+    if not rows:
+        return None
+    actual_cols = max((len(r) for r in rows), default=1)
+    new_tbl = OxmlElement("w:tbl")
+    tblPr = OxmlElement("w:tblPr")
+    tblW = OxmlElement("w:tblW")
+    tblW.set(qn("w:w"), "5000")
+    tblW.set(qn("w:type"), "pct")
+    tblPr.append(tblW)
+    tblBorders = OxmlElement("w:tblBorders")
+    for bn in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        b = OxmlElement(f"w:{bn}")
+        b.set(qn("w:val"), "single")
+        b.set(qn("w:sz"), "4")
+        b.set(qn("w:color"), "auto")
+        tblBorders.append(b)
+    tblPr.append(tblBorders)
+    new_tbl.append(tblPr)
+    new_grid = OxmlElement("w:tblGrid")
+    for _ in range(actual_cols):
+        gc = OxmlElement("w:gridCol")
+        gc.set(qn("w:w"), str(int(9000 / actual_cols)))
+        new_grid.append(gc)
+    new_tbl.append(new_grid)
+    for row in rows:
+        tr = OxmlElement("w:tr")
+        for ci in range(actual_cols):
+            tc = OxmlElement("w:tc")
+            tcPr = OxmlElement("w:tcPr")
+            tcW = OxmlElement("w:tcW")
+            tcW.set(qn("w:w"), str(int(9000 / actual_cols)))
+            tcW.set(qn("w:type"), "dxa")
+            tcPr.append(tcW)
+            tc.append(tcPr)
+            new_p = OxmlElement("w:p")
+            cell = row[ci] if ci < len(row) else None
+            wp = _import_rich_writer()
+            wrote = False
+            if wp is not None:
+                try:
+                    wp(new_p, _cell_to_html(cell) or _cell_to_plain(cell))
+                    wrote = True
+                except Exception:
+                    wrote = False
+            if not wrote or not list(new_p.findall(qn("w:r"))):
+                new_r = OxmlElement("w:r")
+                t = OxmlElement("w:t")
+                t.set(qn("xml:space"), "preserve")
+                t.text = _cell_to_plain(cell)
+                new_r.append(t)
+                new_p.append(new_r)
+            tc.append(new_p)
+            tr.append(tc)
+        new_tbl.append(tr)
+    return new_tbl
 
 
 # ---------------------------------------------------------------------------
@@ -1479,7 +1580,7 @@ def render_lines_json_to_brain(
     doc = Document(str(output_path))
 
     # 2) Normalise the reviewer's saved lines_json into per-slot buckets.
-    paragraphs_by_slot, tables_by_slot, dividers = _normalise_lines_json(lines_json)
+    paragraphs_by_slot, tables_by_slot, dividers, free_zone_items = _normalise_lines_json(lines_json)
 
     # 3) Walk slots in REVERSE order (so insertions don't shift indices
     # of earlier slots — mirrors the legacy renderer's behaviour).
@@ -1492,23 +1593,30 @@ def render_lines_json_to_brain(
             print(f'[lines_json_renderer] slot {sec_id} failed: {e}', flush=True)
             raise
 
-    # 4) Slot 0 (free paragraphs) → free-paragraph zone at top of body.
-    free_paragraphs = paragraphs_by_slot.get(0, [])
+    # 4) Slot 0 (free paragraphs + tables + dividers) → free-paragraph zone
+    # at top of body. The free_zone_items list preserves the original
+    # insertion order so toolbar-inserted content (paragraphs, tables,
+    # dividers) lands in the correct visual order.
     try:
-        _render_free_paragraph_zone(doc, free_paragraphs)
+        _render_free_paragraph_zone(doc, free_zone_items)
     except Exception as e:
         print(f'[lines_json_renderer] free-paragraph zone failed: {e}', flush=True)
         # Non-fatal — the rest of the body is still valid.
 
-    # 4.5) User-inserted <hr> dividers (from CKEditor toolbar). Each
-    # divider is rendered as an empty paragraph with a bottom border
-    # line + 8px margins, matching the existing slot-1 divider style.
-    # Group by slot so dividers land in the correct section body.
+    # 4.5) User-inserted <hr> dividers (from CKEditor toolbar) for NAMED
+    # slots (1-14). Each divider is rendered as an empty paragraph with a
+    # bottom border line + 8px margins, matching the existing slot-1
+    # divider style. Group by slot so dividers land in the correct
+    # section body. Slot=0 dividers are already handled by
+    # `_render_free_paragraph_zone` via `free_zone_items`.
     try:
         from collections import defaultdict
         dividers_by_slot: dict[int, list[dict]] = defaultdict(list)
         for d in dividers:
-            dividers_by_slot[d.get('slot', 0)].append(d)
+            d_slot = d.get('slot', 0)
+            if d_slot == 0:
+                continue  # handled by free_zone_items above
+            dividers_by_slot[d_slot].append(d)
         for d_slot, d_list in dividers_by_slot.items():
             _render_dividers_in_slot(doc, d_slot, d_list)
     except Exception as e:
@@ -1580,12 +1688,24 @@ def _strip_empty_body_paragraphs(doc) -> None:
     Also deletes paragraphs whose runs contain ONLY `<w:br/>` (soft
     line breaks) and no `<w:t>` text — these render as blank lines
     in Word and add unwanted vertical space between content paragraphs.
+
+    Preserves paragraphs with `<w:pBdr>` (paragraph borders) — these
+    are intentional divider paragraphs (slot-1 metadata dividers, free
+    zone dividers from user toolbar inserts) and must NOT be stripped.
     """
     body = doc.element.body
     for p in list(body.findall(qn("w:p"))):
         # Skip if inside a table cell.
         parent = p.getparent()
         if parent is not None and parent.tag.split("}")[-1] == "tc":
+            continue
+        # Preserve divider paragraphs (those with paragraph borders). These
+        # are intentional visual dividers inserted by `_make_divider_paragraph`
+        # (slot-1 metadata dividers in `_apply_slot1_metadata_styling_post_pass`
+        # and toolbar-inserted dividers in `_render_free_paragraph_zone`).
+        # Removing them would silently drop user toolbar inserts.
+        pPr = p.find(qn("w:pPr"))
+        if pPr is not None and pPr.find(qn("w:pBdr")) is not None:
             continue
         text = "".join(t.text or "" for t in p.iter(qn("w:t")))
         if text.strip():
