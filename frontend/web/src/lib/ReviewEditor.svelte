@@ -374,6 +374,15 @@
       if (tag === 'thead' || tag === 'tbody' || tag === 'tr' || tag === 'th' || tag === 'td') {
         continue;
       }
+      // User-inserted <hr> via CKEditor toolbar → preserve as a divider
+      // marker. The renderer detects 'divider' kind entries and inserts
+      // a divider paragraph with the appropriate margins. Decorative
+      // `<hr data-slot-bar="...">` elements (used by the pipeline's
+      // auto-bar injection) are filtered out in the .filter() above.
+      if (tag === 'hr') {
+        out.push(['divider', { slot }]);
+        continue;
+      }
       flushTable();
       const text = (el.textContent || '').replace(/\s+$/g, '');
       const cleanText = text.replace(/<br\s*\/?>/gi, '').trim();

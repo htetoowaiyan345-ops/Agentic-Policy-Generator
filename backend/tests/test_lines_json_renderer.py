@@ -336,11 +336,12 @@ def test_normalise_lines_json(renderer_mod):
         ["t", {"slot": 10, "rows": [["a"]]}],
         ["t", [["b"]]],
     ]
-    paragraphs, tables = renderer_mod._normalise_lines_json(lines_json)
+    paragraphs, tables, dividers = renderer_mod._normalise_lines_json(lines_json)
     assert 3 in paragraphs
     assert 0 in paragraphs  # the legacy string falls into slot=0
     assert 10 in tables
     assert 0 in tables  # legacy rows fall into slot=0
+    assert dividers == []  # no divider entries in this fixture
 
 
 def test_import_rich_writer_works_under_importlib_load(renderer_mod):

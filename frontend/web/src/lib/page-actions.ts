@@ -79,16 +79,37 @@ const SLOT_LABEL_MAP: Record<string, number> = {
 };
 
 function tableSlot(rows: string[][] | undefined): number | null {
+  // Check ALL cells (not just the first) for HISTORY or AWARD signals.
+  // Mirrors backend's `infer_anchor_slots._classify_slot_from_table` so
+  // a HISTORY table with an empty first cell ("dd") still matches.
   if (!rows || !rows.length) return null;
-  const firstRow = rows[0] || [];
-  const firstCell = (firstRow[0] || '').toLowerCase();
-  if (firstCell.includes('version') || firstCell.includes('history')) return 14;
-  if (firstCell.includes('award') || firstCell.includes('tier')) return 10;
+  const flat: string[] = [];
+  for (const row of rows) {
+    for (const cell of row) {
+      if (cell != null) flat.push(String(cell).toLowerCase());
+    }
+  }
+  const joined = flat.join(' ');
+  if (joined.includes('history') || joined.includes('version') ||
+      joined.includes('description') || joined.includes('date') ||
+      joined.includes('author') || joined.includes('reviewer')) return 14;
+  if (joined.includes('award') || joined.includes('tier') ||
+      joined.includes('payout') || joined.includes('criteria') ||
+      joined.includes('recognition') || joined.includes('indicative')) return 10;
   return null;
 }
 
 function slotForLine(text: string): number | null {
   if (!text) return null;
+  // Section headings use startsWith so user-typed variants like
+  // "HISTORY Htet Oo", "HISTOR JJ", "INTRODUCTION body" all match.
+  // Mirrors backend's `infer_anchor_slots._classify_slot_from_text`.
+  const upper = text.toUpperCase().trim();
+  if (upper.startsWith('HISTORY')) return 14;
+  if (upper.startsWith('INTRODUCTION')) return 5;
+  if (upper.startsWith('POLICY STATEMENT')) return 6;
+  if (upper.startsWith('DEFINITIONS')) return 12;
+  if (upper.startsWith('RELATED POLICIES')) return 13;
   for (const [label, sid] of Object.entries(SLOT_LABEL_MAP)) {
     if (text === label) return sid;
     if (text.startsWith(label + ' ')) return sid;

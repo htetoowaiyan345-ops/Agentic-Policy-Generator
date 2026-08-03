@@ -135,6 +135,7 @@ def _normalise_lines_json(lines_json: Iterable) -> tuple[list[dict], list[dict]]
     """
     paragraphs: dict[int, list[dict]] = {}
     tables: dict[int, list[dict]] = {}
+    dividers: list[dict] = []
     for raw in lines_json or []:
         if not isinstance(raw, (list, tuple)) or len(raw) != 2:
             continue
@@ -147,7 +148,16 @@ def _normalise_lines_json(lines_json: Iterable) -> tuple[list[dict], list[dict]]
             t = _normalise_table_payload(payload)
             slot = t['slot']
             tables.setdefault(slot, []).append(t)
-    return paragraphs, tables
+        elif kind == 'divider':
+            # User-inserted <hr> via CKEditor toolbar. Carry slot for
+            # render positioning; renderer inserts a divider paragraph
+            # at the appropriate place.
+            try:
+                d_slot = int(payload.get('slot', 0) if isinstance(payload, dict) else 0)
+            except (TypeError, ValueError):
+                d_slot = 0
+            dividers.append({'slot': d_slot})
+    return paragraphs, tables, dividers
 
 
 # ---------------------------------------------------------------------------
@@ -888,8 +898,9 @@ def _render_slot_direct(doc, sec_id: int,
     # Only the heading + scaffold body paragraphs in this slot are
     # touched — other slots retain their original bullet numbering.
     if sec_id == 14:
-        slot_paras = [heading_elem] + list(para_items)
-        for p in slot_paras:
+        # Strip <w:numPr> from scaffold body paragraphs so user-edited
+        # data renders as plain text (no bullets).
+        for p in para_items:
             if p is None:
                 continue
             pPr = p.find(qn("w:pPr"))
@@ -897,6 +908,31 @@ def _render_slot_direct(doc, sec_id: int,
                 continue
             for numPr in pPr.findall(qn("w:numPr")):
                 pPr.remove(numPr)
+        # Add Roman numeral (numId=6) back to the HISTORY HEADING only.
+        # Other titles (INTRODUCTION, DEFINITIONS, etc.) use Roman numerals
+        # so HISTORY must match. The body paragraphs remain stripped so
+        # the user's edited data doesn't render as bullets.
+        if heading_elem is not None:
+            pPr = heading_elem.find(qn("w:pPr"))
+            if pPr is None:
+                pPr = OxmlElement("w:pPr")
+                heading_elem.insert(0, pPr)
+            # Remove any existing numPr first to avoid duplicates.
+            for existing in pPr.findall(qn("w:numPr")):
+                pPr.remove(existing)
+            numPr = OxmlElement("w:numPr")
+            ilvl = OxmlElement("w:ilvl")
+            ilvl.set(qn("w:val"), "0")
+            numId = OxmlElement("w:numId")
+            numId.set(qn("w:val"), "6")  # Roman numeral list
+            numPr.append(ilvl)
+            numPr.append(numId)
+            # numPr must come before spacing per OOXML schema.
+            spacing = pPr.find(qn("w:spacing"))
+            if spacing is not None:
+                spacing.addprevious(numPr)
+            else:
+                pPr.append(numPr)
 
     # Filter empty/whitespace paragraphs from user input.
     non_empty = [p for p in paragraphs
@@ -1276,6 +1312,69 @@ def _render_slot_direct(doc, sec_id: int,
     # paragraphs by their text prefix.
 
 
+def _render_dividers_in_slot(doc, slot_id: int, dividers: list[dict]) -> None:
+    """Insert divider paragraphs for `<hr>` elements the reviewer added
+    via CKEditor toolbar. Each divider is an empty paragraph with a
+    bottom border + 8px top/bottom margins (matching slot-1 style).
+
+    For slot 0, dividers go into the free-paragraph zone at the top of
+    the body. For other slots, dividers are appended at the end of that
+    slot's body (after the user's paragraphs and tables).
+    """
+    if not dividers:
+        return
+
+    def _make_divider() -> object:
+        new_p = OxmlElement("w:p")
+        pPr = OxmlElement("w:pPr")
+        new_p.append(pPr)
+        spacing = OxmlElement("w:spacing")
+        spacing.set(qn("w:before"), "160")
+        spacing.set(qn("w:after"), "160")
+        pPr.append(spacing)
+        pBdr = OxmlElement("w:pBdr")
+        border = OxmlElement("w:bottom")
+        border.set(qn("w:val"), "single")
+        border.set(qn("w:sz"), "4")
+        border.set(qn("w:space"), "1")
+        border.set(qn("w:color"), "000000")
+        pBdr.append(border)
+        pPr.append(pBdr)
+        return new_p
+
+    if slot_id == 0:
+        # Free-paragraph zone: insert dividers at the top of body.
+        body = doc.element.body
+        insert_pos = 0
+        for child in body:
+            if child.tag == qn("w:p"):
+                insert_pos = list(body).index(child)
+                break
+        for d in dividers:
+            body.insert(insert_pos, _make_divider())
+            insert_pos += 1
+        return
+
+    # For named slots: append dividers after the slot's body content.
+    body = doc.element.body
+    children = list(body)
+    info = BRAIN_SLOT_RANGES.get(slot_id)
+    if not info or not info.get("body_items"):
+        return
+    last_idx = -1
+    body_items = info["body_items"]
+    for i in reversed(body_items):
+        if i < len(children):
+            last_idx = i
+            break
+    if last_idx < 0:
+        return
+    insert_pos = last_idx + 1
+    for d in dividers:
+        body.insert(insert_pos, _make_divider())
+        insert_pos += 1
+
+
 def _render_free_paragraph_zone(doc, free_paragraphs: list[dict]) -> None:
     """Render slot=0 (free) paragraphs into a free-paragraph zone at the
     top of the body — AFTER the header but BEFORE slot 1.
@@ -1317,6 +1416,11 @@ def _render_free_paragraph_zone(doc, free_paragraphs: list[dict]) -> None:
     label_t.text = "Free Paragraphs"
     label_r.append(label_t)
     zone_label.append(label_r)
+    # Strip <w:numPr> from the zone label so it doesn't render as a bullet.
+    zone_pPr = zone_label.find(qn("w:pPr"))
+    if zone_pPr is not None:
+        for numPr in zone_pPr.findall(qn("w:numPr")):
+            zone_pPr.remove(numPr)
     body.insert(insert_pos, zone_label)
     insert_pos += 1
     # Insert the free paragraphs.
@@ -1326,6 +1430,14 @@ def _render_free_paragraph_zone(doc, free_paragraphs: list[dict]) -> None:
         if not text.strip() and not html.strip():
             continue
         new_p = _make_new_paragraph(template_pPr, html, is_html=True)
+        # Strip <w:numPr> from the user-written paragraph so it doesn't
+        # render as a bullet (the brain's free-paragraph zone templates
+        # inherit <w:numPr> from the scaffold, which would make ALL
+        # user-typed text render as Roman-numeral bullets).
+        new_pPr = new_p.find(qn("w:pPr"))
+        if new_pPr is not None:
+            for numPr in new_pPr.findall(qn("w:numPr")):
+                new_pPr.remove(numPr)
         body.insert(insert_pos, new_p)
         insert_pos += 1
 
@@ -1367,7 +1479,7 @@ def render_lines_json_to_brain(
     doc = Document(str(output_path))
 
     # 2) Normalise the reviewer's saved lines_json into per-slot buckets.
-    paragraphs_by_slot, tables_by_slot = _normalise_lines_json(lines_json)
+    paragraphs_by_slot, tables_by_slot, dividers = _normalise_lines_json(lines_json)
 
     # 3) Walk slots in REVERSE order (so insertions don't shift indices
     # of earlier slots — mirrors the legacy renderer's behaviour).
@@ -1387,6 +1499,20 @@ def render_lines_json_to_brain(
     except Exception as e:
         print(f'[lines_json_renderer] free-paragraph zone failed: {e}', flush=True)
         # Non-fatal — the rest of the body is still valid.
+
+    # 4.5) User-inserted <hr> dividers (from CKEditor toolbar). Each
+    # divider is rendered as an empty paragraph with a bottom border
+    # line + 8px margins, matching the existing slot-1 divider style.
+    # Group by slot so dividers land in the correct section body.
+    try:
+        from collections import defaultdict
+        dividers_by_slot: dict[int, list[dict]] = defaultdict(list)
+        for d in dividers:
+            dividers_by_slot[d.get('slot', 0)].append(d)
+        for d_slot, d_list in dividers_by_slot.items():
+            _render_dividers_in_slot(doc, d_slot, d_list)
+    except Exception as e:
+        print(f'[lines_json_renderer] dividers insertion failed (non-fatal): {e}', flush=True)
 
     # 5) Optional header text override (mirrors the legacy renderer's
     # `_replace_header_text`). This only writes the bracket text inside
