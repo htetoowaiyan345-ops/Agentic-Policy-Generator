@@ -252,7 +252,7 @@ def test_empty_text_inherits_last_slot(extractor_mod):
     """Empty paragraphs inherit the preceding slot so they land in the
     right scaffold body region (not the free paragraph zone)."""
     lines_json = [
-        ["p", {"slot": 0, "text": "1. Purpose"}],
+["p", {"slot": 0, "text": "1. Purpose"}],
         ["p", {"slot": 0, "text": "To establish a fair framework."}],
         ["p", {"slot": 0, "text": ""}],
         ["p", {"slot": 0, "text": "2. Scope & Beneficiaries"}],
@@ -260,3 +260,87 @@ def test_empty_text_inherits_last_slot(extractor_mod):
     out = extractor_mod["infer_anchor_slots"](lines_json)
     slots = [p[1].get("slot") for p in out]
     assert slots == [7, 7, 7, 8], f"empty para should inherit slot 7, got {slots}"
+
+
+def test_heading_with_value_inferred_to_correct_slot(extractor_mod):
+    """When the reviewer types the section heading AND value on one line
+    (e.g. 'HISTORY Htet Oo Wai Yan'), the heading label is the first word
+    and must still match the section prefix. Otherwise the paragraph
+    falls into slot=0 (free paragraph zone) and the published .docx
+    renders it at the TOP of the body instead of inside the HISTORY
+    section — and the brain's scaffold bullets + scaffold table bleed
+    through unchanged."""
+    lines_json = [
+        ["p", {"slot": 0, "text": "HISTORY Htet Oo Wai Yan"}],
+    ]
+    out = extractor_mod["infer_anchor_slots"](lines_json)
+    assert out[0][1]["slot"] == 14, (
+        f"HISTORY prefix should infer slot 14, got {out[0][1].get('slot')}"
+    )
+
+
+def test_introduction_with_value_inferred(extractor_mod):
+    """Same pattern for INTRODUCTION / DEFINITIONS / etc."""
+    lines_json = [
+        ["p", {"slot": 0, "text": "INTRODUCTION framework text"}],
+    ]
+    out = extractor_mod["infer_anchor_slots"](lines_json)
+    assert out[0][1]["slot"] == 5
+
+
+def test_heading_prefix_requires_space(extractor_mod):
+    """The prefix matcher requires a trailing space so 'HISTORICAL' (or
+    similar) is NOT mis-routed to slot 14."""
+    lines_json = [
+        ["p", {"slot": 0, "text": "HISTORICAL OVERVIEW"}],
+    ]
+    out = extractor_mod["infer_anchor_slots"](lines_json)
+    assert out[0][1]["slot"] == 0, (
+        f"HISTORICAL should NOT match HISTORY prefix, "
+        f"got {out[0][1].get('slot')}"
+    )
+
+
+def test_history_table_inferred_to_slot_14(extractor_mod):
+    """A table with HISTORY signals (DATE / VERSION / DESCRIPTION OF
+    CHANGE / AUTHOR columns) and slot=0 should be re-inferred to slot 14
+    via content-signal classification."""
+    lines_json = [
+        ["t", {"slot": 0, "rows": [
+            ["DATE", "VERSION", "DESCRIPTION OF CHANGE", "AUTHOR / REVIEWER"],
+            ["05 July 2026", "1.0", "Initial Release", "Htet Oo Wai Yan"],
+        ]}],
+    ]
+    out = extractor_mod["infer_anchor_slots"](lines_json)
+    assert out[0][1]["slot"] == 14, (
+        f"HISTORY content table should infer slot 14, "
+        f"got {out[0][1].get('slot')}"
+    )
+
+
+def test_award_table_inferred_to_slot_10(extractor_mod):
+    """A table with Award Tier signals (TIER / PAYOUT / CRITERIA / etc.)
+    and slot=0 should be re-inferred to slot 10."""
+    lines_json = [
+        ["t", {"slot": 0, "rows": [
+            ["AWARD LEVEL", "TIER", "PAYOUT", "CRITERIA"],
+            ["Tier 1", "1", "USD 100", "Immediate recognition"],
+        ]}],
+    ]
+    out = extractor_mod["infer_anchor_slots"](lines_json)
+    assert out[0][1]["slot"] == 10, (
+        f"Award tier table should infer slot 10, "
+        f"got {out[0][1].get('slot')}"
+    )
+
+
+def test_free_paragraph_stays_slot_0(extractor_mod):
+    """Random free text with no slot signals stays at slot 0 (free zone)."""
+    lines_json = [
+        ["p", {"slot": 0, "text": "Random note about anything"}],
+    ]
+    out = extractor_mod["infer_anchor_slots"](lines_json)
+    assert out[0][1]["slot"] == 0, (
+        f"Random text should NOT be inferred to a slot, "
+        f"got {out[0][1].get('slot')}"
+    )

@@ -753,6 +753,62 @@ def test_page_header_separator_suppressed(renderer_mod, brain_path, out_dir):
             )
 
 
+def test_slot14_history_no_bullet_numbering(renderer_mod, brain_path, out_dir):
+    """The brain template's HISTORY heading (slot 14) is a
+    `ListParagraph` with `<w:numId val="6"/>` (Roman numerals) and
+    inherits bullet formatting. When the user provides edited/added
+    data for slot 14, this numbering causes the heading to render as a
+    bullet — the user reported this as 'only bullet point' output.
+
+    Slot 10 (Award Structure & Payout Tiers) uses a plain heading
+    paragraph with NO `<w:numPr>` and renders cleanly. To match slot
+    10's behaviour, the renderer strips `<w:numPr>` from ALL slot-14
+    scaffold paragraphs.
+
+    This test verifies that no `<w:numPr>` survives anywhere in the
+    published docx for slot-14 paragraphs, and that the HISTORY
+    heading still renders as a heading (not stripped).
+    """
+    lines_json = [
+        ["p", {"slot": 1, "text": "Type: HR Policy", "html": "<p>Type: HR Policy</p>"}],
+        ["p", {"slot": 14, "text": "HISTORY", "html": "<p>HISTORY</p>"}],
+        ["t", {"slot": 14, "rows": [
+            ["DATE", "VERSION", "DESCRIPTION"],
+            ["05 July 2026", "1.0", "Initial Release"],
+        ]}],
+    ]
+    out = out_dir / "slot14_no_bullets.docx"
+    renderer_mod.render_lines_json_to_brain(lines_json, brain_path, out)
+    import zipfile, re
+    with zipfile.ZipFile(str(out)) as zf:
+        doc_xml = zf.read("word/document.xml").decode("utf-8")
+    # Find the HISTORY heading paragraph in document.xml
+    # HISTORY text is the rendered heading.
+    history_pattern = re.search(
+        r"<w:p\b[^>]*>(?:(?!</w:p>).)*?HISTORY(?:(?!</w:p>).)*?</w:p>",
+        doc_xml,
+        re.DOTALL,
+    )
+    assert history_pattern, "HISTORY paragraph not found in output"
+    history_block = history_pattern.group()
+    # The HISTORY paragraph must NOT contain <w:numPr>.
+    assert "<w:numPr>" not in history_block, (
+        "HISTORY paragraph still contains <w:numPr> after slot-14 "
+        "fix; this causes the heading to render as a bullet. "
+        "Block: " + history_block[:500]
+    )
+    # Also verify no <w:numPr> in any slot-14 area paragraph.
+    # Search for any paragraph in document.xml that comes after HISTORY.
+    history_pos = doc_xml.find("HISTORY")
+    after_history = doc_xml[history_pos:]
+    # Take first 2000 chars after HISTORY for adjacent paragraphs.
+    nearby = after_history[:2000]
+    assert "<w:numPr>" not in nearby, (
+        "Slot-14 area paragraphs still contain <w:numPr> after "
+        "slot-14 fix; user data will render as bullets."
+    )
+
+
 def test_inherited_table_style_borders_preserved(renderer_mod, brain_path, out_dir):
     """The brain's table styles `TableGridLight` and `PlainTable3`
     define borders (BFBFBF / 7F7F7F) in `word/styles.xml`. These are

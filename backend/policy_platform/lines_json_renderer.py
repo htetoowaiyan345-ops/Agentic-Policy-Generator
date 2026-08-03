@@ -877,6 +877,27 @@ def _render_slot_direct(doc, sec_id: int,
     if heading_elem is None:
         return
 
+    # Slot 14 (HISTORY): strip `<w:numPr>` from the slot-14 heading and
+    # body paragraphs so the HISTORY heading and any scaffold body
+    # paragraphs render as plain text (not as Roman-numeral bullets).
+    # Mirrors the plain-paragraph style used by slot 10 (Award
+    # Structure & Payout Tiers), which has no `<w:numPr>` and renders
+    # cleanly. Without this, the user's edited HISTORY data renders
+    # with inherited bullet numbering because the brain template's
+    # HISTORY heading is a `ListParagraph` with `<w:numId val="6"/>`.
+    # Only the heading + scaffold body paragraphs in this slot are
+    # touched — other slots retain their original bullet numbering.
+    if sec_id == 14:
+        slot_paras = [heading_elem] + list(para_items)
+        for p in slot_paras:
+            if p is None:
+                continue
+            pPr = p.find(qn("w:pPr"))
+            if pPr is None:
+                continue
+            for numPr in pPr.findall(qn("w:numPr")):
+                pPr.remove(numPr)
+
     # Filter empty/whitespace paragraphs from user input.
     non_empty = [p for p in paragraphs
                  if (p.get('text') or '').strip() or (p.get('html') or '').strip()]

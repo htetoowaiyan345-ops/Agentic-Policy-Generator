@@ -64,9 +64,26 @@ def _classify_slot_from_text(text: str) -> int:
         return 0
     t = text.strip()
     upper = t.upper()
-    # Section headings (exact or near-exact match).
+    # Section headings (exact match OR prefix match — the editor may save
+    # "HISTORY Htet Oo Wai Yan" where the heading label is followed by
+    # a value on the same line, so we also accept prefix matches).
     if upper in {'INTRODUCTION', 'POLICY STATEMENT', 'DEFINITIONS', 'HISTORY'}:
         return {'INTRODUCTION': 5, 'POLICY STATEMENT': 6, 'DEFINITIONS': 12, 'HISTORY': 14}[upper]
+    # Prefix matches: handle "HISTORY Htet Oo Wai Yan",
+    # "INTRODUCTION body text", etc. The heading label is the FIRST word
+    # of the paragraph; anything after a space is the section value.
+    # We require the heading word to be followed by a space so we don't
+    # match e.g. "HISTORYOFLIFE" as slot 14.
+    heading_prefixes = (
+        ('INTRODUCTION ', 5),
+        ('POLICY STATEMENT ', 6),
+        ('DEFINITIONS ', 12),
+        ('HISTORY ', 14),
+        ('RELATED POLICIES', 13),  # already has startswith below; keep for clarity
+    )
+    for prefix, slot in heading_prefixes:
+        if upper.startswith(prefix):
+            return slot
     if upper.startswith('RELATED POLICIES'):
         return 13
     if upper.startswith('1. PURPOSE') or upper == 'PURPOSE':
@@ -99,6 +116,53 @@ def _set_slot(payload: dict, slot: int) -> dict:
     out = dict(payload)
     out['slot'] = slot
     return out
+
+
+# Signal keywords for content-based table slot inference. Used as a
+# fallback when a `['t', ...]` table is saved with `slot=0`. The signals
+# mirror the brain framework's structural table slots.
+_TABLE_SLOT_SIGNALS: dict[int, tuple[str, ...]] = {
+    # Slot 14 (HISTORY): DATE / VERSION / DESCRIPTION / AUTHOR columns
+    # are the canonical brain-template schema for the change log.
+    14: (
+        'date', 'version', 'description of change', 'description',
+        'author', 'reviewer', 'change', 'revision',
+    ),
+    # Slot 10 (Award Structure): tiered payout tables.
+    10: (
+        'award level', 'tier', 'payout', 'criteria', 'recognition',
+        'indicative', 'amount', 'cash', 'mmk', 'usd',
+    ),
+}
+
+
+def _classify_slot_from_table(rows: List[List[Any]]) -> int:
+    """Infer the slot id for a `['t', ...]` table from its content
+    signals. Returns 0 when no slot can be confidently identified.
+
+    Mirrors `table_routing._classify_table_by_content` (kept in sync by
+    hand — see backend/policy_platform/rag/table_routing.py).
+    """
+    if not rows:
+        return 0
+    # Flatten all cell text to a single lowercase string.
+    parts: list[str] = []
+    for row in rows:
+        for cell in row:
+            if cell is None:
+                continue
+            text = cell if isinstance(cell, str) else str(cell)
+            if text:
+                parts.append(text.lower())
+    flat = ' '.join(parts)
+    best_slot = 0
+    best_hits = 0
+    for slot, signals in _TABLE_SLOT_SIGNALS.items():
+        hits = sum(1 for kw in signals if kw in flat)
+        if hits > best_hits:
+            best_hits = hits
+            best_slot = slot
+    return best_slot if best_hits >= 2 else 0
 
 
 def infer_anchor_slots(lines_json: Iterable) -> list:
@@ -152,6 +216,15 @@ def infer_anchor_slots(lines_json: Iterable) -> list:
             current_slot = int(p.get('slot', 0) or 0)
             if current_slot != 0:
                 out.append(['t', p])
+                continue
+            # Try content-signal inference for tables saved with slot=0
+            # (e.g. a HISTORY change-log table that wasn't tagged with the
+            # correct slot). This catches tables the reviewer added to the
+            # editor but whose `data-slot` was dropped on save.
+            inferred = _classify_slot_from_table(p.get('rows', []) or [])
+            if inferred != 0:
+                last_slot = inferred
+                out.append(['t', _set_slot(p, inferred)])
                 continue
             if last_slot != 0:
                 out.append(['t', _set_slot(p, last_slot)])
