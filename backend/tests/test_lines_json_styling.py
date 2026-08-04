@@ -216,9 +216,10 @@ def test_explicit_font_size_still_works(renderer_mod, brain_path, out_dir):
             sz = rPr.find(qn("w:sz"))
             if sz is not None:
                 sizes.append(sz.get(qn("w:val")))
-# Per user directive: ALL text uniform Times New Roman 10pt
-    # (size_hp=20). Even inline font-size overrides are normalised to 10pt.
-    assert "20" in sizes, f"expected sz=20 (10pt uniform), got {sizes}"
+# Stage 6 update: the toolbar's font-size control must work. A user
+    # applied font-size in <span style="font-size: ..."> overrides the
+    # publication default of 10pt. 24px -> 18pt -> 36 half-points.
+    assert "36" in sizes, f"expected sz=36 (18pt from 24px), got {sizes}"
 
 
 def test_explicit_bold_still_works(renderer_mod, brain_path, out_dir):

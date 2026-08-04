@@ -281,7 +281,10 @@ def _strip_html_to_plain(text: str) -> str:
 def normalise_lines_json(lines_json: Iterable) -> list:
     """Accept either legacy `['p', str]` / `['t', list[list[str]]]`
     payloads or rich `['p', dict]` / `['t', dict]` payloads and always
-    return the rich shape. Strings are passed through with slot=0."""
+    return the rich shape. Strings are passed through with slot=0.
+    Divider entries (`['divider', {'slot': N}]`) inserted via the
+    CKEditor toolbar are also passed through so they survive into the
+    rich renderer (which places them at the appropriate slot)."""
     out: list = []
     for raw in lines_json or []:
         if not isinstance(raw, list) or len(raw) != 2:
@@ -299,6 +302,13 @@ def normalise_lines_json(lines_json: Iterable) -> list:
                 rows = [[str(c) if c is not None else '' for c in (row or [])]
                         for row in payload]
                 out.append(['t', {'slot': 0, 'rows': rows}])
+        elif kind == 'divider':
+            if isinstance(payload, dict):
+                out.append(['divider', payload])
+            elif isinstance(payload, (int, float)):
+                out.append(['divider', {'slot': int(payload)}])
+            else:
+                out.append(['divider', {'slot': 0}])
     return out
 
 

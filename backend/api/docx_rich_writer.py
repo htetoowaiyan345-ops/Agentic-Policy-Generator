@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 import copy
 from html.parser import HTMLParser
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -55,9 +55,10 @@ def _as_bool(v: Optional[str]) -> bool:
 
 
 def _as_color(v: Optional[str]) -> Optional[str]:
-    """Extract a hex colour from a CSS color property like '#abc' or 'rgb(...)'.
-    Returns a 6-digit uppercase hex (no leading #) suitable for `w:color w:val`.
-    Falls back to None for anything we can't parse."""
+    """Extract a hex colour from a CSS color property like '#abc', 'rgb(...)',
+    'rgba(...)', 'hsl(...)' or 'hsla(...)'. Returns a 6-digit uppercase hex
+    (no leading #) suitable for `w:color w:val`. Falls back to None for
+    anything we can't parse (named colours, oklab, etc.)."""
     if not v:
         return None
     v = v.strip()
@@ -67,10 +68,49 @@ def _as_color(v: Optional[str]) -> Optional[str]:
             h = ''.join(c * 2 for c in h)
         if len(h) == 6:
             return h.upper()
-    m = re.match(r'rgb\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)', v)
+    # rgb() / rgba() — commas. CKEditor 5 normally emits hsl() but rgb()
+    # is still seen from older saves / direct htmlToLines inputs.
+    m = re.match(
+        r'rgba?\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*[\d.]+\s*)?\)',
+        v,
+    )
     if m:
         r, g, b = int(m.group(1)), int(m.group(2)), int(m.group(3))
         return f"{r:02X}{g:02X}{b:02X}"
+    # hsl() / hsla() — CKEditor 5's colour picker default output. Without
+    # this branch, every toolbar-picked colour returns None and the
+    # downstream `if color:` guard in _build_run drops the <w:color> run
+    # property — the text is published with NO colour. Convert HSL → sRGB
+    # via the standard algorithm and return a 6-digit hex suitable for
+    # `w:color w:val`. Alpha (in hsla()) is intentionally discarded — Word
+    # has no per-run alpha and the rest of the toolbar ignores it too.
+    m = re.match(
+        r'hsla?\s*\(\s*([\d.]+)\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%\s*(?:,\s*[\d.]+\s*)?\)',
+        v,
+    )
+    if m:
+        h = float(m.group(1)) % 360.0
+        s = float(m.group(2)) / 100.0
+        l = float(m.group(3)) / 100.0
+        c = (1 - abs(2 * l - 1)) * s
+        x_ = c * (1 - abs(((h / 60.0) % 2) - 1))
+        m_ = l - c / 2
+        if h < 60:
+            r_, g_, b_ = c, x_, 0
+        elif h < 120:
+            r_, g_, b_ = x_, c, 0
+        elif h < 180:
+            r_, g_, b_ = 0, c, x_
+        elif h < 240:
+            r_, g_, b_ = 0, x_, c
+        elif h < 300:
+            r_, g_, b_ = x_, 0, c
+        else:
+            r_, g_, b_ = c, 0, x_
+        r = int(round((r_ + m_) * 255))
+        g = int(round((g_ + m_) * 255))
+        b = int(round((b_ + m_) * 255))
+        return f"{max(0, min(255, r)):02X}{max(0, min(255, g)):02X}{max(0, min(255, b)):02X}"
     return None
 
 
@@ -104,12 +144,17 @@ def _strip_bom_whitespace(s: str) -> str:
 # ---------------------------------------------------------------------------
 
 class _Span:
-    __slots__ = ('text', 'rPr', 'footnoteId')
+    __slots__ = ('text', 'rPr', 'footnoteId', 'href', 'p_align', 'blockquote')
 
-    def __init__(self, text: str, rPr: dict, footnoteId: Optional[str] = None):
+    def __init__(self, text: str, rPr: dict, footnoteId: Optional[str] = None,
+                 href: Optional[str] = None, p_align: Optional[str] = None,
+                 blockquote: bool = False):
         self.text = text
         self.rPr = rPr  # dict of prop -> value
         self.footnoteId = footnoteId  # str when this run is a <sup data-fn-id="X"> marker
+        self.href = href  # str when this run sits inside an <a href="...">
+        self.p_align = p_align  # 'left' | 'center' | 'right' | 'both' | 'justify'
+        self.blockquote = blockquote  # True when the surrounding tag is <blockquote>
 
 
 class _TipTapParser(HTMLParser):
@@ -168,7 +213,22 @@ class _TipTapParser(HTMLParser):
                 return
             self.style_stack.append(layer)
             return
+        if tag == 'a':
+            # Hyperlink: capture href so the writer can wrap the run in
+            # a <w:hyperlink r:id="..."/> element with a relationship.
+            href = attr_dict.get('href') or ''
+            self.style_stack.append({'href': href, **(layer or {})})
+            return
+        if tag == 'blockquote':
+            # Render as a paragraph with a left indent (720 twips ≈ 0.5")
+            # plus italic body text — the user can override by setting
+            # explicit style on the wrapped spans.
+            self.style_stack.append({'blockquote': '1', **(layer or {})})
+            return
         if tag in ('p', 'div'):
+            # Paragraph-level alignment (text-align) lives in the style.
+            # We attach it to the first span after the layer is pushed
+            # so the writer can read it from the pPr.
             self.blocks.append(tag)
         elif tag in _HEADING_TAG_TO_OUTLINE:
             self.blocks.append(tag)
@@ -193,7 +253,18 @@ class _TipTapParser(HTMLParser):
         text = data
         if not text:
             return
-        self.spans.append(_Span(text, self.current_style))
+        # Pull href / blockquote out of the active style stack so the
+        # writer can use them when emitting the run.
+        cur = self.current_style
+        href = cur.pop('href', None)
+        blockquote = cur.pop('blockquote', None) is not None
+        # Paragraph alignment is a paragraph-level (not run-level)
+        # property. Capture it from the active style and clear it from
+        # the merged style so it does not bleed into the rPr.
+        p_align = cur.pop('text-align', None)
+        self.spans.append(
+            _Span(text, cur, href=href, p_align=p_align, blockquote=blockquote)
+        )
 
 
 def _parse_spans(html: str) -> List[_Span]:
@@ -361,7 +432,8 @@ def _build_footnote_reference(footnote_word_id: int, style: dict) -> OxmlElement
     return r
 
 
-def write_paragraph(p_elem, html: str, footnote_id_map: Optional[Dict[str, int]] = None) -> None:
+def write_paragraph(p_elem, html: str, footnote_id_map: Optional[Dict[str, int]] = None,
+                    part=None, doc=None) -> None:
     """Replace the contents of `p_elem` (a python-docx `_Paragraph._p`
     OOXML element) with rich runs parsed from `html`.
 
@@ -372,7 +444,36 @@ def write_paragraph(p_elem, html: str, footnote_id_map: Optional[Dict[str, int]]
     `footnote_id_map` (optional) maps frontend footnote ids (str) to
     Word footnote ids (int). If a span has `footnoteId` but no mapping
     is provided, we still emit the reference run but with id=0 (Word
-    will fall back to the separator)."""
+    will fall back to the separator).
+
+    `part` (optional) is the python-docx `Part` that owns `p_elem` —
+    required when the user HTML contains `<a href="...">` so the
+    hyperlink relationship can be added to the host part. If omitted
+    we fall back to looking for a `.part` attribute on the ancestors
+    of `p_elem`, which works for python-docx `_Paragraph` elements
+    but NOT for raw lxml elements detached from a Document. The
+    call sites in `build_approved_docx` and `lines_json_renderer.py`
+    pass the part explicitly to keep the lxml round-trip clean.
+
+    `doc` (optional) — the python-docx Document. Required when
+    `html` contains `<ul>` or `<ol>` markup so we can attach Word
+    numbering (`<w:numPr>`) to each `<li>`-derived paragraph. When
+    omitted and a list is detected, falls back to rendering each
+    `<li>` as a plain paragraph (no bullet/number marker) so the
+    document still publishes without crashing.
+    """
+    # --- Stage 1: detect list payload and route to list writer -------
+    # `lines_json` rows whose `html` carries full `<ul>`/`<ol>` markup
+    # (emitted by the frontend's `htmlToLines` grouping consecutive
+    # `<li>` siblings) get split here into one `<w:p>` per `<li>`,
+    # each carrying `<w:numPr>` so Word renders the bullet/number.
+    if html and doc is not None:
+        stripped = html.lstrip()
+        if stripped.startswith('<ul') or stripped.startswith('<ol'):
+            _write_list_paragraphs(p_elem, html, doc,
+                                    footnote_id_map=footnote_id_map,
+                                    part=part)
+            return
     pPr = p_elem.find(qn('w:pPr'))
     # Remove ALL child runs/hyperlinks, but keep pPr.
     for child in list(p_elem):
@@ -392,6 +493,24 @@ def write_paragraph(p_elem, html: str, footnote_id_map: Optional[Dict[str, int]]
     if not spans:
         p_elem.append(OxmlElement('w:r'))
         return
+    # Capture paragraph-level attributes from the first non-newline span.
+    p_align = None
+    blockquote = False
+    for s in spans:
+        if (s.text or '') == '\n':
+            continue
+        if s.p_align:
+            p_align = s.p_align
+        if s.blockquote:
+            blockquote = True
+        break
+    # Lazily create pPr so alignment / blockquote can be applied even
+    # when the host paragraph had no pPr (e.g. a freshly created one).
+    if (p_align or blockquote) and pPr is None:
+        pPr = OxmlElement('w:pPr')
+        p_elem.insert(0, pPr)
+    _apply_p_align(pPr, p_align)
+    _apply_blockquote_indent(pPr, blockquote)
     for span in spans:
         # Footnote anchor span
         if span.footnoteId:
@@ -407,10 +526,300 @@ def write_paragraph(p_elem, html: str, footnote_id_map: Optional[Dict[str, int]]
         if not text.strip() and text != '\n':
             continue
         run = _build_run(text, span.rPr or {})
-        p_elem.append(run)
-    if not list(p_elem.findall(qn('w:r'))):
+        if span.href:
+            p_elem.append(_wrap_run_in_hyperlink(run, span.href, part=part))
+        else:
+            p_elem.append(run)
+    if not list(p_elem.findall(qn('w:r'))) and not list(p_elem.findall(qn('w:hyperlink'))):
         # Word requires at least one run for the paragraph to render
         p_elem.append(OxmlElement('w:r'))
+
+
+# ---------------------------------------------------------------------------
+# Paragraph-level helpers (alignment, blockquote indent, hyperlink wrapper)
+# ---------------------------------------------------------------------------
+
+
+# --- List numbering -----------------------------------------------------
+# Word represents a list with three nested elements:
+#   <w:numbering>
+#     <w:abstractNum w:abstractNumId="N">  -- the visual template
+#       <w:lvl w:ilvl="0">
+#         <w:numFmt w:val="bullet"/>      -- (or "decimal")
+#         <w:lvlText w:val="•"/>          -- (or "%1.")
+#         <w:lvlJc w:val="left"/>
+#         <w:pPr><w:ind w:left="720"/></w:pPr>
+#       </w:lvl>
+#     </w:abstractNum>
+#     <w:num w:numId="M">                 -- a usage instance
+#       <w:abstractNumId w:val="N"/>
+#     </w:num>
+#   </w:numbering>
+# Each list paragraph then carries
+#   <w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="M"/></w:numPr></w:pPr>
+# to opt in.
+#
+# We pre-declare abstractNumId 90 (bullet) and 91 (decimal) and numId
+# 90 and 91 (their only users). These IDs are below the project's
+# typical numbering range (Brain uses numId 6 — see HISTORY heading) so
+# we won't collide.
+
+_LIST_ABSTRACT_NUM_ID_BULLET = 90
+_LIST_ABSTRACT_NUM_ID_DECIMAL = 91
+_LIST_NUM_ID_BULLET = 90
+_LIST_NUM_ID_DECIMAL = 91
+_LIST_NUMBERING_DEFINED = False
+
+
+def _ensure_list_numbering_definition(doc) -> None:
+    """Create the project's two list-numbering definitions on demand.
+
+    Idempotent: only writes the part if not already declared in this
+    python-docx session. Uses `<w:numbering>` directly on the document
+    so we never depend on the Brain template's pre-existing numbering.
+    """
+    global _LIST_NUMBERING_DEFINED
+    if _LIST_NUMBERING_DEFINED:
+        return
+    try:
+        numbering_part = doc.part.numbering_part
+        numbering_el = numbering_part.element
+    except Exception:
+        # Document has no numbering part yet — python-docx auto-creates
+        # one the first time `.numbering_part` is referenced, so this
+        # branch is rarely hit. Fall back to skipping if we cannot
+        # access it (old python-docx without numbering_part).
+        return
+    from lxml import etree as _et
+    # Avoid duplicate declarations if the document already defines
+    # abstractNumId 90 / 91.
+    existing_abstract = [
+        int(el.get(qn('w:abstractNumId')))
+        for el in numbering_el.findall(qn('w:abstractNum'))
+    ]
+    existing_num = [
+        int(el.get(qn('w:numId')))
+        for el in numbering_el.findall(qn('w:num'))
+    ]
+    nsmap = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+    if _LIST_ABSTRACT_NUM_ID_BULLET not in existing_abstract:
+        bullet_xml = f'''<w:abstractNum xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:abstractNumId="{_LIST_ABSTRACT_NUM_ID_BULLET}">
+  <w:lvl w:ilvl="0">
+    <w:start w:val="1"/>
+    <w:numFmt w:val="bullet"/>
+    <w:lvlText w:val="\u2022"/>
+    <w:lvlJc w:val="left"/>
+    <w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr>
+    <w:rPr><w:rFonts w:ascii="Symbol" w:hAnsi="Symbol" w:hint="default"/></w:rPr>
+  </w:lvl>
+</w:abstractNum>'''
+        numbering_el.append(_et.fromstring(bullet_xml))
+    if _LIST_ABSTRACT_NUM_ID_DECIMAL not in existing_abstract:
+        decimal_xml = f'''<w:abstractNum xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:abstractNumId="{_LIST_ABSTRACT_NUM_ID_DECIMAL}">
+  <w:lvl w:ilvl="0">
+    <w:start w:val="1"/>
+    <w:numFmt w:val="decimal"/>
+    <w:lvlText w:val="%1."/>
+    <w:lvlJc w:val="left"/>
+    <w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr>
+  </w:lvl>
+</w:abstractNum>'''
+        numbering_el.append(_et.fromstring(decimal_xml))
+    if _LIST_NUM_ID_BULLET not in existing_num:
+        bullet_num = f'''<w:num xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:numId="{_LIST_NUM_ID_BULLET}">
+  <w:abstractNumId w:val="{_LIST_ABSTRACT_NUM_ID_BULLET}"/>
+</w:num>'''
+        numbering_el.append(_et.fromstring(bullet_num))
+    if _LIST_NUM_ID_DECIMAL not in existing_num:
+        decimal_num = f'''<w:num xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:numId="{_LIST_NUM_ID_DECIMAL}">
+  <w:abstractNumId w:val="{_LIST_ABSTRACT_NUM_ID_DECIMAL}"/>
+</w:num>'''
+        numbering_el.append(_et.fromstring(decimal_num))
+    _LIST_NUMBERING_DEFINED = True
+
+
+def _apply_list_num_pr(pPr, num_id: int) -> None:
+    """Inject `<w:numPr><w:ilvl/><w:numId/></w:numPr>` into `pPr`,
+    placing it at the correct pPr-child position (after `pStyle`,
+    `keepNext`, `keepLines`, `numPr` itself usually leads). For
+    simplicity we append — Word tolerates non-strict child order
+    here as long as the tags are present."""
+    if pPr is None:
+        return
+    # Remove any existing numPr so the new one wins.
+    for npr in pPr.findall(qn('w:numPr')):
+        pPr.remove(npr)
+    numPr = OxmlElement('w:numPr')
+    ilvl = OxmlElement('w:ilvl')
+    ilvl.set(qn('w:val'), '0')
+    numIdEl = OxmlElement('w:numId')
+    numIdEl.set(qn('w:val'), str(num_id))
+    numPr.append(ilvl)
+    numPr.append(numIdEl)
+    pPr.append(numPr)
+
+
+def _write_list_paragraphs(p_elem, html: str, doc,
+                            footnote_id_map: Optional[Dict[str, int]] = None,
+                            part=None) -> None:
+    """Replace `p_elem` with a sequence of `<w:p>` elements — one per
+    `<li>` in the source `<ul>`/`<ol>` — each carrying `<w:numPr>` so
+    Word renders the bullet or decimal number.
+
+    The first list paragraph reuses `p_elem`; subsequent paragraphs
+    are inserted as siblings right after `p_elem` (preserving the
+    document order). The original `p_elem`'s children (text, runs)
+    are discarded.
+    """
+    _ensure_list_numbering_definition(doc)
+    # Walk the markup with stdlib so we don't pull in lxml just for
+    # this. Detect each `<li>` block via a tiny state machine.
+    from html.parser import HTMLParser as _HP
+
+    items: List[str] = []   # raw HTML for each <li>
+    current: List[str] = []
+    inside_li = False
+    depth_inside_li = 0
+
+    class _LiCollector(_HP):
+        def handle_starttag(self, tag, attrs):
+            nonlocal inside_li, depth_inside_li
+            t = tag.lower()
+            current.append(self.get_starttag_text() or f'<{tag}>')
+            if t == 'li' and not inside_li:
+                inside_li = True
+                depth_inside_li = 1
+            elif inside_li:
+                depth_inside_li += 1
+        def handle_endtag(self, tag):
+            nonlocal inside_li, depth_inside_li
+            t = tag.lower()
+            current.append(f'</{tag}>')
+            if t == 'li' and inside_li:
+                depth_inside_li -= 1
+                if depth_inside_li <= 0:
+                    items.append(''.join(current))
+                    current.clear()
+                    inside_li = False
+                    depth_inside_li = 0
+        def handle_data(self, data):
+            if inside_li:
+                current.append(data)
+
+    parsed = _LiCollector()
+    parsed.feed(html)
+    parsed.close()
+    if not items:
+        # No <li> found — fall back to rendering the markup as one
+        # paragraph of plain text so the document still publishes.
+        write_paragraph(p_elem, plain_text_from_html(html),
+                         footnote_id_map=footnote_id_map, part=part)
+        return
+
+    is_ordered = html.lstrip().lower().startswith('<ol')
+    num_id = _LIST_NUM_ID_DECIMAL if is_ordered else _LIST_NUM_ID_BULLET
+
+    parent = p_elem.getparent()
+    # Reuse p_elem for the FIRST <li>.
+    first_html = f'<p>{items[0]}</p>'
+    write_paragraph(p_elem, first_html,
+                    footnote_id_map=footnote_id_map, part=part)
+    # Attach numPr to the first paragraph.
+    pPr = p_elem.find(qn('w:pPr'))
+    _apply_list_num_pr(pPr, num_id)
+
+    # Insert siblings for the remaining items.
+    insert_after = p_elem
+    for li_html in items[1:]:
+        sibling_p = OxmlElement('w:p')
+        insert_after.addnext(sibling_p)
+        write_paragraph(sibling_p, f'<p>{li_html}</p>',
+                        footnote_id_map=footnote_id_map, part=part)
+        sib_pPr = sibling_p.find(qn('w:pPr'))
+        _apply_list_num_pr(sib_pPr, num_id)
+        insert_after = sibling_p
+
+
+_JC_VALUES = {
+    'left': 'left',
+    'right': 'right',
+    'center': 'center',
+    'centre': 'center',
+    'justify': 'both',
+    'both': 'both',
+}
+
+
+def _apply_p_align(pPr, p_align: Optional[str]) -> None:
+    """Set `<w:jc w:val="..."/>` on the paragraph's pPr from a CSS
+    `text-align` value. Recognised values: left / right / center /
+    centre (mapped to 'center') / justify / both (mapped to 'both').
+    Unknown / empty values are ignored so the existing pPr alignment
+    is preserved."""
+    if pPr is None or not p_align:
+        return
+    val = _JC_VALUES.get(p_align.strip().lower())
+    if not val:
+        return
+    # Replace any existing jc so the user value wins.
+    for jc in pPr.findall(qn('w:jc')):
+        pPr.remove(jc)
+    jc = OxmlElement('w:jc')
+    jc.set(qn('w:val'), val)
+    pPr.append(jc)
+
+
+def _apply_blockquote_indent(pPr, blockquote: bool) -> None:
+    """Add a 720-twip left indent (≈0.5") to the paragraph when the
+    surrounding tag is `<blockquote>`. Preserves any existing indent
+    values on the OTHER sides."""
+    if pPr is None or not blockquote:
+        return
+    ind = pPr.find(qn('w:ind'))
+    if ind is None:
+        ind = OxmlElement('w:ind')
+        # pPr children have a defined order: pStyle, keepNext, ...
+        # `w:ind` is mid-list; we just append (Word is forgiving).
+        pPr.append(ind)
+    ind.set(qn('w:left'), '720')
+    ind.set(qn('w:right'), '720')
+
+
+def _wrap_run_in_hyperlink(run: OxmlElement, href: str, part=None) -> OxmlElement:
+    """Wrap a `<w:r>` run in a `<w:hyperlink>` element with a relationship
+    to the given URL. Adds the relationship to the host part so Word can
+    resolve the link. Returns the `<w:hyperlink>` element."""
+    hyperlink = OxmlElement('w:hyperlink')
+    # Resolve the host part. Prefer the explicit `part` argument (so
+    # callers using raw lxml elements can pass it in); otherwise walk
+    # up the parent chain looking for a `.part` attribute (works for
+    # python-docx `_Paragraph` instances).
+    if part is None:
+        parent = run.getparent()
+        while parent is not None:
+            if hasattr(parent, 'part'):
+                part = parent.part
+                break
+            parent = parent.getparent()
+    if part is not None and href:
+        from docx.opc.constants import RELATIONSHIP_TYPE as RT
+        rel_id = part.relate_to(href, RT.HYPERLINK, is_external=True)
+        hyperlink.set(qn('r:id'), rel_id)
+    else:
+        # No part found — fall back to a tooltip-style anchor that Word
+        # can still display, but the link will not navigate.
+        hyperlink.set(qn('w:tooltip'), href)
+    # Give the link the standard blue+underline look so the user can
+    # SEE the hyperlink even if the host theme doesn't apply link styles.
+    rPr = run.find(qn('w:rPr'))
+    if rPr is None:
+        rPr = OxmlElement('w:rPr')
+        run.insert(0, rPr)
+    rStyle = OxmlElement('w:rStyle')
+    rStyle.set(qn('w:val'), 'Hyperlink')
+    rPr.insert(0, rStyle)
+    hyperlink.append(run)
+    return hyperlink
 
 
 def plain_text_from_html(html: str) -> str:

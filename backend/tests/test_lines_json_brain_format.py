@@ -872,7 +872,12 @@ def test_inherited_table_style_borders_preserved(renderer_mod, brain_path, out_d
 
 
 def test_explicit_font_size_still_works(renderer_mod, brain_path, out_dir):
-    """When the user HTML specifies a font-size, it's honoured."""
+    """When the user HTML specifies a font-size, it's honoured.
+    Stage 6 update: the toolbar's font-size control must work, so a
+    user-applied font-size in <span style="font-size: ..."> overrides
+    the publication default of 10pt. (Earlier directive was uniform
+    10pt; superseded by Stage 6 "all toolbar functions must appear in
+    the output".)"""
     lines_json = [
         ["p", {
             "slot": 5,
@@ -891,10 +896,9 @@ def test_explicit_font_size_still_works(renderer_mod, brain_path, out_dir):
             sz = rPr.find(qn("w:sz"))
             if sz is not None:
                 sizes.append(sz.get(qn("w:val")))
-# Per user directive: ALL text must be Times New Roman 10pt, even
-    # when the user specifies a different font-size via inline style.
-    # 10pt -> 20 half-points.
-    assert "20" in sizes, f"expected sz=20 (10pt uniform), got {sizes}"
+    # 24px -> ~18pt -> 36 half-points. The toolbar's font-size
+    # control must be honoured.
+    assert "36" in sizes, f"expected sz=36 (18pt from 24px), got {sizes}"
 
 
 def test_explicit_bold_still_works(renderer_mod, brain_path, out_dir):

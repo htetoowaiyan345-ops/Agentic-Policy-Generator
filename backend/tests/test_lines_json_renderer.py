@@ -146,8 +146,13 @@ def test_all_slot_zero_does_not_crash(renderer_mod, brain_path, out_dir):
     assert out.exists()
     assert out.stat().st_size > 1000  # not empty
     doc = Document(str(out))
-    # Free-paragraph zone label visible.
-    assert any(p.text.strip() == "Free Paragraphs" for p in doc.paragraphs)
+    # Per user spec: "Free Paragraphs" zone label is removed — it was
+    # unnecessary text in the published docx. Free-zone items still render
+    # in their original insertion order.
+    assert not any(p.text.strip() == "Free Paragraphs" for p in doc.paragraphs)
+    # User-written content still appears in the docx.
+    assert _has_text(doc, "first")
+    assert _has_text(doc, "second")
 
 
 def test_mixed_slot_assignment(renderer_mod, brain_path, out_dir):
@@ -477,3 +482,93 @@ def test_import_rich_writer_works_under_importlib_load(renderer_mod):
     wp = renderer_mod._import_rich_writer()
     assert wp is not None, "_import_rich_writer returned None"
     assert callable(wp)
+
+
+# ---------------------------------------------------------------------------
+# Stage 6 — full pipeline toolbar round-trip
+# ---------------------------------------------------------------------------
+# Each test takes a lines_json entry with HTML from one toolbar control,
+# runs the full `render_lines_json_to_brain` pipeline, and asserts the
+# corresponding OOXML fragment survives the trip. Tests use slot 6
+# (POLICY STATEMENT) so the user content replaces the body paragraph of
+# that section in the brain framework.
+
+
+def _render_and_read(lines_json, brain_path, out_dir, name="stage6.docx"):
+    out = out_dir / name
+    renderer_mod.render_lines_json_to_brain(lines_json, brain_path, out)
+    return Document(str(out))
+
+
+@pytest.mark.parametrize(
+    'name,html,expected_frag,rel_frag',
+    [
+        # 1. Bold
+        ('bold',
+         '<p>this is <strong>bold</strong></p>',
+         '<w:b/>', None),
+        # 2. Italic
+        ('italic',
+         '<p>this is <em>italic</em></p>',
+         '<w:i/>', None),
+        # 3. Underline
+        ('underline',
+         '<p>this is <u>underlined</u></p>',
+         '<w:u ', None),
+        # 4. Strikethrough
+        ('strike',
+         '<p>this is <s>struck</s></p>',
+         '<w:strike/>', None),
+        # 5. Color
+        ('color',
+         '<p><span style="color: #ff0000;">red</span></p>',
+         'val="FF0000"', None),
+        # 6. Font size
+        ('fontsize',
+         '<p><span style="font-size: 18px;">big</span></p>',
+         '<w:sz', None),
+        # 7. Font family
+        ('fontfamily',
+         '<p><span style="font-family: Calibri;">calibri</span></p>',
+         'w:ascii="calibri"', None),
+        # 8. Right align
+        ('align-right',
+         '<p style="text-align: right;">right</p>',
+         'w:val="right"', None),
+        # 9. Center align
+        ('align-center',
+         '<p style="text-align: center;">center</p>',
+         'w:val="center"', None),
+        # 10. Hyperlink
+        ('hyperlink',
+         '<p>see <a href="https://example.com">link</a></p>',
+         '<w:hyperlink', 'example.com'),
+        # 11. Blockquote
+        ('blockquote',
+         '<blockquote>quoted</blockquote>',
+         'w:left="720"', None),
+    ],
+)
+def test_stage6_toolbar_format_round_trip(
+    renderer_mod, brain_path, out_dir, name, html, expected_frag, rel_frag
+):
+    """Every toolbar format must survive the full lines_json -> .docx
+    pipeline."""
+    lines_json = [
+        ["p", {"slot": 6, "text": "x", "html": html}],
+    ]
+    out = out_dir / f"stage6_{name}.docx"
+    renderer_mod.render_lines_json_to_brain(lines_json, brain_path, out)
+    doc = Document(str(out))
+    xml = doc.element.body.xml
+    assert expected_frag in xml, (
+        f"{name}: missing {expected_frag!r} in output (html={html!r})"
+    )
+    if rel_frag is not None:
+        # Verify the relationship landed in document.xml.rels.
+        import zipfile
+        with zipfile.ZipFile(str(out)) as z:
+            rels = z.read('word/_rels/document.xml.rels').decode('utf-8')
+        assert rel_frag in rels, (
+            f"{name}: missing {rel_frag!r} in rels"
+        )

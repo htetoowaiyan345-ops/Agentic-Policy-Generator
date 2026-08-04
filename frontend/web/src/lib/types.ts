@@ -87,7 +87,8 @@ export type RichTable = RichCell[][];
 
 export type PreviewLine =
   | ['p', RichParagraph]
-  | ['t', { slot: SlotKind; rows: RichTable }];
+  | ['t', { slot: SlotKind; rows: RichTable }]
+  | ['divider', { slot: SlotKind }];
 
 /**
  * Normalise historical payload shape (legacy `['p', string]` or
@@ -133,6 +134,13 @@ export function normalisePreviewLine(raw: unknown): PreviewLine | null {
       return ['t', { slot: (p.slot ?? 0) as SlotKind, rows: p.rows ?? [] }];
     }
     return null;
+  }
+  if (kind === 'divider') {
+    if (payload && typeof payload === 'object' && 'slot' in payload) {
+      const p = payload as { slot?: SlotKind };
+      return ['divider', { slot: (p.slot ?? 0) as SlotKind }];
+    }
+    return ['divider', { slot: 0 }];
   }
   return null;
 }

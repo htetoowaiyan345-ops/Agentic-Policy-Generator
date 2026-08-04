@@ -330,12 +330,19 @@ def _apply_publication_styling(p_elem) -> None:
     spacing.set(qn("w:line"), "480")
     spacing.set(qn("w:lineRule"), "auto")
 
-    # Left alignment (override scaffold's jc=both)
-    for jc in pPr.findall(qn("w:jc")):
-        pPr.remove(jc)
-    jc = OxmlElement("w:jc")
-    jc.set(qn("w:val"), "left")
-    pPr.append(jc)
+    # Left alignment. Only override the existing jc if the paragraph
+    # does NOT already have a user-applied alignment. The rich writer
+    # sets `<w:jc>` for `<p style="text-align: right|center|justify">`
+    # in the user's HTML, and we want those values to survive the
+    # post-pass. A jc="left" coming from the rich writer is also left
+    # alone (idempotent).
+    existing_jc = pPr.find(qn("w:jc"))
+    if existing_jc is None or existing_jc.get(qn("w:val")) in (None, "both"):
+        if existing_jc is not None:
+            pPr.remove(existing_jc)
+        jc = OxmlElement("w:jc")
+        jc.set(qn("w:val"), "left")
+        pPr.append(jc)
 
 
 def _apply_publication_styling_in_cell(p_elem) -> None:
@@ -375,6 +382,12 @@ def _apply_metadata_styling(p_elem) -> None:
       - left alignment
       - Times New Roman 10pt applied to all runs (overrides existing
         rPr so labels and values render uniformly)
+      - Strip italic (`<w:i/>`/`<w:iCs/>`) from the paragraph rPr so all
+        labels render consistently bold (matches Policy Title:, etc.).
+        The brain scaffold's 'Type:' paragraph inherits italic from the
+        template's pPr (which other labels don't have), making it look
+        different. Normalize here so the whole slot-1 block reads
+        uniformly.
     """
     # Skip table cells — preserve their original formatting.
     parent = p_elem.getparent()
@@ -404,6 +417,17 @@ def _apply_metadata_styling(p_elem) -> None:
     jc = OxmlElement("w:jc")
     jc.set(qn("w:val"), "left")
     pPr.append(jc)
+
+    # Strip italic from the paragraph rPr so the label runs render as
+    # bold-only (matching Policy Title:, Applicable Sector(s):, etc.).
+    # The brain scaffold's 'Type:' paragraph pPr carries `<w:i/>` from
+    # the template which leaves the label visually italic.
+    pPr_rPr = pPr.find(qn("w:rPr"))
+    if pPr_rPr is not None:
+        for i_tag in pPr_rPr.findall(qn("w:i")):
+            pPr_rPr.remove(i_tag)
+        for iCs_tag in pPr_rPr.findall(qn("w:iCs")):
+            pPr_rPr.remove(iCs_tag)
 
     # Times New Roman 10pt on every run.
     for r in p_elem.findall(qn("w:r")):
@@ -469,28 +493,65 @@ def _apply_paragraph_margins(p_elem, top_twips: int = 100, bottom_twips: int = 1
     spacing.set(qn("w:after"), str(bottom_twips))
 
 
-def _write_paragraph_rich(p_elem, html: str) -> None:
+def _resolve_part_from_p(p_elem):
+    """Walk up the parent chain from a `<w:p>` lxml element looking for
+    a `.part` attribute. Returns the python-docx `Part` instance, or
+    `None` when the chain is detached (no host Document). Used to
+    forward the part into the rich writer so `<a href="...">` elements
+    can register their relationship in the host document."""
+    parent = p_elem.getparent()
+    while parent is not None:
+        if hasattr(parent, "part"):
+            try:
+                return parent.part
+            except Exception:
+                return None
+        parent = parent.getparent()
+    return None
+
+
+def _write_paragraph_rich(p_elem, html: str, doc=None) -> None:
     """Write the user's HTML into an existing `<w:p>` element using the
     rich writer (bold/italic/colour/font/heading). Falls back to plain
     text if the rich writer is unavailable or raises.
 
-    Publication styling (1.15 line height, jc=left) is applied via
-    `_apply_publication_styling`. The brain scaffold's pStyle is
+    Publication styling (1.15 line height) is applied via
+    `_apply_publication_styling_no_jc`. The brain scaffold's pStyle is
     preserved so font/theme metrics match the brain framework.
-    User-provided rich styling (bold/italic/color/font-size overrides
-    in <span style="...">) is honoured. Tables are not affected."""
+    User-provided rich styling (bold/italic/color/font-size/alignment
+    overrides in <span style="..."> or `<p style="text-align:...">`) is
+    honoured. Tables are not affected.
+
+    The jc is intentionally applied AFTER the rich writer runs so a
+    user-applied `text-align` value wins over the publication default
+    of `left`.
+
+    `doc` (optional) is the python-docx `Document` so we can resolve
+    the host part for hyperlink relationships. When omitted, we walk
+    the parent chain — which only works for paragraphs that are still
+    attached to a python-docx `_Body` element. lxml elements from
+    `doc.element.body` (used by `_render_slot_direct`) need `doc`."""
     # Remove all children except pPr (preserves paragraph styling).
     for child in list(p_elem):
         if child.tag == qn("w:pPr"):
             continue
         p_elem.remove(child)
-    # Apply publication styling: 1.15 line, jc=left. Tables are skipped
-    # inside `_apply_publication_styling`.
-    _apply_publication_styling(p_elem)
+    # Apply publication styling (line height only — NOT jc, so the rich
+    # writer's user-applied alignment wins). Tables are skipped inside
+    # `_apply_publication_styling_no_jc`.
+    _apply_publication_styling_no_jc(p_elem)
+    # Resolve the host part so hyperlink relationships land in the
+    # right place when the user HTML contains `<a href="...">`.
+    # Prefer the explicit `doc` argument; fall back to walking the
+    # parent chain (works for python-docx Paragraph objects).
+    if doc is not None:
+        _part = doc.part
+    else:
+        _part = _resolve_part_from_p(p_elem)
     wp = _import_rich_writer()
     if wp is not None:
         try:
-            wp(p_elem, html or "")
+            wp(p_elem, html or "", part=_part, doc=doc)
             return
         except Exception:
             pass
@@ -507,6 +568,36 @@ def _write_paragraph_rich(p_elem, html: str) -> None:
     t.text = text
     new_r.append(t)
     p_elem.append(new_r)
+
+
+def _apply_publication_styling_no_jc(p_elem) -> None:
+    """Apply publication-time line height to a body paragraph WITHOUT
+    touching `<w:jc>`. Used by `_write_paragraph_rich` so a user-applied
+    `text-align` from the rich writer (e.g. right, center, justify) is
+    not overwritten by the publication default of jc=left.
+    Mirrors `_apply_publication_styling` but skips the jc step.
+    """
+    # Skip table cells — preserve their original formatting.
+    parent = p_elem.getparent()
+    if parent is not None and parent.tag.split("}")[-1] == "tc":
+        return
+    pPr = p_elem.find(qn("w:pPr"))
+    if pPr is None:
+        pPr = OxmlElement("w:pPr")
+        p_elem.insert(0, pPr)
+    has_border = pPr.find(qn("w:pBdr")) is not None
+    spacing = pPr.find(qn("w:spacing"))
+    if spacing is None:
+        spacing = OxmlElement("w:spacing")
+        pPr.append(spacing)
+    if not has_border:
+        if spacing.get(qn("w:after")) is not None:
+            del spacing.attrib[qn("w:after")]
+        if spacing.get(qn("w:before")) is not None:
+            del spacing.attrib[qn("w:before")]
+    spacing.set(qn("w:line"), "480")
+    spacing.set(qn("w:lineRule"), "auto")
+    # Intentionally NOT setting jc here.
 
 
 def _bold_paragraph_runs(p_elem) -> None:
@@ -736,7 +827,7 @@ def _cell_to_html(cell: Any) -> str:
     return str(cell)
 
 
-def _write_table(table_elem, rows: list[list[Any]], preserve_dimensions: bool = False) -> int:
+def _write_table(table_elem, rows: list[list[Any]], preserve_dimensions: bool = False, doc=None) -> int:
     """Replace the contents of `table_elem` with the user's rows.
 
     Mirrors the brain renderer's behaviour: row count = source row count;
@@ -805,7 +896,7 @@ def _write_table(table_elem, rows: list[list[Any]], preserve_dimensions: bool = 
             wrote = False
             if wp is not None:
                 try:
-                    wp(new_p, html or plain)
+                    wp(new_p, html or plain, part=doc.part if doc is not None else None)
                     wrote = True
                 except Exception:
                     wrote = False
@@ -822,7 +913,7 @@ def _write_table(table_elem, rows: list[list[Any]], preserve_dimensions: bool = 
     return len(rows)
 
 
-def _make_new_paragraph(template_pPr, text_or_html: str, is_html: bool) -> object:
+def _make_new_paragraph(template_pPr, text_or_html: str, is_html: bool, doc=None) -> object:
     """Build a new `<w:p>` element. When `is_html`, write rich; else plain.
 
     Publication styling is applied (1.15 line, jc=left). Brain scaffold
@@ -837,7 +928,7 @@ def _make_new_paragraph(template_pPr, text_or_html: str, is_html: bool) -> objec
         wp = _import_rich_writer()
         if wp is not None:
             try:
-                wp(new_p, text_or_html)
+                wp(new_p, text_or_html, part=doc.part if doc is not None else None)
                 if list(new_p.findall(qn("w:r"))):
                     return new_p
             except Exception:
@@ -989,7 +1080,7 @@ def _render_slot_direct(doc, sec_id: int,
         # "I. INTRODUCTION" with the bold font).
         first_entry = non_empty[0]
         html = first_entry.get('html') or first_entry.get('text') or ''
-        _write_paragraph_rich(heading_elem, html)
+        _write_paragraph_rich(heading_elem, html, doc=doc)
         if sec_id in _BOLD_HEADING_SLOTS:
             _bold_paragraph_runs(heading_elem)
         if sec_id in _BOLD_LABEL_SLOTS:
@@ -1031,7 +1122,7 @@ def _render_slot_direct(doc, sec_id: int,
         if body_scaffold_count > 0 and len(non_empty) >= 1:
             first_entry = non_empty[0]
             html = first_entry.get('html') or first_entry.get('text') or ''
-            _write_paragraph_rich(heading_elem, html)
+            _write_paragraph_rich(heading_elem, html, doc=doc)
             if sec_id in _BOLD_LABEL_SLOTS:
                 _apply_label_bold(heading_elem, first_entry.get('text') or '')
             # Consume the first user paragraph; the body loop will
@@ -1055,7 +1146,7 @@ def _render_slot_direct(doc, sec_id: int,
         if i < body_user_count:
             entry = body_paras[i]
             html = entry.get('html') or entry.get('text') or ''
-            _write_paragraph_rich(p_elem, html)
+            _write_paragraph_rich(p_elem, html, doc=doc)
             # Bold the label portion for slot-1 metadata fields.
             # (Heading paragraphs are handled above; slot body paragraphs
             # are not bolded so values remain normal weight.)
@@ -1102,7 +1193,7 @@ def _render_slot_direct(doc, sec_id: int,
                     insert_pos = len(list(parent))
                 for entry in body_paras[body_scaffold_count:]:
                     html = entry.get('html') or entry.get('text') or ''
-                    new_p = _make_new_paragraph(pPr_template, html, is_html=True)
+                    new_p = _make_new_paragraph(pPr_template, html, is_html=True, doc=doc)
                     parent.insert(insert_pos, new_p)
                     insert_pos += 1
         else:
@@ -1111,7 +1202,7 @@ def _render_slot_direct(doc, sec_id: int,
             # the scaffold label-row). Append remaining paragraphs.
             first_entry = body_paras[0]
             html = first_entry.get('html') or first_entry.get('text') or ''
-            _write_paragraph_rich(heading_elem, html)
+            _write_paragraph_rich(heading_elem, html, doc=doc)
             if sec_id in _BOLD_LABEL_SLOTS:
                 _apply_label_bold(heading_elem, first_entry.get('text') or '')
             parent = heading_elem.getparent()
@@ -1123,7 +1214,7 @@ def _render_slot_direct(doc, sec_id: int,
                     insert_pos = len(list(parent))
                 for entry in body_paras[1:]:
                     html = entry.get('html') or entry.get('text') or ''
-                    new_p = _make_new_paragraph(pPr_template, html, is_html=True)
+                    new_p = _make_new_paragraph(pPr_template, html, is_html=True, doc=doc)
                     parent.insert(insert_pos, new_p)
                     insert_pos += 1
 
@@ -1132,7 +1223,7 @@ def _render_slot_direct(doc, sec_id: int,
         # First table → first scaffold table.
         first_table = tables[0]
         first_rows = first_table.get('rows') or []
-        _write_table(table_items[0], first_rows)
+        _write_table(table_items[0], first_rows, doc=doc)
         # Extra user tables → append after the first scaffold table.
         if len(tables) > 1 and table_items:
             anchor = table_items[0]
@@ -1194,7 +1285,7 @@ def _render_slot_direct(doc, sec_id: int,
                             wrote = False
                             if wp is not None:
                                 try:
-                                    wp(new_p, _cell_to_html(cell) or _cell_to_plain(cell))
+                                    wp(new_p, _cell_to_html(cell) or _cell_to_plain(cell), part=doc.part if doc is not None else None)
                                     wrote = True
                                 except Exception:
                                     wrote = False
@@ -1278,7 +1369,7 @@ def _render_slot_direct(doc, sec_id: int,
                         wrote = False
                         if wp is not None:
                             try:
-                                wp(new_p, _cell_to_html(cell) or _cell_to_plain(cell))
+                                wp(new_p, _cell_to_html(cell) or _cell_to_plain(cell), part=doc.part if doc is not None else None)
                                 wrote = True
                             except Exception:
                                 wrote = False
@@ -1426,23 +1517,10 @@ def _render_free_paragraph_zone(doc, free_zone_items: list) -> None:
             template_pPr = ch.find(qn("w:pPr"))
             if template_pPr is not None:
                 break
-    # Insert a zone-label heading so reviewers can see this is "free".
-    zone_label = OxmlElement("w:p")
-    if template_pPr is not None:
-        zone_label.append(copy.deepcopy(template_pPr))
-    label_r = OxmlElement("w:r")
-    label_t = OxmlElement("w:t")
-    label_t.set(qn("xml:space"), "preserve")
-    label_t.text = "Free Paragraphs"
-    label_r.append(label_t)
-    zone_label.append(label_r)
-    # Strip <w:numPr> from the zone label so it doesn't render as a bullet.
-    zone_pPr = zone_label.find(qn("w:pPr"))
-    if zone_pPr is not None:
-        for numPr in zone_pPr.findall(qn("w:numPr")):
-            zone_pPr.remove(numPr)
-    body.insert(insert_pos, zone_label)
-    insert_pos += 1
+    # The "Free Paragraphs" zone label was previously inserted here so
+    # reviewers could see this section. Per user spec, it's unnecessary
+    # text in the published docx — remove it. The free-zone items are
+    # inserted in their original order below.
     # Insert the free-zone items in original insertion order.
     for kind, payload in free_zone_items:
         if kind == 'p':
@@ -1450,7 +1528,7 @@ def _render_free_paragraph_zone(doc, free_zone_items: list) -> None:
             html = payload.get('html') or text or ''
             if not text.strip() and not html.strip():
                 continue
-            new_p = _make_new_paragraph(template_pPr, html, is_html=True)
+            new_p = _make_new_paragraph(template_pPr, html, is_html=True, doc=doc)
             # Strip <w:numPr> from the user-written paragraph so it doesn't
             # render as a bullet (the brain's free-paragraph zone templates
             # inherit <w:numPr> from the scaffold, which would make ALL
@@ -1526,7 +1604,7 @@ def _build_free_zone_table(rows: list) -> object:
             wrote = False
             if wp is not None:
                 try:
-                    wp(new_p, _cell_to_html(cell) or _cell_to_plain(cell))
+                    wp(new_p, _cell_to_html(cell) or _cell_to_plain(cell), part=doc.part if doc is not None else None)
                     wrote = True
                 except Exception:
                     wrote = False
@@ -2269,24 +2347,30 @@ def _has_table_ancestor(elem) -> bool:
 def _set_run_font(r, *, family: str, size_hp: int) -> None:
     """Set the font family (e.g. 'Times New Roman') and size (half-points,
     e.g. 22 for 11pt) on a single `<w:r>` element. Adds `<w:rPr>` if
-    missing. Removes any existing font/size so the new values win."""
+    missing. PRESERVES any user-applied `<w:rFonts>` or `<w:sz>` that
+    came from the rich writer — only writes the default when the run
+    has no explicit font/size set already. This way user toolbar
+    formatting (font family, font size) is not silently overwritten by
+    the post-pass that normalises to Times New Roman 10pt."""
     rPr = r.find(qn("w:rPr"))
     if rPr is None:
         rPr = OxmlElement("w:rPr")
         r.insert(0, rPr)
-    # Remove existing font + size.
-    for tag in ("w:rFonts", "w:sz", "w:szCs"):
-        for el in rPr.findall(qn(tag)):
-            rPr.remove(el)
-    rFonts = OxmlElement("w:rFonts")
-    rFonts.set(qn("w:ascii"), family)
-    rFonts.set(qn("w:hAnsi"), family)
-    rFonts.set(qn("w:cs"), family)
-    rFonts.set(qn("w:eastAsia"), family)
-    rPr.append(rFonts)
-    sz = OxmlElement("w:sz")
-    sz.set(qn("w:val"), str(size_hp))
-    rPr.append(sz)
-    szCs = OxmlElement("w:szCs")
-    szCs.set(qn("w:val"), str(size_hp))
-    rPr.append(szCs)
+    # Only set the default font when the run has no rFonts of its own
+    # (i.e. the user did not pick a font via the toolbar).
+    if not rPr.findall(qn("w:rFonts")):
+        rFonts = OxmlElement("w:rFonts")
+        rFonts.set(qn("w:ascii"), family)
+        rFonts.set(qn("w:hAnsi"), family)
+        rFonts.set(qn("w:cs"), family)
+        rFonts.set(qn("w:eastAsia"), family)
+        rPr.append(rFonts)
+    # Only set the default size when the run has no <w:sz> of its own.
+    if not rPr.findall(qn("w:sz")):
+        sz = OxmlElement("w:sz")
+        sz.set(qn("w:val"), str(size_hp))
+        rPr.append(sz)
+    if not rPr.findall(qn("w:szCs")):
+        szCs = OxmlElement("w:szCs")
+        szCs.set(qn("w:val"), str(size_hp))
+        rPr.append(szCs)

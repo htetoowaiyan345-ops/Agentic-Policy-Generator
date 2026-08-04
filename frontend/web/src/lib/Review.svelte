@@ -158,16 +158,16 @@
       versionsLoaded = vs;
       setVersions(vs);
       setReviewAudit(events);
-      // Stage 4.14 — initial view: latest drafting row if any
-      // (V# = latest_frozen + N), else latest frozen row.
-      const drafts = vs
-        .filter((v) => v.kind === 'draft')
-        .sort((a, b) => b.version_no - a.version_no);
+      // Pick the highest V# across BOTH drafts and frozen rows. Without
+      // this, a racing `loadDraftAndApply` could leave `viewingVersionNo`
+      // stuck at the last array item (often v1). Deterministic pick —
+      // always show the latest version's content on load.
       let initialV: number | null = null;
-      if (drafts.length > 0) {
-        initialV = drafts[0].version_no;
-      } else if (vs.length > 0) {
-        initialV = vs[vs.length - 1].version_no;
+      if (vs.length > 0) {
+        initialV = vs.reduce(
+          (max, v) => (v.version_no > max ? v.version_no : max),
+          vs[0].version_no
+        );
       }
       viewingVersionNo = initialV;
       setCurrentVersionNo(initialV);
@@ -176,6 +176,33 @@
           runId,
           initialV
         );
+      }
+      // Always load the picked version's `lines_json` into the editor
+      // so the user sees the latest version's content immediately.
+      // Replaces the separate `loadDraftAndApply` race-prone path.
+      if (initialV != null) {
+        try {
+          const resp = await getVersion(runId, initialV);
+          if (resp && Array.isArray(resp.lines_json)) {
+            previewData = { lines: resp.lines_json };
+            editableLines = resp.lines_json as PreviewLine[];
+            editRevision = editRevision + 1;
+            savedRevision = editRevision;
+            // Allow Svelte's `editableLines = ...` reactive update to
+            // propagate to the bound `ReviewEditor.lines` prop before
+            // we push the new content into CKEditor. Without this, the
+            // `buildUnifiedInitialHtml` inside `applyExternalContent`
+            // may serialize the previous `lines` value, producing a
+            // mismatch between `editableLines` (server's V_n) and the
+            // editor's DOM (v2 — the prior content).
+            await tick();
+            if (typeof editorRef?.applyExternalContent === 'function') {
+              await editorRef.applyExternalContent(editableLines);
+            }
+          }
+        } catch {
+          /* keep current state on fetch failure */
+        }
       }
     })().finally(() => {
       reviewDataInflight = null;
@@ -192,6 +219,21 @@
     // pending/in-flight autosave and mark the editor clean so a stale
     // autosave from the previous view doesn't pollute the new one.
     // The new V#'s content is loaded below from the server (fresh).
+    // Critical: flush pending autosave FIRST so divider/format edits
+    // made within the 1.5s debounce window are persisted before the
+    // server data for the new version overwrites the editor.
+    // Guard the flush with `editorDirty`: when re-switching back to a
+    // previously-edited version, `editableLines` now holds the
+    // server-loaded content from the just-viewed version — flushing
+    // it would overwrite the destination version's draft row with
+    // the wrong content. Only flush when there are real unsaved edits.
+    if (editorDirty) {
+      try {
+        await flushAutosave();
+      } catch {
+        /* keep current view intact on flush failure */
+      }
+    }
     clearAutosaveTimer();
     if (autosaveAbort) {
       autosaveAbort.abort();
@@ -216,6 +258,14 @@
       if (resp && Array.isArray(resp.lines_json)) {
         previewData = { lines: resp.lines_json };
         editableLines = resp.lines_json;
+        // Allow the Svelte reactive `editableLines = resp.lines_json`
+        // assignment to propagate to the bound `ReviewEditor.lines` prop
+        // BEFORE we push the new content to CKEditor. Without this, the
+        // first version-switch click fails to refresh the editor DOM
+        // (the prior version's content lingers until the user clicks a
+        // second time). See also: CkEditor.setHtml short-circuit was
+        // removed in this round.
+        await tick();
         if (typeof editorRef?.applyExternalContent === 'function') {
           editorRef.applyExternalContent(editableLines);
         }
@@ -227,6 +277,7 @@
           const data = await getPreview(activeRunId);
           previewData = data;
           editableLines = data.lines || [];
+          await tick();
           if (typeof editorRef?.applyExternalContent === 'function') {
             editorRef.applyExternalContent(editableLines);
           }
@@ -251,6 +302,9 @@
       if (resp && Array.isArray(resp.lines_json)) {
         previewData = { lines: resp.lines_json };
         editableLines = resp.lines_json;
+        // Same rationale as onSelectVersion: propagate the reactive
+        // update through Svelte before pushing to CKEditor.
+        await tick();
         if (typeof editorRef?.applyExternalContent === 'function') {
           editorRef.applyExternalContent(editableLines);
         }
@@ -443,6 +497,17 @@
     autosaveError = null;
     try {
       const linesJson = JSON.stringify(editableLines);
+      // [DIAG] start — diagnostic logging only, no logic change
+      console.log('[DIAG-Review] autosave payload', {
+        editableLines_count: editableLines.length,
+        dividers: editableLines.filter((l) => Array.isArray(l) && l[0] === 'divider').length,
+        with_strong: editableLines.filter((l) => Array.isArray(l) && l[0] === 'p' && (l[1]?.html?.includes('<strong>') || l[1]?.html?.includes('<b>'))).length,
+        with_italic: editableLines.filter((l) => Array.isArray(l) && l[0] === 'p' && (l[1]?.html?.includes('<em>') || l[1]?.html?.includes('<i>'))).length,
+        with_color: editableLines.filter((l) => Array.isArray(l) && l[0] === 'p' && l[1]?.html?.includes('color:')).length,
+        with_hr_in_p: editableLines.filter((l) => Array.isArray(l) && l[0] === 'p' && l[1]?.html?.includes('<hr')).length,
+        payload_chars: linesJson.length
+      });
+      // [DIAG] end
       // Stage 4.13 — use the stable per-session `autosaveClientEditId`.
       // Server uses the 60s idempotency window + UPDATE-in-place to
       // update the SAME draft row with new content. No new V# is
@@ -450,6 +515,14 @@
       const resp = await saveDraft(
         activeRunId, linesJson, autosaveClientEditId
       );
+      // [DIAG] log backend response
+      console.log('[DIAG-Review] autosave response', {
+        edit_id: resp?.edit_id,
+        edit_count: resp?.edit_count,
+        draft_version_no: resp?.draft_version_no,
+        success: !!resp
+      });
+      // [DIAG] end
       autosaveEditId = resp.edit_id;
       autosaveEditCount = resp.edit_count;
       autosaveSavedAt = resp.saved_at;
@@ -466,6 +539,27 @@
         autosaveDraftVersionNo = resp.draft_version_no;
       }
       autosaveDraftVersionNo = resp.draft_version_no;
+      // Sync the editor's "Currently viewing" indicator with the V#
+      // that the server assigned to this autosave. When the server
+      // creates a fresh draft row (first save of the session, or
+      // after a 60s idle gap), this jumps the viewer to that new V#
+      // so the user does not have to manually click it in the
+      // timeline. Otherwise `viewingVersionNo` stays at the V# the
+      // user landed on at page load while a new V# silently appears
+      // in the timeline — making the editor appear "off" the version
+      // the user is actually editing.
+      if (
+        activeRunId != null &&
+        resp.draft_version_no != null &&
+        viewingVersionNo !== resp.draft_version_no
+      ) {
+        viewingVersionNo = resp.draft_version_no;
+        setCurrentVersionNo(resp.draft_version_no);
+        viewingVersionByRunId = new Map(viewingVersionByRunId).set(
+          activeRunId,
+          resp.draft_version_no
+        );
+      }
       savedRevision = editRevision;
       nowTick = Date.now();
     } catch (e) {
@@ -601,6 +695,18 @@
     errorBanner = null;
     successBanner = null;
     try {
+      // Flush any pending autosave BEFORE publish so toolbar-inserted
+      // bold/colour/divider/etc. are persisted into the draft row that
+      // publish (or download-on-the-fly for approved rows) will read.
+      // Without this, edits within the 1.5s debounce window are lost
+      // in the .docx output.
+      try {
+        if (editorDirty) {
+          await flushAutosave();
+        }
+      } catch {
+        /* non-fatal — keep current view intact on flush failure */
+      }
       const resp = await publishVersion(
         activeRunId,
         viewingVersionNo,
@@ -644,6 +750,16 @@
   }
 
   function onEditorChange(updated: PreviewLine[]): void {
+    // [DIAG] start — diagnostic logging only, no logic change
+    console.log('[DIAG-Review] onEditorChange', {
+      total: updated.length,
+      dividers: updated.filter((l) => Array.isArray(l) && l[0] === 'divider').length,
+      with_strong: updated.filter((l) => Array.isArray(l) && l[0] === 'p' && (l[1]?.html?.includes('<strong>') || l[1]?.html?.includes('<b>'))).length,
+      with_italic: updated.filter((l) => Array.isArray(l) && l[0] === 'p' && (l[1]?.html?.includes('<em>') || l[1]?.html?.includes('<i>'))).length,
+      with_color: updated.filter((l) => Array.isArray(l) && l[0] === 'p' && l[1]?.html?.includes('color:')).length,
+      with_hr_in_p: updated.filter((l) => Array.isArray(l) && l[0] === 'p' && l[1]?.html?.includes('<hr')).length
+    });
+    // [DIAG] end
     editableLines = updated;
     editRevision = editRevision + 1;
     scheduleAutosave();
@@ -691,6 +807,12 @@
       autosaveSavedAt = null;
       autosaveDraftVersionNo = 0;
       autosaveError = null;
+      // Defensive: clear `viewingVersionNo` so `loadReviewData`'s
+      // reduce picks the freshest V# without interference from any
+      // stale value left by a previous mount/render of this
+      // component. `loadReviewData` will set it to the highest V#
+      // once the API response arrives.
+      viewingVersionNo = null;
       clearAutosaveTimer();
       if (autosaveAbort) {
         autosaveAbort.abort();
@@ -700,10 +822,6 @@
       loadReviewData(runId);
       refreshDownloadLabel();
       refreshYourAccess(runId);
-      // Stage 4.13 — fetch the autosave draft and apply it on top
-      // of whatever the latest frozen version was. This makes a
-      // page refresh "resume" the in-progress edits.
-      loadDraftAndApply(runId);
     }
   });
 
@@ -716,44 +834,6 @@
     return () => clearInterval(handle);
   });
 
-async function loadDraftAndApply(runId: string): Promise<void> {
-    // Stage 4.14 — multi-draft per run (each session/60s-window gets
-    // its own row). On page load, refresh the list and jump to the
-    // LATEST draft (highest V# = newest 60s window).
-    try {
-      const vs = await listVersions(runId);
-      versionsLoaded = vs;
-      setVersions(vs);
-      const drafts = vs
-        .filter((v) => v.kind === 'draft')
-        .sort((a, b) => b.version_no - a.version_no);
-      if (drafts.length === 0) return;
-      const latestDraft = drafts[0];
-      viewingVersionNo = latestDraft.version_no;
-      setCurrentVersionNo(latestDraft.version_no);
-      viewingVersionByRunId = new Map(viewingVersionByRunId).set(
-        runId,
-        latestDraft.version_no
-      );
-      autosaveEditCount = latestDraft.edit_count ?? 1;
-      autosaveSavedAt = latestDraft.modified_at;
-      autosaveDraftVersionNo = latestDraft.version_no;
-      try {
-        const resp = await getVersion(runId, latestDraft.version_no);
-        if (resp && Array.isArray(resp.lines_json)) {
-          editableLines = resp.lines_json as PreviewLine[];
-          editRevision = editRevision + 1;
-          savedRevision = editRevision;
-          if (typeof editorRef?.applyExternalContent === 'function') {
-            await tick();
-            editorRef.applyExternalContent(editableLines);
-          }
-        }
-      } catch { /* ignore */ }
-      nowTick = Date.now();
-    } catch { /* ignore — fall back to frozen view */ }
-  }
-
   function onPickerChange(e: Event): void {
     const target = e.target as HTMLSelectElement | null;
     if (!target) return;
@@ -763,7 +843,7 @@ async function loadDraftAndApply(runId: string): Promise<void> {
     setActiveRun(runId, entry ? entry.name : null);
   }
 
-  function doDownload(): void {
+  async function doDownload(): Promise<void> {
     const runId = activeRunId;
     if (!runId) return;
     // Always download the LATEST PUBLISHED version of this run —
@@ -776,6 +856,17 @@ async function loadDraftAndApply(runId: string): Promise<void> {
     if (sourceName) {
       const stem = sourceName.replace(/\.[^/.]+$/, '');
       customName = `${stem}.docx`;
+    }
+    // Flush any pending autosave BEFORE download so the latest edits
+    // are in the draft row that Publish will pick up on the next
+    // user click. Without this, edits within the 1.5s debounce window
+    // miss the next publish step.
+    try {
+      if (editorDirty) {
+        await flushAutosave();
+      }
+    } catch {
+      /* non-fatal — keep current view intact on flush failure */
     }
     downloadDocx(runId, customName, null);
     if (downloadBtn) downloadBtn.classList.add('hidden');

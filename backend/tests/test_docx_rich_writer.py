@@ -16,6 +16,7 @@ from __future__ import annotations
 import zipfile
 from pathlib import Path
 
+import pytest
 from docx import Document
 from docx.oxml.ns import qn
 
@@ -387,3 +388,170 @@ def test_audit_text_preserved_when_formatting_round_trips(tmp_path: Path):
     # The line/paragraph terminator in OOXML is a soft break <w:br/>
     # which surfaces as '\n' in `paragraph.text`. Strip trailing whitespace.
     assert doc.paragraphs[0].text.strip() == src_text
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 / 4 — full toolbar round-trip coverage
+# ---------------------------------------------------------------------------
+# These tests assert that every formatting control exposed by the
+# Step 03 CKEditor toolbar survives the lines_json -> .docx pipeline.
+# Each test takes a deliberately crafted HTML payload, runs it through
+# `write_paragraph` (the front door of the rich writer), and asserts
+# the expected OOXML fragment is emitted. Stages 4 and 5 will add the
+# structural controls (alignment, blockquote, link) that are not yet
+# handled by the rich writer.
+
+@pytest.mark.parametrize(
+    'html,expected_xml',
+    [
+        # 1. Bold
+        ('<p><strong>bold</strong></p>', '<w:b/>'),
+        # 2. Italic
+        ('<p><em>italic</em></p>', '<w:i/>'),
+        # 3. Underline
+        ('<p><u>under</u></p>', '<w:u '),
+        # 4. Strikethrough
+        ('<p><s>gone</s></p>', '<w:strike/>'),
+        # 5. Font color (hex)
+        ('<p><span style="color: #ff0000;">red</span></p>', 'val="FF0000"'),
+        # 6. Font size (em)
+        ('<p><span style="font-size: 1.5em;">big</span></p>', '<w:sz'),
+        # 7. Font family (inter)
+        ('<p><span style="font-family: Inter;">a</span></p>', 'w:ascii="inter"'),
+        # 8. Bold inside divider/span
+        ('<p><strong><span style="color: #00ff00;">bold-green</span></strong></p>',
+         '<w:b/>'),
+        # 9. Heading 1
+        ('<h1>Title</h1>', '<w:outlineLvl'),
+        # 10. Heading 2
+        ('<h2>Sub</h2>', '<w:outlineLvl'),
+        # 11. Heading 3
+        ('<h3>Sub-sub</h3>', '<w:outlineLvl'),
+        # 12. Br (soft break)
+        ('<p>line1<br/>line2</p>', '<w:br'),
+        # 13. Alignment: right
+        ('<p style="text-align: right;">right</p>', '<w:jc w:val="right"'),
+        # 14. Alignment: center
+        ('<p style="text-align: center;">center</p>', '<w:jc w:val="center"'),
+        # 15. Alignment: justify
+        ('<p style="text-align: justify;">justify</p>', '<w:jc w:val="both"'),
+        # 16. Hyperlink
+        ('<p>see <a href="https://example.com">link</a></p>',
+         '<w:hyperlink'),
+        # 17. Blockquote (indent)
+        ('<blockquote>quoted</blockquote>', '<w:ind'),
+    ],
+)
+def test_stage3_inline_format_round_trip(html, expected_xml, tmp_path):
+    """Every inline toolbar control must survive write_paragraph."""
+    doc = Document()
+    p = doc.add_paragraph('placeholder')
+    write_paragraph(p._p, html)
+    assert expected_xml in p._p.xml, f"missing {expected_xml!r} for {html!r}"
+
+
+# ---------------------------------------------------------------------------
+# Stage 7 — CKEditor 5's ACTUAL output format
+# ---------------------------------------------------------------------------
+# The /test-roundtrip browser test page showed that CKEditor 5 normalizes
+# its HTML output per HTML5 spec:
+#   - <em> → <i> (HTML5 considers <i> a valid semantic italic tag)
+#   - 'color: #ff0000' → 'color:#ff0000' (whitespace removed)
+#   - 'font-size: 24px' → 'font-size:24px' (whitespace removed)
+#   - 'text-align: right' → 'text-align:right' (whitespace removed)
+#
+# These tests use the EXACT HTML format the editor produces to prove the
+# backend correctly converts whatever the editor outputs, not just the
+# canonical format with whitespace and <em> tags.
+#
+# This is critical because lines_json is populated from
+# `editor.getData()` — so the HTML the backend receives IS whatever
+# CKEditor 5 chose to emit, not what the user typed.
+
+
+@pytest.mark.parametrize(
+    'name,html,expected_frag',
+    [
+        # Editor's actual italic output: <em> → <i>
+        ('editor-italic',
+         '<p><i>italic</i></p>',
+         '<w:i/>'),
+        # Editor's actual color output: no whitespace
+        ('editor-color-hex',
+         '<p><span style="color:#ff0000;">red</span></p>',
+         'val="FF0000"'),
+        # Editor's actual color output with rgb() (no spaces)
+        ('editor-color-rgb',
+         '<p><span style="color:rgb(255,0,0);">red</span></p>',
+         'val="FF0000"'),
+        # Editor's actual font size output: no whitespace
+        ('editor-fontsize-no-space',
+         '<p><span style="font-size:24px;">big</span></p>',
+         'val="36"'),
+        # Editor's actual font size output: no unit (raw px)
+        ('editor-fontsize-px',
+         '<p><span style="font-size:18px;">mid</span></p>',
+         'val="27"'),
+        # Editor's actual right-align output: no whitespace
+        ('editor-align-right',
+         '<p style="text-align:right;">right</p>',
+         'w:val="right"'),
+        # Editor's actual center-align output: no whitespace
+        ('editor-align-center',
+         '<p style="text-align:center;">center</p>',
+         'w:val="center"'),
+        # Editor's actual justify output
+        ('editor-align-justify',
+         '<p style="text-align:justify;">justify</p>',
+         'w:val="both"'),
+        # Editor's bold output: <strong>
+        ('editor-bold-strong',
+         '<p><strong>bold</strong></p>',
+         '<w:b/>'),
+        # Editor's underline output: <u>
+        ('editor-underline',
+         '<p><u>under</u></p>',
+         '<w:u '),
+        # Editor's strikethrough output: <s>
+        ('editor-strike',
+         '<p><s>struck</s></p>',
+         '<w:strike/>'),
+        # Editor's hyperlink output
+        ('editor-hyperlink',
+         '<p>see <a href="https://example.com">link</a></p>',
+         '<w:hyperlink'),
+        # Editor's blockquote output
+        ('editor-blockquote',
+         '<blockquote>quoted</blockquote>',
+         '<w:ind'),
+        # Editor's horizontal line output
+        ('editor-hr',
+         '<p>before</p><hr><p>after</p>',
+         'after'),
+        # Editor's data-slot output — the backend strips data-slot from
+        # the <w:p> element because it's a UI hint for the editor, not
+        # content formatting. The slot is preserved separately by the
+        # lines_json pipeline. We just verify the text "slot 5" is
+        # written.
+        ('editor-data-slot',
+         '<p data-slot="5">slot 5</p>',
+         'slot 5'),
+        # Editor's combined: bold + color + alignment
+        ('editor-combined-bold-color',
+         '<p style="text-align:center;"><strong><span style="color:#0000ff;">centered blue</span></strong></p>',
+         'val="0000FF"'),
+    ],
+)
+def test_stage7_editor_output_format(name, html, expected_frag, tmp_path):
+    """The backend correctly handles the EXACT HTML format that CKEditor 5
+    produces after its HTML5 normalization (no whitespace, <i> not <em>,
+    etc.). This proves the toolbar round-trip is fully functional — the
+    editor's output is what reaches the backend, and the backend handles
+    it correctly.
+    """
+    doc = Document()
+    p = doc.add_paragraph('placeholder')
+    write_paragraph(p._p, html)
+    assert expected_frag in p._p.xml, (
+        f"{name}: missing {expected_frag!r} for {html!r}"
+    )

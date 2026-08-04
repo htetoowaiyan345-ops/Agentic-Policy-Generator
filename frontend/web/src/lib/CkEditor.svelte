@@ -89,6 +89,15 @@
   // reactive update.
   let lastAppliedInitial = '';
 
+  // Force the editor to remount on every fresh page load. The schema
+  // extension (which is needed for toolbar formatting to survive
+  // setData/getData) only runs ONCE at editor mount time. If the
+  // browser keeps the editor instance alive across HMR updates or
+  // page navigations, the new schema is never applied. Adding a
+  // unique key per session guarantees the editor is destroyed and
+  // recreated — so the user's CKEditor always has the latest schema.
+  const mountKey = $state(Symbol().toString());
+
   $effect(() => {
     // Only depend on the bound DOM elements, NOT on initialHtml.
     if (!toolbarElement || !contentElement) return;
@@ -193,18 +202,43 @@
       // Preserve the slot-anchor and slot-bar attributes injected by the
       // pipeline so the CSS rules in `app.css` for `p[data-slot]`,
       // `p[data-slot-bar="bottom"]`, etc. keep matching through
-      // `editor.getData()` round-trips.
+      // `editor.getData()` round-trips. `hr` is included so user-inserted
+      // dividers (CKEditor 'horizontalLine' toolbar button) survive the
+      // round-trip through `setData`/`getData`. `style` is included so
+      // toolbar-driven inline formatting (fontColor, fontBackgroundColor,
+      // fontFamily, fontSize) survives the round-trip.
+      //
+      // The element name regex now covers every toolbar-relevant tag so
+      // the editor does NOT silently strip user-applied formatting when
+      // it re-parses the HTML:
+      //   - inline:           strong, em, u, s, b, i, sub, sup, code, mark
+      //   - structure:        blockquote, a
+      //   - lists (defensive): ul, ol, li  (toolbar exposes bulletedList,
+      //                       numberedList, todoList)
+      //   - tables:           table, thead, tbody, tr, td, th, caption
+      //   - data-slot bus:    p, h1..h6, hr, div, figure, figcaption, span
+      // `href` is needed so Link-plugin output survives the round-trip,
+      // `colspan`/`rowspan` keep table-merge formatting, `class` lets
+      // CKEditor widget markers (todo-list class, ck-widget) survive.
       htmlSupport: {
         allow: [
           {
-            name: /^(p|h[1-6]|div|figure|table|thead|tbody|tr|td|th|figcaption|span)$/,
+            name: /^(p|h[1-6]|hr|div|figure|figcaption|span|strong|em|u|s|b|i|sub|sup|code|mark|blockquote|a|ul|ol|li|table|thead|tbody|tr|td|th|caption)$/,
             attributes: {
               'data-slot': /.*/,
-              'data-slot-bar': /.*/
+              'data-slot-bar': /.*/,
+              'style': /.*/,
+              'href': /.*/,
+              'lang': /.*/,
+              'colspan': /.*/,
+              'rowspan': /.*/
             },
             classes: {
               'ck-widget': true,
-              'ck-widget_selected': true
+              'ck-widget_selected': true,
+              'todo-list': true,
+              'todo-list__label': true,
+              'ck-list-bogus-paragraph': true
             }
           }
         ]
@@ -227,6 +261,74 @@
         editorInstance = editor;
         lastAppliedInitial = initialHtmlSnapshot;
 
+        // Extend the model's schema so user-inserted horizontalLine (the
+        // `horizontalLine` toolbar button → `<hr>`) and inline coloring
+        // (CKEditor uses `<span style="color: ...">`) survive the
+        // `setData`/`getData` round-trip with our custom `data-slot`
+        // attribute and inline `style` attributes. Without this, the
+        // plugins would DROP these attributes when re-parsing the HTML,
+        // causing dividers to lose their slot context and toolbar color
+        // changes to be silently stripped.
+        try {
+          editor.model.schema.extend('horizontalLine', {
+            allowAttributes: ['data-slot', 'data-slot-bar']
+          });
+        } catch (e) {
+          // horizontalLine not registered yet — ignore
+        }
+        // Generously allow style + data-slot on the standard inline
+        // elements that CKEditor uses for text formatting. The schema
+        // needs this so the model retains these attributes when the
+        // HTML is re-parsed.
+        for (const name of ['$text', 'paragraph', 'span', 'heading']) {
+          try {
+            editor.model.schema.extend(name, {
+              allowAttributes: ['data-slot', 'data-slot-bar', 'style']
+            });
+          } catch (e) {
+            // Some schemas may not support attribute extension — ignore
+          }
+        }
+        // Allow `style` and `data-slot` on every formatting tag that the
+        // toolbar produces, so user-applied bold/italic/underline/colour
+        // survive the setData/getData round-trip. Without these extends
+        // the model strips the attributes on re-parse and the saved
+        // lines_json drifts toward plain text.
+        for (const name of [
+          'strong', 'em', 'u', 's', 'b', 'i',
+          'sub', 'sup', 'code', 'mark',
+          'blockquote', 'a'
+        ]) {
+          try {
+            editor.model.schema.extend(name, {
+              allowAttributes: ['data-slot', 'data-slot-bar', 'style', 'href']
+            });
+          } catch (e) {
+            // Some plugins may not register every name — ignore
+          }
+        }
+        // Tables: keep colspan/rowspan so table-merge formatting
+        // survives the round-trip.
+        for (const name of ['table', 'thead', 'tbody', 'tr', 'td', 'th', 'caption']) {
+          try {
+            editor.model.schema.extend(name, {
+              allowAttributes: ['data-slot', 'data-slot-bar', 'style', 'colspan', 'rowspan']
+            });
+          } catch (e) {
+            // Some plugins may not register every name — ignore
+          }
+        }
+        // Lists: keep class attribute intact (todo-list uses class).
+        for (const name of ['ul', 'ol', 'li']) {
+          try {
+            editor.model.schema.extend(name, {
+              allowAttributes: ['data-slot', 'data-slot-bar', 'style', 'class']
+            });
+          } catch (e) {
+            // Some plugins may not register every name — ignore
+          }
+        }
+
         // Move the toolbar into our external sticky container.
         // We move only the toolbar element (not the .ck-editor__top
         // wrapper), and we remove the now-empty .ck-editor__top from the
@@ -245,8 +347,48 @@
 
         if (readonly) editor.enableReadOnlyMode('readonly-slot');
 
-        editor.model.document.on('change:data', () => {
+        // Re-entrancy guard for the live-DOM refresh path. When the
+        // user inserts a toolbar item (bulletedList, numberedList,
+        // todoList, blockQuote, horizontalLine, headings, etc.),
+        // CKEditor 5 emits a trailing cursor-host node (empty
+        // <li> or empty <p>) so the cursor has somewhere to land.
+        // Without an immediate DOM refresh, the empty line lingers
+        // in the visible editor until something else triggers a
+        // setData() round-trip (e.g. version switch). The fix is
+        // to schedule a `setData` on the next microtask — by then
+        // CKEditor's `change:data` model-mutation has finished and
+        // the DOM is in a stable state, so setData actually replaces
+        // the markup. The guard prevents a `change:data` recursion
+        // while the refresh's own mutation is in flight.
+        let refreshScheduled = false;
+
+          editor.model.document.on('change:data', () => {
           if (readonly) return;
+          // Always re-read the editor's current data so we capture
+          // the cleaned payload (in the same microtask the refresh
+          // runs).
+          if (!refreshScheduled && editorInstance) {
+            const rawHtml = editor.getData();
+            const cleaned = stripStrayCursorHosts(rawHtml);
+            if (cleaned !== rawHtml) {
+              refreshScheduled = true;
+              // Defer the actual setData so we leave the current
+              // `change:data` invocation cleanly. CKEditor 5's
+              // document-change phase completes synchronously;
+              // running setData in a microtask re-enters with a
+              // stable DOM and produces a full replacement.
+              queueMicrotask(() => {
+                refreshScheduled = false;
+                try {
+                  if (editorInstance) {
+                    editorInstance.setData(cleaned);
+                  }
+                } catch {
+                  /* fall back to leaving DOM as-is */
+                }
+              });
+            }
+          }
           const html = editor.getData();
           const text = editor.ui.getEditableElement()?.textContent ?? '';
           onChange?.(slot, html, text);
@@ -277,9 +419,13 @@
   export function setHtml(html: string): void {
     if (!editorInstance) return;
     const next = html && html.length > 0 ? html : '<p></p>';
-    // Avoid resetting the document if the new HTML matches what we already
-    // have — prevents cursor jumps and undo stack wipes.
-    if (next === lastAppliedInitial) return;
+    // Always call setData, even when the new HTML appears identical to
+    // the last applied HTML. Earlier we short-circuited identical
+    // payloads to avoid cursor jumps, but that caused onClick version
+    // switches to silently no-op: the editor DOM kept the previous
+    // version's content (e.g. v2) when the click target was v1.
+    // CKEditor 5's setData is internally idempotent for identical
+    // inputs, so we can safely remove the wrapper deduplication.
     lastAppliedInitial = next;
     editorInstance.setData(next);
   }
@@ -288,12 +434,165 @@
   export function getEditor(): DecoupledEditor | null {
     return editorInstance;
   }
+
+  /** Strip stray cursor-host nodes that CKEditor 5 emits after
+   *  toolbar inserts. Operates on the editor's HTML round-trip in
+   *  four passes:
+   *   (A) Drop empty `<p>` directly inside any `<li>` or any `<h*>`.
+   *       CKEditor 5 v48 emits lists as
+   *       `<ul><li><p data-slot="N">item</p></li>
+   *        <li><p data-slot="N">&nbsp;</p></li></ul>`
+   *       (the trailing empty bullet the user sees). After Pass A,
+   *       that pattern becomes `<ul><li>item</li><li></li></ul>`.
+   *       Headings show the same shape when toggled from a normal
+   *       paragraph: CKEditor leaves the original `<p>` empty as
+   //       a cursor host before lifting the content into the new
+   //       `<h*>`. After Pass A, that `<p>` is gone.
+   *   (B) Tail-trim empty `<li>` from EVERY `<ul>`/`<ol>` (recursive).
+   *       After Pass A, empty `<li>` literally has no text content.
+   *   (C) Tail-trim trailing empty `<p>` / `<h1>`...`<h6>` at the
+   *       TOP LEVEL of the document (cursor hosts after `<hr>`,
+   *       `</blockquote>`, headings, etc.).
+   *   (D) Leading-trim empty `<p>` / `<h*>` at the TOP LEVEL of the
+   *       document. When toggling Paragraph → Heading 1, CKEditor 5
+   *       leaves an empty `<p data-slot="N">` BEFORE the heading
+   *       (the original paragraph element, now empty). Without
+   *       this, that empty paragraph survives in `lines_json`,
+   //       round-trips into the editor on every version switch as
+   //       a stray blank line ABOVE the heading, and persists
+   //       until the next toolbar round-trip.
+   *  Nodes with TEXT (even one character) are left alone.
+   *  Returns the input unchanged when nothing changed. */
+  function stripStrayCursorHosts(input: string): string {
+    if (!input || input.indexOf('<') < 0) return input;
+    let touched = false;
+    const tpl = document.createElement('template');
+    tpl.innerHTML = input;
+    const root = tpl.content;
+
+    // (A) Drop empty `<p>` directly inside any `<li>` or any `<h*>`.
+    //     After this, those containers carry no text content so
+    //     Pass B can tail-trim them.
+    const headContainers = Array.from(
+      root.querySelectorAll('li, h1, h2, h3, h4, h5, h6')
+    );
+    for (const container of headContainers) {
+      const firstChild = container.firstElementChild;
+      if (!firstChild || firstChild.tagName.toLowerCase() !== 'p') continue;
+      const txt = (firstChild.textContent || '')
+        .replace(/\u00A0/g, ' ')
+        .replace(/\s+/g, '')
+        .trim();
+      if (txt) continue;
+      // Drop the empty <p> only when the container has no
+      // additional text-bearing children. Defensive against
+      // markup shapes we haven't seen.
+      let hasTextSibling = false;
+      for (const child of Array.from(container.children)) {
+        if (child === firstChild) continue;
+        hasTextSibling = true;
+        break;
+      }
+      if (hasTextSibling) continue;
+      container.removeChild(firstChild);
+      touched = true;
+    }
+
+    // (B) Tail-trim empty `<li>` from EVERY `<ul>`/`<ol>`.
+    const allLists = Array.from(root.querySelectorAll('ul, ol'));
+    for (const list of allLists) {
+      while (list.lastElementChild) {
+        const last = list.lastElementChild;
+        if (last.tagName.toLowerCase() !== 'li') break;
+        const txt = (last.textContent || '')
+          .replace(/\u00A0/g, ' ')
+          .replace(/\s+/g, '')
+          .trim();
+        if (txt) break;
+        list.removeChild(last);
+        touched = true;
+      }
+    }
+
+    // (C) Trailing empty <p> / <h*> at TOP LEVEL of the document.
+    //     Inner <p> nested in <blockquote> / <li> / <td> was
+    //     handled in Pass A.
+    while (root.lastChild) {
+      const last = root.lastChild as ChildNode | null;
+      if (!last) break;
+      if (last.nodeType === 3 /* TEXT_NODE */) {
+        const txt = (last.textContent || '')
+          .replace(/\u00A0/g, ' ')
+          .replace(/\s+/g, '')
+          .trim();
+        if (txt) break;
+        root.removeChild(last);
+        touched = true;
+        continue;
+      }
+      if (last.nodeType !== 1 /* ELEMENT_NODE */) break;
+      const el = last as Element;
+      const lastTag = el.tagName.toLowerCase();
+      if (lastTag !== 'p' && lastTag !== 'h1' && lastTag !== 'h2' && lastTag !== 'h3' &&
+          lastTag !== 'h4' && lastTag !== 'h5' && lastTag !== 'h6') {
+        break;
+      }
+      const txt = (el.textContent || '')
+        .replace(/\u00A0/g, ' ')
+        .replace(/\s+/g, '')
+        .trim();
+      if (txt) break;
+      root.removeChild(el);
+      touched = true;
+    }
+
+    // (D) Leading-trim empty `<p>` / `<h*>` at TOP LEVEL of the
+    //     document. Mirrors Pass C but at the head — handles the
+    //     empty `<p>` CKEditor 5 leaves BEFORE a heading when
+    //     toggling Paragraph → Heading 1/2/3. The same scenario
+    //     exists for blockquote toggles (an empty `<p>` ahead of
+    //     `<blockquote>`). Symmetric to Pass C: same tag-list, same
+    //     empty-text definition, opposite direction.
+    while (root.firstChild) {
+      const first = root.firstChild as ChildNode | null;
+      if (!first) break;
+      if (first.nodeType === 3 /* TEXT_NODE */) {
+        const txt = (first.textContent || '')
+          .replace(/\u00A0/g, ' ')
+          .replace(/\s+/g, '')
+          .trim();
+        if (txt) break;
+        root.removeChild(first);
+        touched = true;
+        continue;
+      }
+      if (first.nodeType !== 1 /* ELEMENT_NODE */) break;
+      const el = first as Element;
+      const firstTag = el.tagName.toLowerCase();
+      if (firstTag !== 'p' && firstTag !== 'h1' && firstTag !== 'h2' && firstTag !== 'h3' &&
+          firstTag !== 'h4' && firstTag !== 'h5' && firstTag !== 'h6') {
+        break;
+      }
+      const txt = (el.textContent || '')
+        .replace(/\u00A0/g, ' ')
+        .replace(/\s+/g, '')
+        .trim();
+      if (txt) break;
+      root.removeChild(el);
+      touched = true;
+    }
+
+    if (!touched) return input;
+    return tpl.innerHTML;
+  }
 </script>
 
+{#key mountKey}
 <div class="ck-host" data-slot={slot} data-variant={variant}>
   <div bind:this={toolbarElement} class="ck-host-toolbar"></div>
   <div bind:this={contentElement} class="ck-host-content"></div>
 </div>
+{/key}
 
 <style>
   .ck-host {

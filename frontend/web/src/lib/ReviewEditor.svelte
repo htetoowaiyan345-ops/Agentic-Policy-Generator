@@ -30,6 +30,7 @@
   import type { Editor as DecoupledEditor } from 'ckeditor5';
   import type { PreviewLine, SlotKind, RichParagraph } from './types';
   import { normalisePreviewLine } from './types';
+  import { tick } from 'svelte';
   import CkEditor from './CkEditor.svelte';
 
   interface Props {
@@ -307,11 +308,78 @@
       } else {
         const rich = b.rich;
         const text = rich.text || '';
-        const inner =
-          rich.html && rich.html.trim().length > 0
-            ? rich.html.replace(/^<p[^>]*>([\s\S]*)<\/p>$/i, '$1')
-            : escapeHtml(text);
-        parts.push(`<p data-slot="${slot}">${inner}</p>`);
+        const rawHtml = (rich.html || '').trim();
+        // Detect rows whose `html` carries a block-level element
+        // other than `<p>`: lists, headings, blockquotes, etc.
+        // These MUST NOT be wrapped in `<p>` (invalid HTML; CKEditor
+        // 5 lifts them out via model normalisation and the empty
+        // outer `<p>` would render as a stray blank line plus
+        // duplicate the block content). We re-emit each shape as a
+        // standalone block, with `data-slot` lifted onto the first
+        // element so `htmlToLines` can map it back on round-trip.
+        const listMatch = /^<(ul|ol)[\s>]/i.exec(rawHtml);
+        const headingMatch = /^(h[1-6])[\s>]/i.exec(rawHtml);
+        const blockquoteMatch = /^<blockquote[\s>]/i.exec(rawHtml);
+        if (listMatch) {
+          // Lift `data-slot="N"` onto the list's first element so the
+          // reverse walk in `htmlToLines` puts the row back in the
+          // correct slot when the editor's `getData` fires after.
+          const lifted = rawHtml.replace(
+            /^<(ul|ol)/i,
+            (_match, tag) => `<${tag} data-slot="${slot}"`
+          );
+          parts.push(lifted);
+        } else if (headingMatch) {
+          // Headings: re-emit as-is with data-slot on the heading
+          // element so subsequent htmlToLines walks retrieve the
+          // right slot. Wrapping `<h*>` inside `<p>` would cause
+          // CKEditor 5 to split them on parse, producing duplicates.
+          const lifted = rawHtml.replace(
+            /^<h[1-6]/i,
+            (match) => `${match} data-slot="${slot}"`
+          );
+          parts.push(lifted);
+        } else if (blockquoteMatch) {
+          // Blockquotes (single-line wrapping preserved) — emit as-is
+          // with data-slot on the `<blockquote>` element.
+          const lifted = rawHtml.replace(
+            /^<blockquote/i,
+            (match) => `${match} data-slot="${slot}"`
+          );
+          parts.push(lifted);
+        } else {
+          // Detect legacy rows where a block-level element (heading,
+          // blockquote) was wrapped inside `<p>...</p>` from earlier
+          // broken round-trips. We must lift the block back out so
+          // CKEditor 5 doesn't split it via model normalisation and
+          // leave an empty trailing paragraph (a duplicate that
+          // persists through version switches).
+          let unwrapped = rawHtml;
+          const legacyWrap = /^<p[^>]*>([\s\S]*)<\/p>$/i.exec(rawHtml);
+          let lifted = false;
+          if (legacyWrap && /^<(h[1-6]|blockquote|ul|ol)[\s>]/i.test(legacyWrap[1])) {
+            unwrapped = legacyWrap[1];
+            lifted = true;
+          }
+          const inner =
+            unwrapped.length > 0 && !lifted
+              ? unwrapped.replace(/^<p[^>]*>([\s\S]*)<\/p>$/i, '$1')
+              : unwrapped;
+          if (lifted && /^<(h[1-6])[\s>]/i.test(unwrapped)) {
+            // Re-emit the heading standalone with data-slot lifted
+            // onto it.
+            const tag = /^<(h[1-6])/i.exec(unwrapped)![1];
+            parts.push(
+              `<${tag} data-slot="${slot}">${unwrapped.replace(/^<h[1-6][^>]*>/i, '').replace(/<\/h[1-6]>$/i, '')}</${tag}>`
+            );
+          } else if (lifted && /^<blockquote[\s>]/i.test(unwrapped)) {
+            parts.push(
+              `<blockquote data-slot="${slot}">${unwrapped.replace(/^<blockquote[^>]*>/i, '').replace(/<\/blockquote>$/i, '')}</blockquote>`
+            );
+          } else {
+            parts.push(`<p data-slot="${slot}">${inner}</p>`);
+          }
+        }
 
         if (/^Functional Area(?:\(s\))?\s*:/i.test(text)) {
           parts.push(`<p data-slot-bar="functional-area"></p>`);
@@ -343,7 +411,7 @@
     tpl.innerHTML = html;
     const blocks = Array.from(
       tpl.content.querySelectorAll(
-        'p, h1, h2, h3, h4, h5, h6, li, blockquote, pre, hr, table, thead, tbody, tr, th, td'
+        'p, h1, h2, h3, h4, h5, h6, li, ul, ol, blockquote, pre, hr, table, thead, tbody, tr, th, td'
       )
     ).filter((el) => {
       const tag = el.tagName.toLowerCase();
@@ -356,6 +424,37 @@
       // paragraphs are filtered — they are Step 03 UI only.
       if (tag === 'p' && el.getAttribute('data-slot-bar') != null) {
         return false;
+      }
+      // Drop CKEditor 5's empty bogus paragraph that follows a list
+      // (bulletedList / numberedList / todoList). CKEditor appends an
+      // empty `<p class="ck-list-bogus-paragraph">` after each list to
+      // host the cursor; without this filter the empty `<p>` is
+      // emitted in addition to the `<li>`, producing a duplicate empty
+      // paragraph in `lines_json` on every toolbar click. The class is
+      // already preserved through `setData`/`getData` by the
+      // `htmlSupport.allow.classes` allow-list in `CkEditor.svelte`.
+      // Blockquote is intentionally NOT covered here (per user scope).
+      if (
+        tag === 'p' &&
+        el.classList.contains('ck-list-bogus-paragraph')
+      ) {
+        return false;
+      }
+      // Drop a `<p>` whose closest list/block-container ancestor is a
+      // `<li>` — because the FIRST sibling `<li>` already emits the
+      // WHOLE `<ul>`/`<ol>` (including its `<p>` inner content) as one
+      // `lines_json` row. Without this filter the inner `<p>` would
+      // also be emitted as its own row, duplicating the list text in
+      // `lines_json` (visible as duplicates after toolbar clicks AND
+      // after version-switch round-trips). Scope is narrow: only
+      // `<p>` inside `<li>` is filtered. `<p>` inside `<blockquote>`,
+      // top-level paragraphs, and the trailing `ck-list-bogus-
+      // paragraph` are unaffected (handled above).
+      if (tag === 'p') {
+        const inListItem = el.closest('li');
+        if (inListItem) {
+          return false;
+        }
       }
       return true;
     });
@@ -412,6 +511,17 @@
       if (tag === 'thead' || tag === 'tbody' || tag === 'tr' || tag === 'th' || tag === 'td') {
         continue;
       }
+      // Skip <ul>/<ol> container elements themselves — their first
+      // <li> child already emits the whole list as one row below. If
+      // we let `<ul>` fall through to the regular wrap, it would emit
+      // a SEPARATE row that wraps the same `<li>` text — duplicating
+      // the list in `lines_json` and producing visible duplicates
+      // after every toolbar click AND after every version switch
+      // round-trip. Blockquote / paragraph fallback paths are
+      // untouched.
+      if (tag === 'ul' || tag === 'ol') {
+        continue;
+      }
       // User-inserted <hr> via CKEditor toolbar → preserve as a divider
       // marker. The renderer detects 'divider' kind entries and inserts
       // a divider paragraph with the appropriate margins. Decorative
@@ -421,21 +531,168 @@
         out.push(['divider', { slot }]);
         continue;
       }
+      // Group consecutive <li> siblings under one <ul>/<ol> into a
+      // single `lines_json` row. The FIRST <li> of a list emits the
+      // WHOLE list once (its outerHTML), carrying the slot attribute
+      // lifted onto the list element so `buildUnifiedInitialHtml` can
+      // re-emit the bullets verbatim when `setData` round-trips.
+      // Subsequent <li> siblings AND nested <li>s (inside another
+      // <li>'s subtree) skip — they would otherwise duplicate the
+      // list markup because the OUTER `<li>`'s row already contains
+      // the entire `<ul>`/`<ol>` HTML recursively.
+      if (tag === 'li') {
+        // Skip nested <li> — the OUTER `<li>`'s row already
+        // captured the entire subtree via parentList.outerHTML.
+        if (el.closest('li') !== el) {
+          flushTable();
+          continue;
+        }
+        const listParent = el.parentElement;
+        if (listParent) {
+          const pTag = listParent.tagName.toLowerCase();
+          if (pTag === 'ul' || pTag === 'ol') {
+            // Check whether a previous <li> already emitted this list.
+            let prev = el.previousElementSibling;
+            let prevIsLi = false;
+            while (prev) {
+              if (prev.tagName.toLowerCase() === 'li') {
+                prevIsLi = true;
+                break;
+              }
+              prev = prev.previousElementSibling;
+            }
+            if (prevIsLi) {
+              flushTable();
+              continue;
+            }
+            // First <li> — capture the whole list once.
+            // Strip TRAILING empty/whitespace-only <li>s that CKEditor
+            // 5 emits at end-of-list to host the cursor; otherwise the
+            // editor renders a stray empty bullet (•) after the real
+            // items, and the .docx writer emits an empty `<w:p>` with
+            // `<w:numPr>`. "Empty" includes <li> with only `<br>` or
+            // `&nbsp;` — CKEditor 5 uses those to keep the cursor
+            // visible inside the empty item; from the user's POV
+            // they're empty. Inner empty `<li>`s (between siblings)
+            // are preserved; only the TAIL is trimmed. If every
+            // `<li>` was empty, we skip emitting a row entirely so
+            // we don't write a stray empty bullet line to
+            // lines_json.
+            let listHtml = listParent.outerHTML;
+            try {
+              const clone = document.createElement('div');
+              clone.innerHTML = listHtml;
+              const clonedList = clone.firstElementChild;
+              if (clonedList) {
+                while (clonedList.lastElementChild) {
+                  const lastChild = clonedList.lastElementChild;
+                  if (lastChild.tagName.toLowerCase() !== 'li') break;
+                  // Empty-or-whitespace-only detector: trims ASCII
+                  // whitespace, also normalises &nbsp; (U+00A0) so a
+                  // `<li>&nbsp;</li>` is treated as empty. `<br>`
+                  // counted as empty (it carries no text). An `<li>`
+                  // containing a `<br>` and whitespace still counts
+                  // as "empty" because the user can't see the
+                  // difference and Word would render it as a blank
+                  // bullet.
+                  const rawText = (lastChild.textContent || '');
+                  const trimmed = rawText.replace(/\u00A0/g, ' ').trim();
+                  if (trimmed) break;
+                  clonedList.removeChild(lastChild);
+                }
+                if (!clonedList.firstElementChild) {
+                  flushTable();
+                  continue;
+                }
+                listHtml = clonedList.outerHTML;
+              }
+            } catch {
+              /* on DOM parse failure, keep the original listHtml */
+            }
+            const cleanListText = (listParent.textContent || '')
+              .replace(/\s+$/g, '')
+              .trim();
+            out.push([
+              'p',
+              {
+                slot,
+                text: cleanListText,
+                html: listHtml,
+                footnotes: []
+              }
+            ]);
+            flushTable();
+            continue;
+          }
+        }
+        // <li> not under a real list — fall through to the regular
+        // wrap-below path.
+      }
       flushTable();
       const text = (el.textContent || '').replace(/\s+$/g, '');
       const cleanText = text.replace(/<br\s*\/?>/gi, '').trim();
-      if (!cleanText && tag !== 'p') continue;
+      if (!cleanText && tag !== 'p' && tag !== 'blockquote') continue;
       const innerHtml = el.innerHTML;
-      const wrapTag = (() => {
+      // Pick the wrap tag. Preserve the original block-level tag for
+      // <p>, headings, and <blockquote> so the rich writer can pick up
+      // the blockquote / heading context. Other tags default to <p>.
+      const wrapTag = ((): string => {
         if (tag === 'p') return 'p';
         if (/^h[1-6]$/.test(tag)) return tag;
+        if (tag === 'blockquote') return 'blockquote';
         return 'p';
       })();
-      const wrapped =
-        wrapTag === 'p' ? `<p>${innerHtml}</p>` : `<${wrapTag}>${innerHtml}</${wrapTag}>`;
+      // Lift `data-slot="N"` onto the wrapping element so the saved
+      // `lines_json` row carries the slot. Without this the slot is
+      // embedded only in a parent `<p>` that may not survive
+      // CKEditor 5's normalisation, and the row would round-trip to
+      // slot 0 on the next version switch.
+      let wrapped: string;
+      if (wrapTag === 'p') {
+        if (directSlotAttr != null) {
+          wrapped = `<p data-slot="${slot}">${innerHtml}</p>`;
+        } else {
+          wrapped = `<p>${innerHtml}</p>`;
+        }
+      } else if (directSlotAttr != null) {
+        wrapped = `<${wrapTag} data-slot="${slot}">${innerHtml}</${wrapTag}>`;
+      } else {
+        wrapped = `<${wrapTag}>${innerHtml}</${wrapTag}>`;
+      }
       out.push(['p', { slot, text: cleanText, html: wrapped, footnotes: [] }]);
     }
     flushTable();
+    // Drop TRAILING empty `<p>` row(s) — CKEditor 5 emits them as
+    // cursor hosts after lists, blockquotes, headings, and
+    // dividers. They surface in the editor as a stray empty cursor
+    // line below the toolbar-inserted item (the user sees it BEFORE
+    // any version switch — once they switch, `applyExternalContent`
+    // re-renders from `lines_json` and the autosave round-trip has
+    // already produced the same shape, so the line stays). Without
+    // this post-pass the user sees an empty line under their
+    // list/quote/heading that disappears only on a fresh page load.
+    while (out.length > 0) {
+      const last = out[out.length - 1];
+      if (!Array.isArray(last) || last[0] !== 'p') break;
+      const payload = last[1] as { text?: string; html?: string };
+      const txt = (payload?.text || '').replace(/\u00A0/g, ' ').trim();
+      if (txt) break;
+      out.pop();
+    }
+    // Drop LEADING empty `<p>` row(s) for the same reason — CKEditor
+    // 5 emits an empty `<p data-slot="N">` BEFORE a heading or
+    // blockquote when the user toggles a normal paragraph into a
+    // heading (the previous paragraph element is left empty as a
+    // cursor host). Without this, the user sees a stray blank line
+    // ABOVE their heading that persists through version switches.
+    while (out.length > 0) {
+      const first = out[0];
+      if (!Array.isArray(first) || first[0] !== 'p') break;
+      const payload = first[1] as { text?: string; html?: string };
+      const txt = (payload?.text || '').replace(/\u00A0/g, ' ').trim();
+      if (txt) break;
+      out.shift();
+    }
     if (out.length === 0) {
       out.push(['p', { slot: fallbackSlot, text: fallbackText, html: `<p>${fallbackText}</p>`, footnotes: [] }]);
     }
@@ -448,15 +705,25 @@
 
   /** Replace editor content with `newLines`. Used by Review.svelte on
    *  version jump. Resets history so undo doesn't cross version boundaries.
-   *  Also sets `suppressNextChange = true` so the CKEditor "content
-   *  change" event that fires from `setHtml` is ignored by `onChange`,
-   *  preventing a spurious autosave. */
+   *  Sets `suppressNextChange = true` for the entire synchronous burst of
+   *  `change:data` events that CKEditor 5 fires per `setData` call. The
+   *  flag is released on the next microtask via `tick()` so ALL echoing
+   *  back to the host is suppressed — not just the first one. Without
+   *  this, a multi-event setData (e.g. multiple model mutations from
+   *  schema conversion) leaves the editor's DOM reflecting the new V# but
+   *  `editableLines` overwritten by a stale serialisation — making the
+   *  previous version's content appear in the new V#'s view. */
   export function applyExternalContent(newLines: PreviewLine[]): void {
     history = [];
     redoStack = [];
     suppressNextChange = true;
     if (ckEditorRef) ckEditorRef.setHtml(buildUnifiedInitialHtml(newLines));
     else initialHtml = buildUnifiedInitialHtml(newLines);
+    // Release suppression on the next microtask so all synchronous
+    // change:data events from setData are dropped.
+    tick().then(() => {
+      suppressNextChange = false;
+    });
   }
 
   /** Initial html used on first mount only. */
@@ -471,15 +738,34 @@
   /** CkEditor calls this on every change. Translate to lines and emit
    *  to the host. */
   function onSlotChange(_slot: SlotKind, html: string, text: string): void {
+    // [DIAG] start — diagnostic logging only, no logic change
     if (readonly) return;
     if (suppressNextChange) {
-      suppressNextChange = false;
-      // Still update internal state, but don't emit to the host so
-      // the host's autosave isn't triggered for a programmatic load.
+      // [DIAG] programmatic load (version switch) — change suppressed
+      console.log('[DIAG-RE] suppressed change: editor emitted HTML length=' + html.length);
+      // DO NOT release the flag here — `applyExternalContent` releases it
+      // on the next microtask via `tick().then()`. CKEditor 5 may fire
+      // multiple `change:data` events per setData; we want to drop ALL
+      // events in the synchronous burst, not just the first.
       return;
     }
     pushHistory(lines);
     const next = htmlToLines(html, 0, text);
+    // [DIAG] log what came in and what came out
+    console.log('[DIAG-RE] onSlotChange', {
+      editor_html_length: html.length,
+      editor_html_has_strong: html.includes('<strong>'),
+      editor_html_has_italic: html.includes('<em>') || html.includes('<i>'),
+      editor_html_has_color: html.includes('color:'),
+      editor_html_has_hr: html.includes('<hr'),
+      htmlToLines_total: next.length,
+      htmlToLines_dividers: next.filter((l) => Array.isArray(l) && l[0] === 'divider').length,
+      htmlToLines_with_strong: next.filter((l) => Array.isArray(l) && l[0] === 'p' && (l[1]?.html?.includes('<strong>') || l[1]?.html?.includes('<b>'))).length,
+      htmlToLines_with_italic: next.filter((l) => Array.isArray(l) && l[0] === 'p' && (l[1]?.html?.includes('<em>') || l[1]?.html?.includes('<i>'))).length,
+      htmlToLines_with_color: next.filter((l) => Array.isArray(l) && l[0] === 'p' && l[1]?.html?.includes('color:')).length,
+      htmlToLines_with_hr_in_p: next.filter((l) => Array.isArray(l) && l[0] === 'p' && l[1]?.html?.includes('<hr')).length
+    });
+    // [DIAG] end
     emitChange(next);
   }
 </script>

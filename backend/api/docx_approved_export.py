@@ -150,25 +150,35 @@ def _set_paragraph_text(p, new_text: str) -> None:
 
 
 def _set_paragraph_rich(p, html: str, plain_text_fallback: str,
-                        footnote_id_map: dict | None = None) -> None:
+                        footnote_id_map: dict | None = None,
+                        doc=None) -> None:
     """Replace `p`'s runs with rich ones from `html`. If `html` is empty,
     fall back to plain-text mode so the audit guarantee (verbatim text)
     is preserved. `footnote_id_map` is threaded into the rich writer so
     `<sup data-fn-id="X">` markers get swapped for `<w:footnoteReference>`
-    runs with the right Word-side id."""
+    runs with the right Word-side id. `doc` (optional python-docx
+    Document) is forwarded so `write_paragraph` can attach
+    `<w:numPr>` list-numbering when the source HTML carries
+    `<ul>`/`<ol>` markup — without `doc`, lists render as plain
+    paragraphs (no bullet/number marker)."""
     from api.docx_rich_writer import write_paragraph
     if html:
-        write_paragraph(p._p, html, footnote_id_map=footnote_id_map)
+        # Pass the host part so `<a href="...">` can register the
+        # hyperlink relationship in the document part.
+        write_paragraph(p._p, html, footnote_id_map=footnote_id_map,
+                        part=p.part, doc=doc)
     else:
         _set_paragraph_text(p, plain_text_fallback)
 
 
 def _set_cell_rich(cell_para, html: str, plain_text_fallback: str,
-                   footnote_id_map: dict | None = None) -> None:
+                   footnote_id_map: dict | None = None,
+                   doc=None) -> None:
     """Same as `_set_paragraph_rich` for a table cell's first paragraph."""
     from api.docx_rich_writer import write_paragraph
     if html:
-        write_paragraph(cell_para._p, html, footnote_id_map=footnote_id_map)
+        write_paragraph(cell_para._p, html, footnote_id_map=footnote_id_map,
+                        part=cell_para.part, doc=doc)
     else:
         cell_para.text = plain_text_fallback
 
@@ -538,6 +548,34 @@ def _add_page_field(paragraph, instr_text: str) -> None:
     run._r.append(fldChar_end)
 
 
+def _make_divider_paragraph() -> object:
+    """Build an empty `<w:p>` styled as a divider: top/bottom 160 twips
+    (≈8 px) margins + single bottom border, matching
+    `lines_json_renderer._render_dividers_in_slot`.
+
+    Used by `build_approved_docx` so toolbar-inserted `<hr>` markers
+    render identically in the on-the-fly download path and in the
+    published pipeline."""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    new_p = OxmlElement("w:p")
+    pPr = OxmlElement("w:pPr")
+    spacing = OxmlElement("w:spacing")
+    spacing.set(qn("w:before"), "160")
+    spacing.set(qn("w:after"), "160")
+    pPr.append(spacing)
+    pBdr = OxmlElement("w:pBdr")
+    border = OxmlElement("w:bottom")
+    border.set(qn("w:val"), "single")
+    border.set(qn("w:sz"), "4")
+    border.set(qn("w:space"), "1")
+    border.set(qn("w:color"), "000000")
+    pBdr.append(border)
+    pPr.append(pBdr)
+    new_p.append(pPr)
+    return new_p
+
+
 def build_approved_docx(
     original_docx_path: Path | None,
     approved_lines_json: list,
@@ -602,9 +640,20 @@ def build_approved_docx(
                     _set_paragraph_rich(
                         para, rich.get('html') or '', text,
                         footnote_id_map=footnote_id_map or None,
+                        doc=doc,
                     )
                 else:
                     _set_paragraph_text(para, text)
+            elif kind == 'divider':
+                # Toolbar-inserted `<hr>` marker. Append a divider
+                # paragraph to the body without consuming a brain
+                # template paragraph (the divider is additive).
+                body = doc.element.body
+                sectPr = body.find('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}sectPr')
+                if sectPr is not None:
+                    sectPr.addprevious(_make_divider_paragraph())
+                else:
+                    body.append(_make_divider_paragraph())
             elif kind == 't':
                 try:
                     tbl = next(t_iter)
@@ -629,6 +678,7 @@ def build_approved_docx(
                         _set_cell_rich(
                             cell_para, cell_html, text,
                             footnote_id_map=footnote_id_map or None,
+                            doc=doc,
                         )
         doc.save(output_path)
     else:
@@ -641,6 +691,10 @@ def build_approved_docx(
             if kind == 'p':
                 _slot, text, _rich = _normalise_paragraph_payload(payload)
                 doc.add_paragraph(text)
+            elif kind == 'divider':
+                # Toolbar-inserted `<hr>` marker — append divider
+                # paragraph to the freshly-built document body.
+                doc.element.body.append(_make_divider_paragraph())
             elif kind == 't':
                 _slot, plain_rows, _rich = _normalise_table_payload(payload)
                 if not plain_rows:
