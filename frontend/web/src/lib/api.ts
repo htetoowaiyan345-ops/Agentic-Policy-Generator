@@ -581,6 +581,43 @@ export async function dismissAllNotifications(): Promise<{ ok: boolean; dismisse
   return (await res.json()) as { ok: boolean; dismissed: number };
 }
 
+// Notification: outgoing-share feed ("you shared Project X with
+// <recipient>"). Returned alongside the incoming-shares feed and
+// rendered as a single combined bell list with a per-row direction
+// label ('in' = incoming, 'out' = outgoing).
+export interface SentShareItem {
+  id: number;
+  run_id: string;
+  filename: string;
+  recipient_id: number;
+  recipient_username: string;
+  created_at: string;
+  is_unread: boolean;
+}
+
+export async function getMySentShares(): Promise<SentShareItem[]> {
+  const res = await apiFetch(`${API_BASE}/auth/sent-shares`);
+  if (!res.ok) throw new Error(`getMySentShares failed (${res.status})`);
+  const data = (await res.json()) as { items: SentShareItem[] };
+  return data.items || [];
+}
+
+export async function dismissSentShare(shareId: number): Promise<{ ok: boolean }> {
+  const res = await apiFetch(`${API_BASE}/auth/sent-shares/${shareId}/dismiss`, {
+    method: 'POST'
+  });
+  if (!res.ok) throw new Error(`dismissSentShare failed (${res.status})`);
+  return (await res.json()) as { ok: boolean };
+}
+
+export async function dismissAllSentShares(): Promise<{ ok: boolean; dismissed: number }> {
+  const res = await apiFetch(`${API_BASE}/auth/dismiss-all-sent-shares`, {
+    method: 'POST'
+  });
+  if (!res.ok) throw new Error(`dismissAllSentShares failed (${res.status})`);
+  return (await res.json()) as { ok: boolean; dismissed: number };
+}
+
 export async function assignReviewer(
   runId: string,
   versionNo: number,

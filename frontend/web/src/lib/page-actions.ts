@@ -1,5 +1,5 @@
 import { appState, setActiveRun, setFromHistory } from './stores';
-import { getHistory, getPreview, downloadDocx } from './api';
+import { getHistory, downloadDocx } from './api';
 import { get } from 'svelte/store';
 import type { PreviewData, HistoryEntry, AppState } from './types';
 
@@ -18,6 +18,18 @@ export async function loadResultAndShow(runId: string): Promise<void> {
   const dlAllDone = document.getElementById('download-all-done');
   if (dlAllDone) dlAllDone.classList.add('hidden');
 
+  // Trigger the preview load via Review.svelte's reactive $effect.
+  // The effect watches `activeRunId` (line ~798 of Review.svelte) and
+  // calls `loadPreview(runId)` which sets `previewData`, pushes
+  // `editableLines` into the editor via `applyExternalContent`, and
+  // re-renders the editor with the loaded content.
+  //
+  // Previously this function ALSO called `getPreview(runId)` directly
+  // + `renderSlots(data)` which wrote raw `<p>` / `<table>` elements
+  // into `#slots-container`. That corrupted the Svelte-managed
+  // `<ReviewEditor>` that now lives there — the user would click
+  // "Load result" and see nothing change. Removed: the reactive
+  // $effect handles the preview load correctly.
   setActiveRun(runId, null);
 
   let match: HistoryEntry | null = null;
@@ -40,209 +52,11 @@ export async function loadResultAndShow(runId: string): Promise<void> {
     sel.value = runId;
   }
 
-  try {
-    const data: PreviewData = await getPreview(runId);
-    renderSlots(data);
-    const dlBtn = document.getElementById('download-btn');
-    if (dlBtn) {
-      const current = get(appState);
-      const name = current.activeFilename || 'Policy.docx';
-      const stem = name.replace(/\.[^/.]+$/, '');
-      dlBtn.textContent = `Download ${stem}.docx`;
-    }
-  } catch (e) {
-    const container = document.getElementById('slots-container');
-    if (container) container.textContent = 'Failed to load result: ' + (e instanceof Error ? e.message : String(e));
+  const dlBtn = document.getElementById('download-btn');
+  if (dlBtn) {
+    const current = get(appState);
+    const name = current.activeFilename || 'Policy.docx';
+    const stem = name.replace(/\.[^/.]+$/, '');
+    dlBtn.textContent = `Download ${stem}.docx`;
   }
-}
-
-const MARKER = 'Data is not found in source file';
-
-const SLOT_LABEL_MAP: Record<string, number> = {
-  'Type': 1, 'Policy Title': 1, 'Policy Number': 1,
-  'Applicable Sector(s)': 1, 'Functional Area(s)': 1,
-  'Brief Description': 2,
-  'Effective Date/Period': 3, 'Approved by': 3, 'Prepared by': 3,
-  'Responsible Function(s)': 3, 'Responsible Function Officer(s)': 3,
-  'Supersedes': 3, 'Last Reviewed': 3, 'Applies to': 3,
-  'Reason for Policy': 4,
-  'POLICY STATEMENT': 6,
-  '1. Purpose': 7,
-  '2. Scope & Beneficiaries': 8,
-  '3. Exclusions': 9,
-  '4. Award Structure & Payout Tiers': 10,
-  'Policy Review Note': 11,
-  'DEFINITIONS': 12,
-  'RELATED POLICIES, PROCEDURES, FORMS, GUIDELINES & OTHER RESOURCES': 13,
-  'RELATED POLICIES': 13, 'OTHER RESOURCES': 13,
-  'HISTORY': 14,
-};
-
-function tableSlot(rows: string[][] | undefined): number | null {
-  // Check ALL cells (not just the first) for HISTORY or AWARD signals.
-  // Mirrors backend's `infer_anchor_slots._classify_slot_from_table` so
-  // a HISTORY table with an empty first cell ("dd") still matches.
-  if (!rows || !rows.length) return null;
-  const flat: string[] = [];
-  for (const row of rows) {
-    for (const cell of row) {
-      if (cell != null) flat.push(String(cell).toLowerCase());
-    }
-  }
-  const joined = flat.join(' ');
-  if (joined.includes('history') || joined.includes('version') ||
-      joined.includes('description') || joined.includes('date') ||
-      joined.includes('author') || joined.includes('reviewer')) return 14;
-  if (joined.includes('award') || joined.includes('tier') ||
-      joined.includes('payout') || joined.includes('criteria') ||
-      joined.includes('recognition') || joined.includes('indicative')) return 10;
-  return null;
-}
-
-function slotForLine(text: string): number | null {
-  if (!text) return null;
-  // Section headings use startsWith so user-typed variants like
-  // "HISTORY Htet Oo", "HISTOR JJ", "INTRODUCTION body" all match.
-  // Mirrors backend's `infer_anchor_slots._classify_slot_from_text`.
-  const upper = text.toUpperCase().trim();
-  if (upper.startsWith('HISTORY')) return 14;
-  if (upper.startsWith('INTRODUCTION')) return 5;
-  if (upper.startsWith('POLICY STATEMENT')) return 6;
-  if (upper.startsWith('DEFINITIONS')) return 12;
-  if (upper.startsWith('RELATED POLICIES')) return 13;
-  for (const [label, sid] of Object.entries(SLOT_LABEL_MAP)) {
-    if (text === label) return sid;
-    if (text.startsWith(label + ' ')) return sid;
-    if (text.startsWith(label + ':')) return sid;
-  }
-  return null;
-}
-
-export function renderSlots(data: PreviewData): void {
-  const container = document.getElementById('slots-container');
-  if (!container) {
-    console.warn('[renderSlots] #slots-container not in DOM yet — preview will be empty');
-    return;
-  }
-  container.innerHTML = '';
-
-  const lines = data.lines || [];
-  let activeSlot = 0;
-  let appendedCount = 0;
-
-  lines.forEach((item) => {
-    if (!item || item.length !== 2) return;
-    const kind = item[0];
-    const payload = item[1];
-
-    if (kind === 'p') {
-      const payloadRecord = payload as Record<string, unknown>;
-      const text = (typeof payloadRecord['text'] === 'string'
-        ? (payloadRecord['text'] as string)
-        : '') || (typeof payload === 'string' ? (payload as string) : '');
-      const sid = slotForLine(text);
-      if (sid !== null && sid !== activeSlot && activeSlot !== 0) {
-        const div = document.createElement('div');
-        div.className = 'brain-rule';
-        container.appendChild(div);
-        activeSlot = sid;
-      } else if (sid !== null && activeSlot === 0) {
-        activeSlot = sid;
-      }
-      container.appendChild(buildLine(text));
-      appendedCount += 1;
-    } else if (kind === 't') {
-      const payloadRecord = payload as Record<string, unknown>;
-      const rowsRaw = payloadRecord['rows'];
-      const rows = (Array.isArray(rowsRaw) ? rowsRaw : payload) as unknown as string[][];
-      const sid = tableSlot(rows);
-      if (sid !== null && sid !== activeSlot && activeSlot !== 0) {
-        const div = document.createElement('div');
-        div.className = 'brain-rule';
-        container.appendChild(div);
-        activeSlot = sid;
-      } else if (sid !== null && activeSlot === 0) {
-        activeSlot = sid;
-      }
-      container.appendChild(buildTable(rows) as Node);
-      appendedCount += 1;
-    }
-  });
-
-  console.log(
-    `[renderSlots] appended ${appendedCount} child node(s) to #slots-container (data.lines: ${lines.length})`
-  );
-}
-
-function buildLine(text: string): HTMLElement {
-  const p = document.createElement('p');
-  p.className = 'brain-p';
-
-  if (text === MARKER) {
-    p.className = 'brain-p brain-marker';
-    p.textContent = text;
-    return p;
-  }
-
-  const m = text.match(/^([A-Z][A-Za-z0-9 ()/\-.]+?):\s*(.*)$/);
-  if (m) {
-    const label = m[1];
-    const value = m[2];
-    const lab = document.createElement('span');
-    lab.className = 'brain-p-label';
-    lab.textContent = label + ':';
-    p.appendChild(lab);
-    p.appendChild(document.createTextNode(' '));
-    if (value === MARKER) {
-      const mk = document.createElement('span');
-      mk.className = 'brain-marker-inline';
-      mk.textContent = value;
-      p.appendChild(mk);
-    } else {
-      p.appendChild(document.createTextNode(value));
-    }
-    return p;
-  }
-
-  p.textContent = text;
-  return p;
-}
-
-function buildTable(rows: string[][] | undefined): HTMLElement {
-  if (!rows || !rows.length) {
-    return buildLine('(empty table)');
-  }
-  const wrap = document.createElement('div');
-  wrap.className = 'brain-table-wrap';
-  const table = document.createElement('table');
-  table.className = 'brain-table';
-
-  const header = rows[0];
-  const bodyRows = rows.slice(1);
-  if (header && header.length) {
-    const thead = document.createElement('thead');
-    const trh = document.createElement('tr');
-    header.forEach((h) => {
-      const th = document.createElement('th');
-      th.textContent = h == null ? '' : String(h);
-      trh.appendChild(th);
-    });
-    thead.appendChild(trh);
-    table.appendChild(thead);
-  }
-  if (bodyRows && bodyRows.length) {
-    const tbody = document.createElement('tbody');
-    bodyRows.forEach((r) => {
-      const tr = document.createElement('tr');
-      r.forEach((c) => {
-        const td = document.createElement('td');
-        td.textContent = c == null ? '' : String(c);
-        tr.appendChild(td);
-      });
-      tbody.appendChild(tr);
-    });
-    table.appendChild(tbody);
-  }
-  wrap.appendChild(table);
-  return wrap;
 }

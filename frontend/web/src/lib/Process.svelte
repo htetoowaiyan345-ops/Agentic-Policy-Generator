@@ -3,7 +3,6 @@
   import { appState, setBatch, setActiveRun, setFromHistory } from './stores';
   import { uploadFile, processRun, getStatus, getPreview } from './api';
   import { escapeHtml } from './escape';
-  import { renderSlots } from './page-actions';
   import type { BatchEntry, BatchStatus } from './types';
 
   const STUCK_TIMEOUT_MS = 60000;

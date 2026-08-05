@@ -103,14 +103,70 @@ def init_db():
         if 'dismissed_at' not in pm_cols:
             c.execute("ALTER TABLE project_members ADD COLUMN dismissed_at TEXT")
 
+        # Notification: shared_notifications table — records every "X shared
+        # project Y with Z" event so the sender can later see their own
+        # outgoing shares in the bell ("you shared Project A with bob")
+        # alongside the incoming-shares feed ("alice shared Project B
+        # with you"). One row per (sender, recipient, run) per share event;
+        # re-sharing bumps `created_at`. Per-user dismissal via
+        # `sender_dismissed_at` (only the sender's view is suppressed;
+        # the recipient still sees the incoming notification as before).
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS shared_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                sender_user_id INTEGER NOT NULL,
+                recipient_user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                sender_dismissed_at TEXT,
+                FOREIGN KEY (run_id) REFERENCES runs(run_id),
+                FOREIGN KEY (sender_user_id) REFERENCES users(user_id),
+                FOREIGN KEY (recipient_user_id) REFERENCES users(user_id)
+            )
+        """)
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_shared_notifications_sender
+            ON shared_notifications (sender_user_id, created_at DESC)
+        """)
+        # Per-recipient uniqueness: one share row per (sender, run, recipient).
+        # Re-sharing the same project with the same person updates the
+        # existing row's `created_at` instead of duplicating.
+        sn_cols = {row[1] for row in c.execute("PRAGMA table_info(shared_notifications)").fetchall()}
+        if not sn_cols:
+            pass  # fresh table created above; nothing to migrate yet.
+
         c.commit()
 
 
 def insert_run(run_id, filename, size, source_path=None, created_by_user_id=None):
     """Insert a new run. If `created_by_user_id` is provided, also auto-add
     that user to `project_members` with `access_level='approver'` so they
-    have full access to their own run."""
+    have full access to their own run.
+
+    Stage 4.x — Run History storage cap (per user spec "30 files max"):
+    before inserting, count rows in the `runs` table. If the count is at
+    or above `MAX_RUN_HISTORY`, evict the oldest runs (and all related
+    rows + on-disk .docx) until there's room for the new one. This keeps
+    Run History bounded so the DB + disk don't grow without limit.
+    Eviction is FIFO by `created_at` ascending — the oldest run is
+    removed first, regardless of status. Per spec, all 30 slots count
+    (uploaded, processing, done, failed) so Run History always shows
+    the 30 most recent files regardless of status.
+    """
     with _conn() as c:
+        # Evict oldest runs until there's room for the new one. We evict
+        # BEFORE inserting so the count check uses the post-evict count.
+        existing = c.execute(
+            "SELECT run_id FROM runs ORDER BY created_at ASC"
+        ).fetchall()
+        # How many do we need to evict? `existing` will hold the post-
+        # evict list once we DELETE rows from it. We need to leave at
+        # most MAX_RUN_HISTORY - 1 rows so the new INSERT keeps us at
+        # the cap.
+        evict_count = max(0, len(existing) - (MAX_RUN_HISTORY - 1))
+        for i in range(evict_count):
+            oldest_id = existing[i]['run_id']
+            _evict_run(c, oldest_id)
         c.execute(
             """INSERT INTO runs
                (run_id, filename, file_size_bytes, created_at, status, source_path,
@@ -125,6 +181,59 @@ def insert_run(run_id, filename, size, source_path=None, created_by_user_id=None
                 c, run_id, int(created_by_user_id), 'approver',
                 added_by_user_id=int(created_by_user_id),
             )
+
+
+# Run History storage cap. Per user spec: at most 30 files kept; the
+# 31st upload auto-deletes the oldest. Applies to ALL statuses so Run
+# History always shows the 30 most recent files (uploaded + processing
+# + done + failed). The constant is module-level so tests can patch it
+# if they need a smaller cap for fixtures.
+MAX_RUN_HISTORY = 30
+
+
+def _evict_run(c, run_id: str) -> None:
+    """Delete a single run and everything attached to it: per-run
+    metadata in `runs`, version history (`policy_versions`), draft
+    buffer (`policy_drafts`), review comments, audit entries, project
+    membership rows, and share notifications. The on-disk .docx file
+    (if any) is also removed. Called from `insert_run` to enforce the
+    MAX_RUN_HISTORY cap.
+
+    Order matters: child rows first, then `runs`, so no FK constraints
+    are violated even though `PRAGMA foreign_keys` is OFF in this DB.
+    """
+    # Read the docx_path so we can delete the file from disk after the
+    # DB rows are gone. Errors here are non-fatal — the DB rows are
+    # the canonical record; missing files are tolerated by the
+    # preview/download endpoints.
+    docx_path = None
+    row = c.execute(
+        "SELECT docx_path FROM runs WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    if row:
+        docx_path = row['docx_path']
+    # Delete child rows first. We don't trust CASCADE because
+    # `PRAGMA foreign_keys = 0` and most FKs don't declare ON DELETE.
+    c.execute("DELETE FROM policy_versions WHERE run_id = ?", (run_id,))
+    c.execute("DELETE FROM policy_drafts WHERE run_id = ?", (run_id,))
+    c.execute("DELETE FROM review_comments WHERE run_id = ?", (run_id,))
+    c.execute("DELETE FROM audit_log WHERE run_id = ?", (run_id,))
+    c.execute("DELETE FROM project_members WHERE run_id = ?", (run_id,))
+    c.execute("DELETE FROM shared_notifications WHERE run_id = ?", (run_id,))
+    # Finally the run row itself.
+    c.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+    # Remove the on-disk .docx if it exists. Defensive: Path may be
+    # missing or already gone; we just log and move on.
+    if docx_path:
+        try:
+            p = Path(docx_path)
+            if p.exists():
+                p.unlink()
+        except Exception:
+            # Don't let a filesystem hiccup abort the eviction. The
+            # run row is already gone; the orphaned file will be
+            # garbage-collected on next disk-cleanup pass.
+            pass
 
 
 def update_status(run_id, status, **kwargs):

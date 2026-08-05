@@ -362,6 +362,17 @@ class Handler(BaseHTTPRequestHandler):
         # ("you've been added to <project>" notifications).
         if path == '/api/auth/shared-projects':
             return self.handle_list_shared_projects()
+        # Notification: outgoing-shares feed for the Flow 2 bell
+        # ("you shared Project X with <recipient>" rows).
+        if path == '/api/auth/sent-shares':
+            return self.handle_list_sent_shares()
+        # Notification: per-item dismissal for an outgoing share row.
+        m = re.match(r'^/api/auth/sent-shares/(\d+)/dismiss$', path)
+        if m and self.command == 'POST':
+            return self.handle_dismiss_sent_share(int(m.group(1)))
+        # Notification: bulk-dismiss every outgoing share row for me.
+        if path == '/api/auth/dismiss-all-sent-shares' and self.command == 'POST':
+            return self.handle_dismiss_all_sent_shares()
         # Stage 4.2 Ã¢â‚¬â€ Flow 2 reviewer queue (assigned-to-me).
         if path == '/api/reviewer/queue':
             return self.handle_reviewer_queue()
@@ -1527,6 +1538,49 @@ class Handler(BaseHTTPRequestHandler):
             items = users.get_my_shared_projects(c, user_id)
         return send_json(self, {'items': items})
 
+    def handle_list_sent_shares(self):
+        """GET /api/auth/sent-shares  — Flow 2 outgoing-share feed.
+
+        Returns every share the caller is the SENDER of, joined with the
+        recipient's username and the project's filename. Powers the
+        "you shared Project X with <recipient>" rows in the bell
+        (rendered alongside the incoming-shares feed as a single
+        combined list with a per-row direction label).
+        """
+        from api.auth_middleware import require_auth
+        current = require_auth(self)
+        if current is None:
+            return
+        user_id = current['id']
+        with db._conn() as c:
+            items = users.get_my_sent_shares(c, user_id)
+        return send_json(self, {'items': items})
+
+    def handle_dismiss_sent_share(self, share_id: int):
+        """POST /api/auth/sent-shares/<id>/dismiss  — per-item dismissal
+        for an outgoing share row. Flags `sender_dismissed_at` so the
+        sender's bell stops surfacing it; recipient is unaffected.
+        """
+        from api.auth_middleware import require_auth
+        current = require_auth(self)
+        if current is None:
+            return
+        with db._conn() as c:
+            ok = users.dismiss_sent_share(c, share_id, current['id'])
+        return send_json(self, {'ok': ok})
+
+    def handle_dismiss_all_sent_shares(self):
+        """POST /api/auth/dismiss-all-sent-shares  — bulk-dismiss every
+        outgoing share notification for the current user.
+        """
+        from api.auth_middleware import require_auth
+        current = require_auth(self)
+        if current is None:
+            return
+        with db._conn() as c:
+            n = users.dismiss_all_sent_shares(c, current['id'])
+        return send_json(self, {'ok': True, 'dismissed': n})
+
     def handle_list_project_members(self, run_id):
         """GET /api/runs/<id>/members  Ã¢â‚¬â€ Flow 1 popup listing.
 
@@ -1612,6 +1666,15 @@ class Handler(BaseHTTPRequestHandler):
                 """UPDATE project_members SET last_seen_at = NULL
                    WHERE run_id = ? AND user_id = ?""",
                 (run_id, target_user_id),
+            )
+            # Notification: record the outgoing share so the sender's
+            # bell surfaces "you shared Project X with <recipient>" rows
+            # alongside the incoming feed. Idempotent — re-sharing the
+            # same project with the same person bumps `created_at`
+            # instead of duplicating. Self-share (sender == recipient)
+            # is skipped inside `record_share_event`.
+            users.record_share_event(
+                c, run_id, current['id'], target_user_id,
             )
             member = c.execute(
                 """SELECT pm.access_level,

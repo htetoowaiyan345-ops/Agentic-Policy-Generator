@@ -1352,3 +1352,63 @@ input, select, textarea {
   letter-spacing: 0.04em;
   vertical-align: 1px;
 }
+
+/* Direction tag — small pill on each share row that identifies
+   whether the row is an INCOMING share ("↓ shared" — someone shared
+   with you) or an OUTGOING share ("↑ share" — you shared with
+   someone). Same row pattern for both, only the tag's color + text
+   differ. */
+.nb-row-direction {
+  font-size: 9px;
+  margin-left: 6px;
+  padding: 1px 6px;
+  letter-spacing: 0.04em;
+  vertical-align: 1px;
+  text-transform: uppercase;
+  font-weight: 700;
+  border-radius: 3px;
+  font-family: var(--sans);
+}
+.nb-direction-in {
+  background: rgba(37, 99, 235, 0.15);   /* share-blue */
+  color: #1d4ed8;
+  border: 1px solid rgba(37, 99, 235, 0.35);
+}
+.nb-direction-out {
+  background: rgba(22, 163, 74, 0.15);   /* share-green */
+  color: #15803d;
+  border: 1px solid rgba(22, 163, 74, 0.35);
+}
+/* Outgoing rows get a subtle green left-border accent so the user can
+   spot them at a glance. Incoming rows stay neutral. */
+.nb-row-share-out {
+  border-left: 3px solid rgba(22, 163, 74, 0.5);
+}
+.nb-row-share-in {
+  border-left: 3px solid rgba(37, 99, 235, 0.4);
+}
+/* Small × dismiss button for outgoing rows (recipient doesn't get a
+   dismiss button — only the sender dismisses their own outgoing
+   notifications). */
+.nb-dismiss-btn {
+  background: transparent;
+  border: 1px solid #d1d5db;
+  color: #6b7280;
+  width: 24px;
+  height: 24px;
+  border-radius: 12px;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  font-family: var(--sans);
+}
+.nb-dismiss-btn:hover {
+  background: #f3f4f6;
+  color: #111827;
+  border-color: #9ca3af;
+}

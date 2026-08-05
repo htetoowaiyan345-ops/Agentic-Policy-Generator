@@ -409,15 +409,29 @@ def get_my_shared_projects(conn, user_id: int) -> list[dict]:
     if not user_row:
         return []
     if int(user_row["is_admin"]) == 1:
+        # Admin branch: bell shows ONLY projects where the admin
+        # explicitly added someone via the Share button (filtered via
+        # the `shared_notifications` table). Without this filter, the
+        # admin would see every run in their bell (because admins
+        # implicitly have access to every project via `is_admin=1`),
+        # which violates the "Run History = all files, Notification =
+        # only shared" rule. The same filter logic as the non-admin
+        # branch (added_by_user_id != user_id) is applied via the
+        # JOIN ON `shared_notifications` — admin appearing as the
+        # SENDER of a share row means they used the Share button.
         rows = conn.execute(
-            """SELECT r.run_id, r.filename, r.created_at, r.status,
+            """SELECT DISTINCT r.run_id, r.filename, r.created_at, r.status,
                       'approver' AS your_access,
                       u_creator.username AS shared_by,
                       NULL AS added_at,
                       NULL AS last_seen_at
-               FROM runs r
+               FROM shared_notifications sn
+               JOIN runs r ON r.run_id = sn.run_id
                LEFT JOIN users u_creator ON u_creator.user_id = r.created_by_user_id
-               ORDER BY r.created_at DESC LIMIT 50"""
+               WHERE sn.sender_user_id = ?
+                 AND sn.sender_dismissed_at IS NULL
+               ORDER BY r.created_at DESC LIMIT 50""",
+            (int(user_id),),
         ).fetchall()
     else:
         rows = conn.execute(
@@ -435,6 +449,13 @@ def get_my_shared_projects(conn, user_id: int) -> list[dict]:
                LEFT JOIN users u_added ON u_added.user_id = pm.added_by_user_id
                WHERE pm.user_id = ?
                  AND pm.dismissed_at IS NULL
+                 -- Bell filter: only show projects added via the Share
+                 -- button (added_by_user_id != user_id). The creator is
+                 -- auto-added on upload with added_by_user_id == user_id,
+                 -- so their own uploads don't surface in the bell —
+                 -- they live in Run History instead. Members added by
+                 -- someone else's Share-button click DO surface here.
+                 AND pm.added_by_user_id != pm.user_id
                ORDER BY r.created_at DESC LIMIT 50""",
             (int(user_id),),
         ).fetchall()
@@ -522,6 +543,123 @@ def dismiss_all_notifications(conn, user_id: int) -> int:
     cur = conn.execute(
         """UPDATE project_members SET dismissed_at = ?
            WHERE user_id = ? AND dismissed_at IS NULL""",
+        (_now(), int(user_id)),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def record_share_event(conn, run_id: str, sender_user_id: int,
+                       recipient_user_id: int) -> int:
+    """Record a "X shared project Y with Z" event so the sender can later
+    see their outgoing shares in the bell. Idempotent per
+    (sender, run, recipient) tuple — re-sharing the same project with
+    the same person updates the existing row's `created_at` instead of
+    inserting a duplicate row, so the bell shows one row per recipient
+    regardless of how many times the share was re-saved.
+
+    Skips self-share (sender == recipient) — the project creator is
+    already on the project as `approver` and doesn't need an outgoing
+    share notification to themselves.
+
+    Returns the share notification id (existing row id if updated,
+    new row id if inserted). Returns 0 for self-shares.
+    """
+    if int(sender_user_id) == int(recipient_user_id):
+        return 0
+    existing = conn.execute(
+        """SELECT id FROM shared_notifications
+           WHERE run_id = ? AND sender_user_id = ? AND recipient_user_id = ?""",
+        (run_id, int(sender_user_id), int(recipient_user_id)),
+    ).fetchone()
+    now = _now()
+    if existing:
+        conn.execute(
+            """UPDATE shared_notifications SET created_at = ?,
+                                                sender_dismissed_at = NULL
+               WHERE id = ?""",
+            (now, existing["id"]),
+        )
+        conn.commit()
+        return int(existing["id"])
+    cur = conn.execute(
+        """INSERT INTO shared_notifications
+           (run_id, sender_user_id, recipient_user_id, created_at)
+           VALUES (?, ?, ?, ?)""",
+        (run_id, int(sender_user_id), int(recipient_user_id), now),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def get_my_sent_shares(conn, user_id: int) -> list[dict]:
+    """Return every outgoing share `user_id` is the sender of, joined with
+    the recipient's username and the project's filename. Used by the
+    Flow 2 bell to show "you shared Project X with <recipient>" rows
+    alongside the incoming-shares feed.
+
+    Each row contains:
+      - id              : shared_notifications row id (for per-item dismiss)
+      - run_id          : project id
+      - filename        : project filename
+      - recipient_id    : recipient user_id
+      - recipient_username : recipient's login name
+      - created_at      : when the share was recorded
+      - is_unread       : True if `sender_dismissed_at` IS NULL
+
+    Returns [] for unknown users. Excludes rows where the sender has
+    dismissed the notification.
+    """
+    rows = conn.execute(
+        """SELECT sn.id, sn.run_id, sn.created_at,
+                  sn.recipient_user_id AS recipient_id,
+                  u.username AS recipient_username,
+                  r.filename
+           FROM shared_notifications sn
+           JOIN users u ON u.user_id = sn.recipient_user_id
+           JOIN runs r ON r.run_id = sn.run_id
+           WHERE sn.sender_user_id = ?
+             AND sn.sender_dismissed_at IS NULL
+           ORDER BY sn.created_at DESC LIMIT 50""",
+        (int(user_id),),
+    ).fetchall()
+    return [
+        {
+            "id": int(r["id"]),
+            "run_id": r["run_id"],
+            "filename": r["filename"],
+            "recipient_id": int(r["recipient_id"]),
+            "recipient_username": r["recipient_username"],
+            "created_at": r["created_at"],
+            "is_unread": True,
+        }
+        for r in rows
+    ]
+
+
+def dismiss_sent_share(conn, share_id: int, user_id: int) -> bool:
+    """Per-user dismissal for an outgoing share notification. Flags the
+    row's `sender_dismissed_at` so the sender's bell stops surfacing it;
+    the recipient's incoming notification is unaffected.
+    """
+    cur = conn.execute(
+        """UPDATE shared_notifications SET sender_dismissed_at = ?
+           WHERE id = ? AND sender_user_id = ?
+             AND sender_dismissed_at IS NULL""",
+        (_now(), int(share_id), int(user_id)),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def dismiss_all_sent_shares(conn, user_id: int) -> int:
+    """Bulk-dismiss every outgoing share notification for `user_id` in
+    one shot. Returns the number of rows flagged.
+    """
+    cur = conn.execute(
+        """UPDATE shared_notifications SET sender_dismissed_at = ?
+           WHERE sender_user_id = ?
+             AND sender_dismissed_at IS NULL""",
         (_now(), int(user_id)),
     )
     conn.commit()

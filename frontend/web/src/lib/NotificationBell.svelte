@@ -3,9 +3,11 @@
   import { currentUser, setUnreadSharedCount } from './stores';
   import {
     getMySharedProjects,
-    markAllProjectsSeen,
+    getMySentShares,
     dismissAllNotifications,
-    type SharedProjectItem
+    dismissAllSentShares,
+    type SharedProjectItem,
+    type SentShareItem
   } from './api';
   import { timeAgo } from './timeAgo';
 
@@ -16,28 +18,52 @@
   }
   let { onSelectRun }: Props = $props();
 
+  // Combined list of incoming shares (someone shared with you) and
+  // outgoing shares (you shared with someone). Each item carries a
+  // `direction: 'in' | 'out'` discriminator so the row template can
+  // render the right icon, color, and label without splitting into two
+  // sections.
+  type CombinedItem =
+    | (SharedProjectItem & { direction: 'in' })
+    | (SentShareItem & { direction: 'out' });
+
   let open = $state(false);
-  let sharedItems = $state<SharedProjectItem[]>([]);
+  let combinedItems = $state<CombinedItem[]>([]);
   let loading = $state(false);
   let error = $state<string | null>(null);
   let pollHandle: ReturnType<typeof setInterval> | null = null;
 
-  let sharedUnread = $derived(
-    sharedItems.filter((d) => d.is_unread).length
+  let unread = $derived(
+    combinedItems.filter((d) => d.is_unread).length
   );
-  let unread = $derived(sharedUnread);
 
   async function refresh(): Promise<void> {
     if (!$currentUser) {
-      sharedItems = [];
+      combinedItems = [];
       setUnreadSharedCount(0);
       return;
     }
     try {
-      const shr = await getMySharedProjects();
-      sharedItems = shr;
-      const n = shr.filter((d) => d.is_unread).length;
-      setUnreadSharedCount(n);
+      // Fetch both feeds in parallel — incoming (someone shared with
+      // me) and outgoing (I shared with someone). The bell renders
+      // them as one combined list with a per-row direction label.
+      const [incoming, outgoing] = await Promise.all([
+        getMySharedProjects(),
+        getMySentShares().catch(() => [] as SentShareItem[])
+      ]);
+      const combined: CombinedItem[] = [
+        ...incoming.map((it) => ({ ...it, direction: 'in' as const })),
+        ...outgoing.map((it) => ({ ...it, direction: 'out' as const }))
+      ];
+      // Sort by timestamp desc (use added_at for incoming, created_at
+      // for outgoing). Items missing a timestamp sort to the end.
+      combined.sort((a, b) => {
+        const ta = (a.direction === 'in' ? a.added_at : a.created_at) || '';
+        const tb = (b.direction === 'in' ? b.added_at : b.created_at) || '';
+        return tb.localeCompare(ta);
+      });
+      combinedItems = combined;
+      setUnreadSharedCount(combined.filter((d) => d.is_unread).length);
       error = null;
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -56,12 +82,16 @@
 
   async function clearAll(): Promise<void> {
     try {
-      // Per-user permanent dismissal — flags every notification as
-      // dismissed in the DB so the bell stops surfacing them for THIS
-      // user. Other members are unaffected.
-      await dismissAllNotifications();
+      // Per-user permanent dismissal — flags both incoming and
+      // outgoing notifications as dismissed in the DB so the bell
+      // stops surfacing them for THIS user. Other members are
+      // unaffected.
+      await Promise.all([
+        dismissAllNotifications(),
+        dismissAllSentShares().catch(() => ({ ok: true, dismissed: 0 }))
+      ]);
       setUnreadSharedCount(0);
-      sharedItems = [];
+      combinedItems = [];
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     }
@@ -98,7 +128,7 @@
     } else if (!$currentUser && pollHandle) {
       clearInterval(pollHandle);
       pollHandle = null;
-      sharedItems = [];
+      combinedItems = [];
       setUnreadSharedCount(0);
     }
   });
@@ -130,13 +160,13 @@
         <div class="nb-head mono-label">
           <span>NOTIFICATIONS</span>
         </div>
-        {#if loading && sharedItems.length === 0}
+        {#if loading && combinedItems.length === 0}
           <div class="nb-empty mono-underline">Loading…</div>
-        {:else if sharedItems.length === 0}
+        {:else if combinedItems.length === 0}
           <div class="nb-empty mono-underline">No notifications.</div>
         {:else}
           <div class="nb-section-label mono-underline">
-            <span>Shared with you</span>
+            <span>Shares</span>
             <button
               type="button"
               class="nb-clear-btn"
@@ -146,22 +176,36 @@
             >Clear all</button>
           </div>
           <ul class="nb-list">
-            {#each sharedItems as it (it.run_id)}
-              <li class="nb-row nb-row-share" data-unread={it.is_unread}>
+            {#each combinedItems as it (it.direction + ':' + (it.direction === 'out' ? it.id : it.run_id))}
+              <li
+                class="nb-row nb-row-share {it.direction === 'out' ? 'nb-row-share-out' : 'nb-row-share-in'}"
+                data-unread={it.is_unread}
+                data-direction={it.direction}
+              >
                 <div class="nb-row-text">
                   <div class="nb-row-title">
                     {it.filename || it.run_id}
-                    <span class="nb-access-tag share-badge share-{it.your_access}">
-                      {it.your_access}
+                    <span class="nb-row-direction nb-direction-{it.direction}">
+                      {it.direction === 'out' ? '↑ share' : '↓ shared'}
                     </span>
+                    {#if it.direction === 'in'}
+                      <span class="nb-access-tag share-badge share-{it.your_access}">
+                        {it.your_access}
+                      </span>
+                    {/if}
                   </div>
                   <div class="nb-row-sub mono-underline">
-                    {#if it.shared_by}
-                      shared by <strong>{it.shared_by}</strong>
+                    {#if it.direction === 'in'}
+                      {#if it.shared_by}
+                        shared by <strong>{it.shared_by}</strong>
+                      {:else}
+                        your project
+                      {/if}
+                      · {timeAgo(it.added_at)}
                     {:else}
-                      your project
+                      you shared with <strong>{it.recipient_username}</strong>
+                      · {timeAgo(it.created_at)}
                     {/if}
-                    · {timeAgo(it.added_at)}
                   </div>
                 </div>
                 <button
