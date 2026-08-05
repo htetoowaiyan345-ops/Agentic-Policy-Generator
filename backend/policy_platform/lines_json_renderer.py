@@ -646,10 +646,35 @@ def _apply_label_bold(p_elem, user_text: str) -> None:
 
     Also: if the user's text starts with a slot heading label
     (e.g. "INTRODUCTION"), the WHOLE paragraph is bolded.
+
+    Fix E: if the user's saved line_json already carries inline
+    formatting (strong / em / u / s / span with style), we skip the
+    label-bold split so the user's toolbar-applied formatting is not
+    overwritten. Otherwise the value run is stripped of its bold and the
+    user's `<strong>` on a metadata line becomes invisible (the label
+    portion was always bold by default).
     """
     t = (user_text or '').strip()
     if not t:
         return
+    # Fix E: detect user-applied inline formatting on any run in this
+    # paragraph. If found, skip label-bold so the user's formatting
+    # survives verbatim. The label portion will still be bold because
+    # the user's <strong> wraps the whole text.
+    _INLINE_FMT_TAGS = ('<strong', '<b>', '<em', '<i>', '<u', '<s ',
+                        '<span', '<mark')
+    for r in p_elem.findall(qn("w:r")):
+        rPr = r.find(qn("w:rPr"))
+        if rPr is not None:
+            if (rPr.find(qn("w:b")) is not None
+                or rPr.find(qn("w:i")) is not None
+                or rPr.find(qn("w:u")) is not None
+                or rPr.find(qn("w:strike")) is not None):
+                return
+        # Also check the raw HTML-equivalent: any run that has a w:t
+        # whose text came from a tagged span. Since we already have
+        # lxml runs here (not raw HTML), the rPr check above is the
+        # reliable signal.
 
     # Slot heading: bold the whole paragraph
     upper_t = t.upper()
@@ -827,6 +852,32 @@ def _cell_to_html(cell: Any) -> str:
     return str(cell)
 
 
+def _apply_visible_table_borders(tblPr) -> None:
+    """Fix G3: force a visible 1pt black border on every edge of a table.
+
+    Without this, tables that reuse the brain template's scaffold style
+    (TableGridLight, PlainTable3) inherit very faint BFBFBF / 0.5pt
+    borders that are effectively invisible in Word — the user sees an
+    empty grid instead of a real table. We explicitly replace any
+    inherited `<w:tblBorders>` with solid 1pt black borders so the
+    user's toolbar-inserted tables are clearly visible.
+    """
+    if tblPr is None:
+        return
+    # Remove any existing tblBorders so our explicit borders win.
+    for old in tblPr.findall(qn("w:tblBorders")):
+        tblPr.remove(old)
+    tblBorders = OxmlElement("w:tblBorders")
+    for bn in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        b = OxmlElement(f"w:{bn}")
+        b.set(qn("w:val"), "single")
+        b.set(qn("w:sz"), "8")  # 1pt
+        b.set(qn("w:space"), "0")
+        b.set(qn("w:color"), "000000")
+        tblBorders.append(b)
+    tblPr.append(tblBorders)
+
+
 def _write_table(table_elem, rows: list[list[Any]], preserve_dimensions: bool = False, doc=None) -> int:
     """Replace the contents of `table_elem` with the user's rows.
 
@@ -910,6 +961,9 @@ def _write_table(table_elem, rows: list[list[Any]], preserve_dimensions: bool = 
                 new_p.append(new_r)
             tc.append(new_p)
         table_elem.append(tr)
+    # Fix G3: force visible 1pt black borders so toolbar-inserted
+    # tables don't inherit the brain's faint TableGridLight style.
+    _apply_visible_table_borders(table_elem.find(qn("w:tblPr")))
     return len(rows)
 
 
@@ -928,7 +982,11 @@ def _make_new_paragraph(template_pPr, text_or_html: str, is_html: bool, doc=None
         wp = _import_rich_writer()
         if wp is not None:
             try:
-                wp(new_p, text_or_html, part=doc.part if doc is not None else None)
+                # Fix B: pass `doc=doc` so write_paragraph's list branch
+                # fires. Without doc, lists (ul/ol/todo-list) are
+                # flattened into a single paragraph with no bullets /
+                # numbers / checkbox markers.
+                wp(new_p, text_or_html, part=doc.part if doc is not None else None, doc=doc)
                 if list(new_p.findall(qn("w:r"))):
                     return new_p
             except Exception:
@@ -1306,6 +1364,10 @@ def _render_slot_direct(doc, sec_id: int,
                             tc.append(new_p)
                             tr.append(tc)
                         new_tbl.append(tr)
+                    # Fix G3: override the copied brain-scaffold tblPr
+                    # with explicit 1pt black borders so the extra table
+                    # is clearly visible (not the faint brain default).
+                    _apply_visible_table_borders(new_tbl.find(qn("w:tblPr")))
                     parent.insert(insert_pos, new_tbl)
                     insert_pos += 1
                     # Spacer paragraph between tables.
@@ -1533,10 +1595,16 @@ def _render_free_paragraph_zone(doc, free_zone_items: list) -> None:
             # render as a bullet (the brain's free-paragraph zone templates
             # inherit <w:numPr> from the scaffold, which would make ALL
             # user-typed text render as Roman-numeral bullets).
-            new_pPr = new_p.find(qn("w:pPr"))
-            if new_pPr is not None:
-                for numPr in new_pPr.findall(qn("w:numPr")):
-                    new_pPr.remove(numPr)
+            # Fix B: BUT if this paragraph is a list (starts with <ul>/<ol>),
+            # the numPr was intentionally added by _write_list_paragraphs
+            # to render bullets/numbers — keep it.
+            stripped_html = html.lstrip()
+            is_list = stripped_html.startswith('<ul') or stripped_html.startswith('<ol')
+            if not is_list:
+                new_pPr = new_p.find(qn("w:pPr"))
+                if new_pPr is not None:
+                    for numPr in new_pPr.findall(qn("w:numPr")):
+                        new_pPr.remove(numPr)
             body.insert(insert_pos, new_p)
             insert_pos += 1
         elif kind == 't':
@@ -1573,12 +1641,19 @@ def _build_free_zone_table(rows: list) -> object:
     tblW.set(qn("w:w"), "5000")
     tblW.set(qn("w:type"), "pct")
     tblPr.append(tblW)
+    # Fix G3: explicit, visible borders for toolbar-inserted tables.
+    # Without this, the free-zone tables inherit the brain's
+    # TableGridLight style which uses BFBFBF / sz=4 (very faint)
+    # borders that are effectively invisible in Word — the user sees
+    # an empty grid instead of a real table. Force solid 1pt black
+    # borders here so user-inserted tables are clearly visible.
     tblBorders = OxmlElement("w:tblBorders")
     for bn in ("top", "left", "bottom", "right", "insideH", "insideV"):
         b = OxmlElement(f"w:{bn}")
         b.set(qn("w:val"), "single")
-        b.set(qn("w:sz"), "4")
-        b.set(qn("w:color"), "auto")
+        b.set(qn("w:sz"), "8")  # 1pt
+        b.set(qn("w:space"), "0")
+        b.set(qn("w:color"), "000000")
         tblBorders.append(b)
     tblPr.append(tblBorders)
     new_tbl.append(tblPr)
@@ -1604,7 +1679,9 @@ def _build_free_zone_table(rows: list) -> object:
             wrote = False
             if wp is not None:
                 try:
-                    wp(new_p, _cell_to_html(cell) or _cell_to_plain(cell), part=doc.part if doc is not None else None)
+                    # Fix B: pass `doc=doc` so in-cell lists render
+                    # with bullets / numbers / checkbox markers.
+                    wp(new_p, _cell_to_html(cell) or _cell_to_plain(cell), part=doc.part if doc is not None else None, doc=doc)
                     wrote = True
                 except Exception:
                     wrote = False
@@ -1819,11 +1896,14 @@ def _apply_publication_styling_to_body(doc) -> None:
     table cells) and apply publication styling:
       - 2.0 line height (line=480 lineRule=auto)
       - left alignment (jc=left)
-      - Times New Roman 10pt on ALL runs (uniform font/size)
+      - Times New Roman 10pt on runs that have NO explicit size set
 
     Bold/italic/underline/strikethrough/color are preserved on runs
     that have explicit rPr — we only override the font family and
     size, not the rest of the rPr.
+    Fix G1 (revised): runs that already carry `<w:sz>` (set by the
+    heading pipeline to 36/30/26 half-points for H1/H2/H3) are LEFT
+    ALONE so heading sizes survive this post-pass.
     Tables (and table cells) are skipped — they keep brain's formatting.
     """
     body = doc.element.body
@@ -1835,11 +1915,19 @@ def _apply_publication_styling_to_body(doc) -> None:
         if _has_table_ancestor(p):
             continue
         _apply_publication_styling(p)
-        # Apply Times New Roman 10pt to ALL runs (uniform font/size).
-        # Bold/italic/underline/color preserved via rPr — only font and
-        # size are overridden.
+        # Apply Times New Roman 10pt to runs that DON'T already have a
+        # custom size. Heading runs carry `<w:sz>` from the heading
+        # pipeline and must not be clobbered back to 10pt.
         for r in p.findall(qn("w:r")):
-            _set_run_font(r, family="Times New Roman", size_hp=20)
+            rPr = r.find(qn("w:rPr"))
+            has_explicit_size = (
+                rPr is not None and rPr.find(qn("w:sz")) is not None
+            )
+            if has_explicit_size:
+                # Only set font family, preserve the existing size.
+                _set_run_font(r, family="Times New Roman", size_hp=None)
+            else:
+                _set_run_font(r, family="Times New Roman", size_hp=20)
 
 
 def _apply_publication_styling_to_tables(doc) -> None:
@@ -1931,9 +2019,13 @@ def _make_divider_paragraph(side: str = "bottom",
     new_p = OxmlElement("w:p")
     pPr = OxmlElement("w:pPr")
     new_p.append(pPr)
-    # Margins — support asymmetric (top vs bottom).
-    before_val = str(before_twips) if before_twips is not None else str(margin_twips)
-    after_val = str(after_twips) if after_twips is not None else str(margin_twips)
+    # Fix I5: larger margins so the divider line is clearly separated
+    # from surrounding text and unmistakably visible. Previous margins
+    # (160 twips = 8px before/after) were too tight, making the
+    # divider blend with adjacent content. 360 twips (~18px) gives
+    # clear visual separation above and below the rule.
+    before_val = str(before_twips if before_twips is not None else 360)
+    after_val = str(after_twips if after_twips is not None else 360)
     spacing = OxmlElement("w:spacing")
     spacing.set(qn("w:before"), before_val)
     spacing.set(qn("w:after"), after_val)
@@ -1942,8 +2034,10 @@ def _make_divider_paragraph(side: str = "bottom",
     pBdr = OxmlElement("w:pBdr")
     border = OxmlElement(f"w:{side}")
     border.set(qn("w:val"), "single")
-    border.set(qn("w:sz"), "4")  # 0.5pt
-    border.set(qn("w:space"), "1")
+    # Fix I5: thicker, clearly visible divider border. 2pt (w:sz="16")
+    # is an unambiguous, bold rule that is easily seen in Word.
+    border.set(qn("w:sz"), "16")  # 2pt
+    border.set(qn("w:space"), "4")
     border.set(qn("w:color"), "000000")
     pBdr.append(border)
     pPr.append(pBdr)

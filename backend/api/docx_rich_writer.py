@@ -47,6 +47,40 @@ _HEADING_TAG_TO_OUTLINE = {
     'h3': '2',
 }
 
+# Fix J3: heading font sizes (each +1pt from I1: 15/13/12pt → 16/14/13pt).
+#
+# The values here go through `_as_size()` which converts CSS font-size
+# to Word half-points via `pt * 2`. So to land on a target Word
+# point-size we store the equivalent pixel value here:
+#   - 16pt target → 21.33px, rounded to 21px → 21 * 72/96 = 15.75pt
+#     → w:sz="32"  (16pt)
+#   - 14pt target → 18.67px, rounded to 19px → 19 * 72/96 = 14.25pt
+#     → w:sz="28"  (14pt)
+#   - 13pt target → 17.33px, rounded to 17px → 17 * 72/96 = 12.75pt
+#     → w:sz="26"  (13pt)
+# Headings are clearly distinguishable from the ~10pt body text.
+_HEADING_SIZE_BY_OUTLINE = {
+    '0': '21px',  # H1 → 16pt
+    '1': '19px',  # H2 → 14pt
+    '2': '17px',  # H3 → 13pt
+}
+
+
+def _apply_heading_outline_and_style(pPr, outline: str) -> None:
+    """Fix A: write `<w:outlineLvl w:val="N"/>` into pPr (Word only honors
+    outlineLvl inside paragraph properties) so the heading participates
+    in Word's outline navigation and TOC. Idempotent: any existing
+    outlineLvl is replaced.
+    """
+    if pPr is None:
+        return
+    # Remove any existing outlineLvl so the new value wins.
+    for ol in pPr.findall(qn('w:outlineLvl')):
+        pPr.remove(ol)
+    ol = OxmlElement('w:outlineLvl')
+    ol.set(qn('w:val'), str(outline))
+    pPr.append(ol)
+
 
 def _as_bool(v: Optional[str]) -> bool:
     if v is None:
@@ -496,6 +530,7 @@ def write_paragraph(p_elem, html: str, footnote_id_map: Optional[Dict[str, int]]
     # Capture paragraph-level attributes from the first non-newline span.
     p_align = None
     blockquote = False
+    heading_outline = None
     for s in spans:
         if (s.text or '') == '\n':
             continue
@@ -503,14 +538,25 @@ def write_paragraph(p_elem, html: str, footnote_id_map: Optional[Dict[str, int]]
             p_align = s.p_align
         if s.blockquote:
             blockquote = True
+        # Fix A: detect heading outline from the first non-newline span.
+        if heading_outline is None:
+            style = s.rPr or {}
+            ov = style.get('outline')
+            if ov is not None and str(ov).strip() != '':
+                heading_outline = str(ov).strip()
         break
     # Lazily create pPr so alignment / blockquote can be applied even
     # when the host paragraph had no pPr (e.g. a freshly created one).
-    if (p_align or blockquote) and pPr is None:
+    if (p_align or blockquote or heading_outline is not None) and pPr is None:
         pPr = OxmlElement('w:pPr')
         p_elem.insert(0, pPr)
     _apply_p_align(pPr, p_align)
     _apply_blockquote_indent(pPr, blockquote)
+    # Fix A: write outlineLvl into pPr (Word only honors it there) and
+    # apply visible heading styling (bold + larger size) so headings look
+    # like real Word headings, matching the editor.
+    if heading_outline is not None:
+        _apply_heading_outline_and_style(pPr, heading_outline)
     for span in spans:
         # Footnote anchor span
         if span.footnoteId:
@@ -525,7 +571,14 @@ def write_paragraph(p_elem, html: str, footnote_id_map: Optional[Dict[str, int]]
         text = span.text or ''
         if not text.strip() and text != '\n':
             continue
-        run = _build_run(text, span.rPr or {})
+        # Fix A: for heading paragraphs, strip outline from rPr (it now
+        # lives in pPr) and ensure bold + heading size are applied.
+        run_style = dict(span.rPr or {})
+        if heading_outline is not None:
+            run_style.pop('outline', None)
+            run_style['font-weight'] = 'bold'
+            run_style['font-size'] = _HEADING_SIZE_BY_OUTLINE.get(heading_outline, '24')
+        run = _build_run(text, run_style)
         if span.href:
             p_elem.append(_wrap_run_in_hyperlink(run, span.href, part=part))
         else:
@@ -566,8 +619,10 @@ def write_paragraph(p_elem, html: str, footnote_id_map: Optional[Dict[str, int]]
 
 _LIST_ABSTRACT_NUM_ID_BULLET = 90
 _LIST_ABSTRACT_NUM_ID_DECIMAL = 91
+_LIST_ABSTRACT_NUM_ID_TODO = 92
 _LIST_NUM_ID_BULLET = 90
 _LIST_NUM_ID_DECIMAL = 91
+_LIST_NUM_ID_TODO = 92
 _LIST_NUMBERING_DEFINED = False
 
 
@@ -603,28 +658,49 @@ def _ensure_list_numbering_definition(doc) -> None:
     ]
     nsmap = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
     if _LIST_ABSTRACT_NUM_ID_BULLET not in existing_abstract:
-        bullet_xml = f'''<w:abstractNum xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:abstractNumId="{_LIST_ABSTRACT_NUM_ID_BULLET}">
-  <w:lvl w:ilvl="0">
-    <w:start w:val="1"/>
-    <w:numFmt w:val="bullet"/>
-    <w:lvlText w:val="\u2022"/>
-    <w:lvlJc w:val="left"/>
-    <w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr>
-    <w:rPr><w:rFonts w:ascii="Symbol" w:hAnsi="Symbol" w:hint="default"/></w:rPr>
-  </w:lvl>
-</w:abstractNum>'''
-        numbering_el.append(_et.fromstring(bullet_xml))
+        # Fix L1: build the abstractNum element directly with lxml's
+        # element API instead of parsing a string via fromstring().
+        # fromstring() was stripping the Private Use Area characters
+        # (U+F0B7 bullet, U+F0A7 checkbox) during XML round-tripping
+        # because lxml normalizes/strips characters it considers
+        # invalid in the parsed content. Using OxmlElement + .text on
+        # the lvlText element preserves the exact Unicode codepoint
+        # through serialization.
+        abs_num = OxmlElement('w:abstractNum')
+        abs_num.set(qn('w:abstractNumId'), str(_LIST_ABSTRACT_NUM_ID_BULLET))
+        lvl = OxmlElement('w:lvl')
+        lvl.set(qn('w:ilvl'), '0')
+        start = OxmlElement('w:start'); start.set(qn('w:val'), '1'); lvl.append(start)
+        fmt = OxmlElement('w:numFmt'); fmt.set(qn('w:val'), 'bullet'); lvl.append(fmt)
+        lvlText = OxmlElement('w:lvlText')
+        lvlText.set(qn('w:val'), '\uF0B7')  # Symbol-font bullet (•)
+        lvl.append(lvlText)
+        jc = OxmlElement('w:lvlJc'); jc.set(qn('w:val'), 'left'); lvl.append(jc)
+        pPr = OxmlElement('w:pPr')
+        ind = OxmlElement('w:ind'); ind.set(qn('w:left'), '720'); ind.set(qn('w:hanging'), '360')
+        pPr.append(ind); lvl.append(pPr)
+        rPr = OxmlElement('w:rPr')
+        rFonts = OxmlElement('w:rFonts')
+        rFonts.set(qn('w:ascii'), 'Symbol'); rFonts.set(qn('w:hAnsi'), 'Symbol'); rFonts.set(qn('w:hint'), 'default')
+        rPr.append(rFonts); lvl.append(rPr)
+        abs_num.append(lvl)
+        numbering_el.append(abs_num)
     if _LIST_ABSTRACT_NUM_ID_DECIMAL not in existing_abstract:
-        decimal_xml = f'''<w:abstractNum xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:abstractNumId="{_LIST_ABSTRACT_NUM_ID_DECIMAL}">
-  <w:lvl w:ilvl="0">
-    <w:start w:val="1"/>
-    <w:numFmt w:val="decimal"/>
-    <w:lvlText w:val="%1."/>
-    <w:lvlJc w:val="left"/>
-    <w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr>
-  </w:lvl>
-</w:abstractNum>'''
-        numbering_el.append(_et.fromstring(decimal_xml))
+        abs_num = OxmlElement('w:abstractNum')
+        abs_num.set(qn('w:abstractNumId'), str(_LIST_ABSTRACT_NUM_ID_DECIMAL))
+        lvl = OxmlElement('w:lvl')
+        lvl.set(qn('w:ilvl'), '0')
+        start = OxmlElement('w:start'); start.set(qn('w:val'), '1'); lvl.append(start)
+        fmt = OxmlElement('w:numFmt'); fmt.set(qn('w:val'), 'decimal'); lvl.append(fmt)
+        lvlText = OxmlElement('w:lvlText')
+        lvlText.set(qn('w:val'), '%1.')  # Decimal 1., 2., 3., ...
+        lvl.append(lvlText)
+        jc = OxmlElement('w:lvlJc'); jc.set(qn('w:val'), 'left'); lvl.append(jc)
+        pPr = OxmlElement('w:pPr')
+        ind = OxmlElement('w:ind'); ind.set(qn('w:left'), '720'); ind.set(qn('w:hanging'), '360')
+        pPr.append(ind); lvl.append(pPr)
+        abs_num.append(lvl)
+        numbering_el.append(abs_num)
     if _LIST_NUM_ID_BULLET not in existing_num:
         bullet_num = f'''<w:num xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" w:numId="{_LIST_NUM_ID_BULLET}">
   <w:abstractNumId w:val="{_LIST_ABSTRACT_NUM_ID_BULLET}"/>
@@ -635,15 +711,60 @@ def _ensure_list_numbering_definition(doc) -> None:
   <w:abstractNumId w:val="{_LIST_ABSTRACT_NUM_ID_DECIMAL}"/>
 </w:num>'''
         numbering_el.append(_et.fromstring(decimal_num))
+    # Fix H2: todo-list checkbox numFmt. CKEditor 5's todoList plugin
+    # produces `<ul class="todo-list"><li><label><input type="checkbox"/>…</li></ul>`.
+    # Without a dedicated abstractNum, the renderer falls through to the
+    # bullet numFmt and the user sees a plain bullet instead of a
+    # checkbox — "I don't see its icon." We add abstractNum 92 / numId
+    # 92 that renders ☐ (open ballot box) using both Segoe UI Symbol
+    # and Symbol fonts as fallbacks. Symbol is the original Word font
+    # and ships with every Word installation; Segoe UI Symbol provides
+    # better Unicode coverage. The `w:cs` and `w:hAnsi` fonts ensure
+    # consistent rendering.
+    if _LIST_ABSTRACT_NUM_ID_TODO not in existing_abstract:
+        # Fix L1: build directly with lxml element API to preserve the
+        # U+F0A7 checkbox character through serialization.
+        abs_num = OxmlElement('w:abstractNum')
+        abs_num.set(qn('w:abstractNumId'), str(_LIST_ABSTRACT_NUM_ID_TODO))
+        lvl = OxmlElement('w:lvl')
+        lvl.set(qn('w:ilvl'), '0')
+        start = OxmlElement('w:start'); start.set(qn('w:val'), '1'); lvl.append(start)
+        fmt = OxmlElement('w:numFmt'); fmt.set(qn('w:val'), 'bullet'); lvl.append(fmt)
+        lvlText = OxmlElement('w:lvlText')
+        lvlText.set(qn('w:val'), '\uF0A7')  # Symbol-font checkbox (☐)
+        lvl.append(lvlText)
+        jc = OxmlElement('w:lvlJc'); jc.set(qn('w:val'), 'left'); lvl.append(jc)
+        pPr = OxmlElement('w:pPr')
+        ind = OxmlElement('w:ind'); ind.set(qn('w:left'), '720'); ind.set(qn('w:hanging'), '360')
+        pPr.append(ind); lvl.append(pPr)
+        rPr = OxmlElement('w:rPr')
+        rFonts = OxmlElement('w:rFonts')
+        rFonts.set(qn('w:ascii'), 'Symbol'); rFonts.set(qn('w:hAnsi'), 'Symbol'); rFonts.set(qn('w:hint'), 'default')
+        rPr.append(rFonts); lvl.append(rPr)
+        abs_num.append(lvl)
+        numbering_el.append(abs_num)
+    if _LIST_NUM_ID_TODO not in existing_num:
+        num_el = OxmlElement('w:num')
+        num_el.set(qn('w:numId'), str(_LIST_NUM_ID_TODO))
+        abs_ref = OxmlElement('w:abstractNumId')
+        abs_ref.set(qn('w:val'), str(_LIST_ABSTRACT_NUM_ID_TODO))
+        num_el.append(abs_ref)
+        numbering_el.append(num_el)
     _LIST_NUMBERING_DEFINED = True
 
 
 def _apply_list_num_pr(pPr, num_id: int) -> None:
     """Inject `<w:numPr><w:ilvl/><w:numId/></w:numPr>` into `pPr`,
-    placing it at the correct pPr-child position (after `pStyle`,
-    `keepNext`, `keepLines`, `numPr` itself usually leads). For
-    simplicity we append — Word tolerates non-strict child order
-    here as long as the tags are present."""
+    placing it at the correct pPr-child position per the OOXML schema
+    (after pStyle/keepNext/keepLines/pageBreakBefore/framePr/widowControl
+    and BEFORE pBdr/shd/tabs/spacing/ind/jc/textDirection/outlineLvl/rPr).
+    
+    Fix I2/I3: Word silently ignores `<w:numPr>` when it appears in the
+    wrong pPr-child position. Previously we appended it to the end of
+    pPr, which placed it after spacing/jc/rPr — making bullet/number
+    lists appear as plain paragraphs in Word. We now insert it at the
+    schema-correct position so the list marker renders.
+    """
     if pPr is None:
         return
     # Remove any existing numPr so the new one wins.
@@ -656,7 +777,21 @@ def _apply_list_num_pr(pPr, num_id: int) -> None:
     numIdEl.set(qn('w:val'), str(num_id))
     numPr.append(ilvl)
     numPr.append(numIdEl)
-    pPr.append(numPr)
+    # Find the correct insertion index: after pStyle/keepNext/keepLines/
+    # pageBreakBefore/framePr/widowControl, before pBdr/shd/tabs/spacing/
+    # ind/jc/textDirection/outlineLvl/rPr.
+    _PR_ORDER_BEFORE = (
+        'pStyle', 'keepNext', 'keepLines', 'pageBreakBefore',
+        'framePr', 'widowControl',
+    )
+    insert_idx = 0
+    for i, child in enumerate(pPr):
+        tag = child.tag.split('}')[-1]
+        if tag in _PR_ORDER_BEFORE:
+            insert_idx = i + 1
+        else:
+            break
+    pPr.insert(insert_idx, numPr)
 
 
 def _write_list_paragraphs(p_elem, html: str, doc,
@@ -682,6 +817,16 @@ def _write_list_paragraphs(p_elem, html: str, doc,
     depth_inside_li = 0
 
     class _LiCollector(_HP):
+        # Fix B: HTML void elements that are self-closing and must NOT
+        # increment OR decrement depth (Python's HTMLParser only calls
+        # handle_starttag for them, not handle_endtag, so they are
+        # naturally balanced — but we still need to skip the starttag
+        # increment or depth inflates and `<li>` never closes).
+        _VOID_ELEMENTS = frozenset((
+            'area', 'base', 'br', 'col', 'embed', 'hr', 'img',
+            'input', 'link', 'meta', 'param', 'source', 'track', 'wbr',
+        ))
+
         def handle_starttag(self, tag, attrs):
             nonlocal inside_li, depth_inside_li
             t = tag.lower()
@@ -689,14 +834,19 @@ def _write_list_paragraphs(p_elem, html: str, doc,
             if t == 'li' and not inside_li:
                 inside_li = True
                 depth_inside_li = 1
-            elif inside_li:
+            elif inside_li and t not in self._VOID_ELEMENTS:
                 depth_inside_li += 1
         def handle_endtag(self, tag):
             nonlocal inside_li, depth_inside_li
             t = tag.lower()
             current.append(f'</{tag}>')
-            if t == 'li' and inside_li:
+            # Fix B: decrement on EVERY endtag inside_li so nested
+            # elements balance correctly. `</li>` also decrements —
+            # without this, `</li>` sees depth=1 (not 0) and the item
+            # never closes.
+            if inside_li:
                 depth_inside_li -= 1
+            if t == 'li' and inside_li:
                 if depth_inside_li <= 0:
                     items.append(''.join(current))
                     current.clear()
@@ -717,15 +867,29 @@ def _write_list_paragraphs(p_elem, html: str, doc,
         return
 
     is_ordered = html.lstrip().lower().startswith('<ol')
-    num_id = _LIST_NUM_ID_DECIMAL if is_ordered else _LIST_NUM_ID_BULLET
+    # Fix G2: detect todo-list (`<ul class="todo-list">`) and route it
+    # to the checkbox numFmt so the user sees ☐ instead of a plain •.
+    is_todo = 'todo-list' in html[:200].lower()
+    if is_ordered:
+        num_id = _LIST_NUM_ID_DECIMAL
+    elif is_todo:
+        num_id = _LIST_NUM_ID_TODO
+    else:
+        num_id = _LIST_NUM_ID_BULLET
 
     parent = p_elem.getparent()
     # Reuse p_elem for the FIRST <li>.
     first_html = f'<p>{items[0]}</p>'
     write_paragraph(p_elem, first_html,
                     footnote_id_map=footnote_id_map, part=part)
-    # Attach numPr to the first paragraph.
+    # Attach numPr to the first paragraph. Fix B: ensure pPr exists —
+    # the recursive write_paragraph call may have removed it if the
+    # first li's HTML didn't produce any styled content (e.g. a todo
+    # list whose <li> is just a <label><input/></label> wrapper).
     pPr = p_elem.find(qn('w:pPr'))
+    if pPr is None:
+        pPr = OxmlElement('w:pPr')
+        p_elem.insert(0, pPr)
     _apply_list_num_pr(pPr, num_id)
 
     # Insert siblings for the remaining items.

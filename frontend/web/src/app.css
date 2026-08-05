@@ -603,6 +603,66 @@ input, select, textarea {
   position: static;
 }
 
+/* Fix K1: reset heading margins/padding so H1/H2/H3 don't have visible
+   white space / empty line underneath when reloaded after a version
+   switch. CKEditor 5 v48+ adds default `margin-bottom` and `padding`
+   to headings in the editor surface; combined with the trailing empty
+   `<p>` cursor host CKEditor injects after a heading in the document
+   model, this produces a visible blank line beneath every heading
+   until the next change:data fires and stripStrayCursorHosts
+   cleans it up. We collapse the heading margins to 0 and tighten the
+   trailing-paragraph spacing so the editor view matches the DOCX
+   output (where headings sit flush against the next paragraph). */
+.re-document .re-doc-body .ck-content h1,
+.re-document .re-doc-body .ck-content h2,
+.re-document .re-doc-body .ck-content h3,
+.re-document .re-doc-body .ck-content h4,
+.re-document .re-doc-body .ck-content h5,
+.re-document .re-doc-body .ck-content h6 {
+  margin-top: 0;
+  margin-bottom: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+/* The trailing empty `<p>` that CKEditor 5 injects as a cursor host
+   after headings/lists/quotes must NOT add visible vertical space.
+   Collapse its margins so it renders as a zero-height line that the
+   next non-empty paragraph sits flush against. */
+.re-document .re-doc-body .ck-content h1 + p:empty,
+.re-document .re-doc-body .ck-content h2 + p:empty,
+.re-document .re-doc-body .ck-content h3 + p:empty,
+.re-document .re-doc-body .ck-content h4 + p:empty,
+.re-document .re-doc-body .ck-content h5 + p:empty,
+.re-document .re-doc-body .ck-content h6 + p:empty {
+  margin-top: 0 !important;
+  margin-bottom: 0 !important;
+  padding: 0 !important;
+  min-height: 0 !important;
+  height: 0 !important;
+  line-height: 0 !important;
+  font-size: 0 !important;
+}
+
+/* L2: collapse ALL empty `<p>` so they never produce visible white space,
+   whether they follow a heading, paragraph, list, or blockquote. The
+   preceding `h* + p:empty` rule only handled paragraphs directly after
+   a heading; cursor hosts elsewhere (after a normal `<p>`, inside a
+   `<li>`, after a `<blockquote>`, after a list) still rendered with
+   CKEditor 5's default `<p>` margins (~22px) and produced a visible
+   empty line after every version switch. This rule catches the rest.
+   Slot-bar rules (with `[data-slot-bar]` selector) keep their
+   `height: 2px` because attribute selectors win specificity ties
+   over element-only `p:empty`. */
+.re-document .re-doc-body .ck-content p:empty {
+  margin: 0 !important;
+  padding: 0 !important;
+  min-height: 0 !important;
+  height: 0 !important;
+  line-height: 0 !important;
+  font-size: 0 !important;
+}
+
 /* ============================================================================
    Editor body styles — plain editable document surface.
 
@@ -625,8 +685,15 @@ input, select, textarea {
   border-bottom: 2px solid #000;
   height: 2px;
   min-height: 2px;
-  margin: 10px 0;
+  /* Fix K3: tightened margins so the slot-bar divider doesn't create a
+     visible empty line between content sections after a version switch.
+     Previous 10px top/bottom margins + CKEditor 5's default line-height
+     for empty paragraphs produced ~28px of vertical white space between
+     content and the bar. Tightened to 4px so the bar sits flush against
+     the surrounding content. */
+  margin: 4px 0;
   padding: 0;
+  line-height: 0;
   cursor: pointer;
 }
 .re-document .re-doc-body .ck-content p[data-slot-bar="bottom"]:hover {
@@ -638,27 +705,28 @@ input, select, textarea {
 }
 
 /* Slot spacer — white-space-only paragraph emitted between sections
-   that should NOT show a black bar. Adds 10 px white space above and
+   that should NOT show a black bar. Adds minimal white space above and
    below with no visible rule. */
 .re-document .re-doc-body .ck-content p[data-slot-bar="space"] {
   border: 0;
   height: 0;
   min-height: 0;
-  margin: 10px 0;
+  margin: 0;
   padding: 0;
+  line-height: 0;
   cursor: default;
 }
 
 /* Functional-area bar — same visual as `bottom` bars: 2px solid black
-   rule with 10 px white space above and below. Emitted explicitly after
-   the `Functional Area(s):` metadata paragraph. */
+   rule with tight margins so it sits flush against surrounding content. */
 .re-document .re-doc-body .ck-content p[data-slot-bar="functional-area"] {
   border: 0;
   border-bottom: 2px solid #000;
   height: 2px;
   min-height: 2px;
-  margin: 10px 0;
+  margin: 4px 0;
   padding: 0;
+  line-height: 0;
   cursor: pointer;
 }
 .re-document .re-doc-body .ck-content p[data-slot-bar="functional-area"]:hover {

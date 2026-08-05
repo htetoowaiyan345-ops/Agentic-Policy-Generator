@@ -115,6 +115,53 @@ def publish_approved_version(
         )
         return None
 
+    # Fix G: pipeline gap — if the user inserted toolbar content AFTER
+    # approving this version but BEFORE clicking publish, those edits
+    # live in policy_drafts (autosave). Without this fix, publish reads
+    # only the frozen version row's lines_json and silently drops the
+    # user's latest edits — the user sees "almost everything I insert
+    # is not in the output." Detect a newer draft and use its lines_json
+    # instead, then backfill the version row so editor / timeline /
+    # published file stay consistent.
+    draft = versions_io.get_draft(c, run_id)
+    if draft and draft.get('lines_json'):
+        ver_modified = ver.get('modified_at') or ''
+        draft_modified = draft.get('modified_at') or ''
+        if draft_modified > ver_modified:
+            print(
+                f'[publish_to_brain] FIX G: newer draft found '
+                f'(draft ec={draft["edit_count"]} modified {draft_modified} '
+                f'> ver v{version_no} modified {ver_modified}), '
+                f'using draft lines_json for publish and backfilling '
+                f'version row.',
+                flush=True,
+            )
+            # Backfill the version row so the frozen data matches the
+            # published file. The change_summary records the fact so
+            # reviewers can see what happened.
+            import json as _json
+            try:
+                c.execute(
+                    """UPDATE policy_versions
+                       SET lines_json = ?, modified_at = ?
+                       WHERE run_id = ? AND version_no = ?""",
+                    (
+                        draft['lines_json'] if isinstance(draft['lines_json'], str)
+                        else _json.dumps(draft['lines_json']),
+                        draft_modified,
+                        run_id,
+                        version_no,
+                    ),
+                )
+                c.commit()
+                # Reload ver so subsequent code sees the updated lines_json.
+                ver = versions_io.get_version(c, run_id, version_no) or ver
+            except Exception as gerr:
+                print(
+                    f'[publish_to_brain] FIX G backfill failed (non-fatal): {gerr}',
+                    flush=True,
+                )
+
     # 2a) Load the underlying run row so we can preserve its status when
     # we update docx_path + audit_json below.
     run = db.get_run(run_id) or {}

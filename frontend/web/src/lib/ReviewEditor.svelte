@@ -321,14 +321,53 @@
         const headingMatch = /^(h[1-6])[\s>]/i.exec(rawHtml);
         const blockquoteMatch = /^<blockquote[\s>]/i.exec(rawHtml);
         if (listMatch) {
-          // Lift `data-slot="N"` onto the list's first element so the
-          // reverse walk in `htmlToLines` puts the row back in the
-          // correct slot when the editor's `getData` fires after.
-          const lifted = rawHtml.replace(
-            /^<(ul|ol)/i,
-            (_match, tag) => `<${tag} data-slot="${slot}"`
-          );
-          parts.push(lifted);
+          // Detect bogus list: a `<ul>`/`<ol>` whose `<li>` wraps a
+          // heading or blockquote (CKEditor 5 emits this when toggling
+          // Heading 1/2/3 on a list item). If found, unwrap to a
+          // standalone heading/blockquote so the text does NOT
+          // duplicate on every version switch (the bogus list row AND
+          // the heading row would both re-render). Without this,
+          // saved rows like `<ul><li><h1>A</h1></li></ul>` + a
+          // separate `<h1>A</h1>` both persist and duplicate.
+          let bogusListUnwrapped = false;
+          try {
+            const tpl = document.createElement('template');
+            tpl.innerHTML = rawHtml;
+            const firstLi = tpl.content.querySelector('li');
+            const innerBlock = firstLi?.firstElementChild;
+            const innerTag = (innerBlock?.tagName || '').toLowerCase();
+            if (innerBlock && (/^h[1-6]$/.test(innerTag) || innerTag === 'blockquote')) {
+              const blockHtml = (innerBlock as HTMLElement).outerHTML;
+              const blockText = (innerBlock.textContent || '')
+                .replace(/\s+$/g, '').trim();
+              // Lift data-slot onto the heading/blockquote if not
+              // already present.
+              let lifted = blockHtml;
+              if (!lifted.includes('data-slot=')) {
+                lifted = lifted.replace(
+                  /^(<(?:h[1-6]|blockquote))/i,
+                  `$1 data-slot="${slot}"`
+                );
+              } else {
+                lifted = lifted.replace(
+                  /^(<(?:h[1-6]|blockquote)[^>]*?) data-slot="[^"]*"/i,
+                  `$1 data-slot="${slot}"`
+                );
+              }
+              parts.push(lifted);
+              bogusListUnwrapped = true;
+            }
+          } catch {
+            /* on DOM parse failure, fall through to the list path */
+          }
+          if (!bogusListUnwrapped) {
+            // Normal list — lift data-slot and re-emit as-is.
+            const lifted = rawHtml.replace(
+              /^<(ul|ol)/i,
+              (_match, tag) => `<${tag} data-slot="${slot}"`
+            );
+            parts.push(lifted);
+          }
         } else if (headingMatch) {
           // Headings: re-emit as-is with data-slot on the heading
           // element so subsequent htmlToLines walks retrieve the
@@ -396,7 +435,28 @@
       prevSlot = slot;
     }
     // No trailing bar — by user spec, the last slot has no bar below it.
-    return parts.join('');
+    //
+    // Deduplicate consecutive heading/blockquote rows with identical
+    // text. When a bogus list row (<ul><li><h1>X</h1></li></ul>) is
+    // unwrapped to <h1>X</h1> AND a standalone <h1>X</h1> (ghost from
+    // CKEditor's model normalisation) also exists in the same
+    // lines_json, both branches emit a heading for the same text.
+    // Without this post-pass the text renders twice after every
+    // version switch.
+    const deduped: string[] = [];
+    for (const part of parts) {
+      const isBlock = /^<(h[1-6]|blockquote)[\s>]/i.test(part);
+      if (isBlock && deduped.length > 0) {
+        const prev = deduped[deduped.length - 1];
+        if (/^<(h[1-6]|blockquote)[\s>]/i.test(prev)) {
+          const prevText = prev.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+          const curText = part.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+          if (prevText && prevText === curText) continue;
+        }
+      }
+      deduped.push(part);
+    }
+    return deduped.join('');
   }
 
   /** Build lines_json from a CKEditor 5 HTML payload. Reads `data-slot`
@@ -565,6 +625,20 @@
               flushTable();
               continue;
             }
+            // Detect bogus list: a `<ul>`/`<ol>` whose `<li>` wraps a
+            // heading or blockquote (CKEditor 5 emits this when toggling
+            // Heading 1/2/3 on a list item). Skip the list row — the
+            // heading's own element in the walk will emit a proper
+            // heading row instead. Without this, the bogus list row AND
+            // the standalone heading row BOTH get saved, producing a
+            // duplicate on every version switch.
+            const firstLiChild = listParent.querySelector(':scope > li');
+            const firstBlockChild = firstLiChild?.firstElementChild;
+            const firstBlockTag = (firstBlockChild?.tagName || '').toLowerCase();
+            if (/^h[1-6]$/.test(firstBlockTag) || firstBlockTag === 'blockquote') {
+              flushTable();
+              continue;
+            }
             // First <li> — capture the whole list once.
             // Strip TRAILING empty/whitespace-only <li>s that CKEditor
             // 5 emits at end-of-list to host the cursor; otherwise the
@@ -658,6 +732,17 @@
         wrapped = `<${wrapTag} data-slot="${slot}">${innerHtml}</${wrapTag}>`;
       } else {
         wrapped = `<${wrapTag}>${innerHtml}</${wrapTag}>`;
+      }
+      // Dedup: when a bogus list+heading pair exists (CKEditor 5
+      // heading-on-list toggle), the heading's own element in the walk
+      // AND the standalone heading both emit rows. Skip the second one
+      // to prevent the text from appearing twice after version switch.
+      if (/^h[1-6]$/.test(wrapTag) || wrapTag === 'blockquote') {
+        const last = out[out.length - 1];
+        if (last && Array.isArray(last) && last[0] === 'p') {
+          const prevText = (last[1] as { text?: string })?.text ?? '';
+          if (prevText === cleanText) continue;
+        }
       }
       out.push(['p', { slot, text: cleanText, html: wrapped, footnotes: [] }]);
     }

@@ -160,7 +160,6 @@
           'alignment',
           '|',
           'link',
-          'horizontalLine',
           'blockQuote',
           'insertTable',
           '|',
@@ -419,6 +418,15 @@
   export function setHtml(html: string): void {
     if (!editorInstance) return;
     const next = html && html.length > 0 ? html : '<p></p>';
+    // Fix G4: strip stray cursor-host nodes BEFORE setData so
+    // CKEditor 5 doesn't render an extra empty paragraph / white space
+    // after every heading (`<h1>`/`<h2>`/`<h3>`) when reloading
+    // content via buildUnifiedInitialHtml on a version switch.
+    // Without this, the user sees "extra line/white space under
+    // each heading" until the next change:data fires (which
+    // self-heals via the same function). We now self-heal at the
+    // setData boundary instead.
+    const cleaned = stripStrayCursorHosts(next);
     // Always call setData, even when the new HTML appears identical to
     // the last applied HTML. Earlier we short-circuited identical
     // payloads to avoid cursor jumps, but that caused onClick version
@@ -426,8 +434,8 @@
     // version's content (e.g. v2) when the click target was v1.
     // CKEditor 5's setData is internally idempotent for identical
     // inputs, so we can safely remove the wrapper deduplication.
-    lastAppliedInitial = next;
-    editorInstance.setData(next);
+    lastAppliedInitial = cleaned;
+    editorInstance.setData(cleaned);
   }
 
   /** Expose the editor handle to host (ReviewEditor) for source-view reading. */
@@ -454,15 +462,21 @@
    *       TOP LEVEL of the document (cursor hosts after `<hr>`,
    *       `</blockquote>`, headings, etc.).
    *   (D) Leading-trim empty `<p>` / `<h*>` at the TOP LEVEL of the
-   *       document. When toggling Paragraph → Heading 1, CKEditor 5
-   *       leaves an empty `<p data-slot="N">` BEFORE the heading
-   *       (the original paragraph element, now empty). Without
-   *       this, that empty paragraph survives in `lines_json`,
-   //       round-trips into the editor on every version switch as
-   //       a stray blank line ABOVE the heading, and persists
-   //       until the next toolbar round-trip.
-   *  Nodes with TEXT (even one character) are left alone.
-   *  Returns the input unchanged when nothing changed. */
+    *       document. When toggling Paragraph → Heading 1/2/3, CKEditor 5
+    *       leaves an empty `<p data-slot="N">` BEFORE the heading
+    *       (the original paragraph element, now empty). Without
+    *       this, that empty paragraph survives in `lines_json`,
+    //       round-trips into the editor on every version switch as
+    //       a stray blank line ABOVE the heading, and persists
+    //       until the next toolbar round-trip.
+    *   (E) Unwrap `<h1>`…`<h6>` / `<blockquote>` trapped inside a
+    *       single-item `<ul>`/`<ol>`. When the user toggles a heading
+    *       on a list item, CKEditor 5 can leave the bogus wrapper
+    *       `<ul><li><h1>X</h1></li></ul>` alongside a standalone
+    *       `<h1>X</h1>`. Without this, the text appears twice
+    *       (once per row) after every version switch.
+    *  Nodes with TEXT (even one character) are left alone.
+    *  Returns the input unchanged when nothing changed. */
   function stripStrayCursorHosts(input: string): string {
     if (!input || input.indexOf('<') < 0) return input;
     let touched = false;
@@ -579,6 +593,32 @@
         .trim();
       if (txt) break;
       root.removeChild(el);
+      touched = true;
+    }
+
+    // (E) Unwrap headings / blockquotes trapped inside a list. When
+    //     a user toggles Heading 1/2/3 on a list item, CKEditor 5
+    //     can produce `<ul><li><h1>X</h1></li></ul>` — a bogus list
+    //     wrapper around a heading. Without this pass the heading
+    //     appears both inside the list row AND as a standalone row,
+    //     producing visible text duplication after every version
+    //     switch. For single-item lists whose only child is a
+    //     heading or blockquote, we replace the list with the
+    //     heading directly.
+    const listsToUnwrap = Array.from(root.querySelectorAll('ul, ol'));
+    for (const list of listsToUnwrap) {
+      const lis = Array.from(list.children).filter(
+        (c) => c.tagName.toLowerCase() === 'li'
+      );
+      if (lis.length !== 1) continue;
+      const li = lis[0];
+      const block = Array.from(li.children).find(
+        (c) => /^(h[1-6]|blockquote)$/i.test(c.tagName)
+      );
+      if (!block) continue;
+      if (li.children.length !== 1) continue;
+      // Replace the bogus <ul>/<ol> with the trapped heading.
+      list.parentNode!.replaceChild(block, list);
       touched = true;
     }
 
