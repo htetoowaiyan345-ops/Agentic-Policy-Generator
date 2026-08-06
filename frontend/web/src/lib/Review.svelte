@@ -1,5 +1,6 @@
 <script lang="ts">
   import { tick } from 'svelte';
+  import { onMount } from 'svelte';
   import {
     appState,
     currentUser,
@@ -35,6 +36,7 @@
   import ReviewComments from './ReviewComments.svelte';
   import ReviewEditor from './ReviewEditor.svelte';
   import ProjectSharing from './ProjectSharing.svelte';
+  import { setReloadHandler } from './page-actions';
 
   interface Props {
     onBack: () => void;
@@ -832,6 +834,32 @@
       nowTick = Date.now();
     }, 30_000);
     return () => clearInterval(handle);
+  });
+
+  // "Load result" force-reload hook. Registered via a callback so that
+  // `page-actions.ts#loadResultAndShow` can re-populate the editor for
+  // the currently active run, bypassing the `$effect` gate at line ~798
+  // which would otherwise no-op on a same-runId click (because
+  // `lastLoadedRunId === activeRunId`). Without this, clicking "Load
+  // result" on the already-loaded run does nothing visible.
+  onMount(() => {
+    setReloadHandler(async () => {
+      const runId = activeRunId;
+      if (runId) {
+        // Reset the gate so the next reactive fire (e.g. when
+        // `activeFilename` flips from `null` to the matched filename
+        // inside `loadResultAndShow`) also re-runs the side-effects:
+        // `loadReviewData`, `refreshDownloadLabel`, `refreshYourAccess`.
+        lastLoadedRunId = null;
+        await loadPreview(runId);
+        await loadReviewData(runId);
+        refreshDownloadLabel();
+        await refreshYourAccess(runId);
+      }
+    });
+    return () => {
+      setReloadHandler(null);
+    };
   });
 
   function onPickerChange(e: Event): void {

@@ -7,6 +7,7 @@
   import WorkflowTracker from '$lib/WorkflowTracker.svelte';
   import { appState, resetAppState, setFromHistory, setActiveRun } from '$lib/stores';
   import { onMount } from 'svelte';
+  import { setNavigateHandler, setOnStep3Probe, setCloseHistoryHandler } from '$lib/page-actions';
   import type { StepId } from '$lib/types';
 
   let currentStep = $state<StepId>(1);
@@ -59,6 +60,26 @@
 
   onMount(() => {
     showStep(1);
+    // Register navigation handler so `loadResultAndShow` (called from
+    // the History panel "Load result" button) can route the user to
+    // Step 3 and let the freshly-mounted Review component load the
+    // result via its `$effect` (which sees `lastLoadedRunId === null`
+    // on a fresh mount, so it fires unconditionally).
+    setNavigateHandler((runId) => onSelectRun(runId));
+    setOnStep3Probe(() => currentStep === 3);
+    // Register History-panel closer so clicking "Load result"
+    // collapses the overlay, exposing the freshly-loaded Review
+    // content. Without this, users on Step 3 who open History and
+    // click "Load result" must manually click Close to see the
+    // editor — confusing UX.
+    setCloseHistoryHandler(() => {
+      historyOpen = false;
+    });
+    return () => {
+      setNavigateHandler(null);
+      setOnStep3Probe(null);
+      setCloseHistoryHandler(null);
+    };
   });
 </script>
 
