@@ -106,6 +106,18 @@ BRAIN_APPROVAL_FIELDS: list[tuple[str, list[str]]] = [
         "effective period",
         "valid from",
         "validity",
+        # Phase 5 — general date-label synonyms seen across
+        # real-world policy PDFs (no per-file hardcoding; these are
+        # generic Brain-schema slot-3 label variants).
+        "effected/review date",
+        "effected/review",
+        "effected date",
+        "effected on",
+        "review date",
+        "reviewed date",
+        "reviewed on",
+        "date effected",
+        "date effective",
     ]),
     ("Approved by:", [
         "approved by",

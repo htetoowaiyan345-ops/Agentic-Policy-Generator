@@ -43,6 +43,21 @@ class ExtractedDocument:
     # content_paragraphs when the corresponding table is already
     # routed to that slot (prevents duplication).
     paragraph_table_origin: list[int | None] = field(default_factory=list)
+    # Per-paragraph bbox parallel to `paragraphs`. Each entry is
+    # `(page, x0, top, x1, bottom)` in PDF point coordinates (1pt = 1/72
+    # inch). PDF extractors populate this for every paragraph. None
+    # entries mean the source had no coordinates for the line (e.g. a
+    # synthetic continuation line). Empty list = the extractor didn't
+    # produce coordinates at all (DOCX, RTF, TXT). Downstream code
+    # should check `len(line_bboxes) == len(paragraphs)` before using.
+    line_bboxes: list[tuple[int, float, float, float, float] | None] = field(
+        default_factory=list
+    )
+    # Page rotations in degrees as detected per-page during extraction.
+    # Each entry is `(page_number, rotation_degrees)` where rotation is
+    # one of 0, 90, 180, 270. Empty list if the source had no rotation
+    # (DOCX, RTF, TXT, or PDFs all at 0°).
+    page_rotations: list[tuple[int, int]] = field(default_factory=list)
 
     @property
     def full_text(self) -> str:

@@ -140,28 +140,67 @@ _LABEL_ROW_KEYWORDS: set[str] = {
     "applies to",
     "reason for policy",
     "policy review note",
+    # Phase 5 — general date / version / approval label variants
+    # seen across real-world policy PDFs (general domain synonyms;
+    # not tied to any specific file or test).
+    "effected/review date",
+    "effected/review",
+    "effected date",
+    "effected on",
+    "review date",
+    "date of issue",
+    "date issued",
+    "effective from",
+    "version",
 }
 
 
 def _looks_like_label_row_table(table: Sequence[Sequence[str]]) -> bool:
     """Heuristic: this table is the slot-1 label-row table (key-value pairs).
 
-    The slot-1 label-row table is always 2 columns where col 0 is a
-    short label and col 1 is the corresponding value. We use this to
-    exclude it from slot 9/10/14 matching.
+    The slot-1 label-row table is normally 2 columns where col 0 is a
+    short label and col 1 is the corresponding value. Real-world
+    policy PDFs also use a TRANSPOSED form (row 0 = labels across
+    columns, row 1 = values across columns) — e.g. a 5-column table
+    with `[Policy no, Version, Approved by, Prepared by, Effective Date]`
+    on row 0 and `[HR_GP_00002, V3, ...]` on row 1. We use this to
+    exclude label-row tables from slot 9/10/14 matching AND to route
+    the cell text into field_parser so the labels become slot-1
+    fields.
 
-    Hybrid detection:
-      1. Structural check (NEW) — works on any label vocabulary. Catches
+    Hybrid detection (canonical 2-column form):
+      1. Structural check — works on any label vocabulary. Catches
          tables where labels like 'Reference', 'Policy Category', 'Coverage',
-         'Managed By' don't appear in the canonical _LABEL_ROW_KEYWORDS set.
-      2. Keyword fallback (LEGACY) — preserved verbatim for backward
+         'Managed By' don't appear in the canonical _LABEL_ROWWORDS set.
+      2. Keyword fallback — preserved verbatim for backward
          compatibility with documents whose labels match the canonical
          vocabulary (e.g. existing Award / School PDFs).
 
-    A table is a label-row table if EITHER check passes.
+    Transposed detection (Phase 5 — N-column form):
+      3. Header-row labels + value row. Triggered when the table has
+         ≥3 columns and ≤3 rows, with ≥2 Brain labels in row 0 and a
+         value row that fills ≥half the columns.
+
+    A table is a label-row table if ANY check passes.
     """
     if not table or len(table) < 2:
         return False
+
+    # ---- Check 3 (Phase 5): TRANSPOSED form (N columns, labels in row 0) ----
+    n_cols = max(len(r) for r in table if r)
+    if n_cols >= 3 and len(table) <= 3:
+        header_cells = [
+            (str(c).strip().lower().rstrip(":") if c else "")
+            for c in (table[0] or [])
+        ]
+        header_label_hits = sum(1 for c in header_cells if c in _LABEL_ROW_KEYWORDS)
+        if header_label_hits >= 2:
+            value_row = table[1] if len(table) >= 2 else []
+            value_cells = [(str(c).strip() if c else "") for c in (value_row or [])]
+            non_empty_values = sum(1 for v in value_cells if v)
+            if non_empty_values >= max(1, header_label_hits // 2):
+                return True
+
     if len(table[0]) != 2:
         return False
 

@@ -268,12 +268,39 @@ def _run_extracted_pipeline(
     from .rag.table_routing import _looks_like_label_row_table
 
     def _label_row_tables_to_paragraphs(tables):
+        """Convert key-value tables into `Label: value` paragraphs.
+
+        Supports both the canonical 2-column form (col 0 = label,
+        col 1 = value) AND the transposed N-column form (row 0 =
+        labels across columns, row 1 = values across columns). The
+        transposed form is general — it works for any future file
+        that encodes slot-1 metadata as a single-row label table.
+        """
         out: list[str] = []
         if not tables:
             return out
         for tbl in tables:
             if not tbl or not _looks_like_label_row_table(tbl):
                 continue
+            # ---- Phase 5: TRANSPOSED form (N columns, labels in row 0, values in row 1) ----
+            n_cols = max(len(r) for r in tbl if r)
+            if n_cols >= 3 and len(tbl) <= 3:
+                header_cells = [
+                    (str(c).strip() if c else "") for c in (tbl[0] or [])
+                ]
+                value_row = tbl[1] if len(tbl) >= 2 else []
+                value_cells = [
+                    (str(c).strip() if c else "") for c in (value_row or [])
+                ]
+                for label, value in zip(header_cells, value_cells):
+                    if not label or not value:
+                        continue
+                    if label.endswith(":"):
+                        out.append(f"{label} {value}")
+                    else:
+                        out.append(f"{label}: {value}")
+                continue
+            # ---- Canonical 2-column form (col 0 = label, col 1 = value) ----
             for row in tbl:
                 if not row or len(row) < 2:
                     continue
@@ -536,12 +563,18 @@ def _run_extracted_pipeline(
     from .rag.table_routing import _looks_like_label_row_table
 
     def _label_row_tables_to_paragraphs(tables):
-        """Convert 2-column key-value tables into `Label: value` paragraphs.
+        """Convert key-value tables into `Label: value` paragraphs.
 
         Returns a list of synthetic paragraph strings (possibly empty).
         Only tables detected as label-row tables are converted; other
         tables (tier tables, exclusion tables, history tables) are
         skipped by `_looks_like_label_row_table()`.
+
+        Supports both the canonical 2-column form (col 0 = label,
+        col 1 = value) AND the transposed N-column form (row 0 =
+        labels across columns, row 1 = values across columns). The
+        transposed form is general — it works for any future file
+        that encodes slot-1 metadata as a single-row label table.
         """
         out: list[str] = []
         if not tables:
@@ -549,6 +582,25 @@ def _run_extracted_pipeline(
         for tbl in tables:
             if not tbl or not _looks_like_label_row_table(tbl):
                 continue
+            # ---- Phase 5: TRANSPOSED form (N columns, labels in row 0, values in row 1) ----
+            n_cols = max(len(r) for r in tbl if r)
+            if n_cols >= 3 and len(tbl) <= 3:
+                header_cells = [
+                    (str(c).strip() if c else "") for c in (tbl[0] or [])
+                ]
+                value_row = tbl[1] if len(tbl) >= 2 else []
+                value_cells = [
+                    (str(c).strip() if c else "") for c in (value_row or [])
+                ]
+                for label, value in zip(header_cells, value_cells):
+                    if not label or not value:
+                        continue
+                    if label.endswith(":"):
+                        out.append(f"{label} {value}")
+                    else:
+                        out.append(f"{label}: {value}")
+                continue
+            # ---- Canonical 2-column form (col 0 = label, col 1 = value) ----
             for row in tbl:
                 if not row or len(row) < 2:
                     continue

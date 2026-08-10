@@ -1,0 +1,112 @@
+# Phase 4 — Layout / Routing / Phrase config for the hybrid RAG pipeline.
+#
+# All values are loaded at startup by `policy_platform.config.load_layout_config()`
+# and exposed via lazy properties on the relevant modules:
+#   * framework.section_map.SECTION_HEADING_SYNONYMS
+#   * rag.slot_queries.SLOT_QUERIES
+#   * rag.table_routing.TABLE_SLOT_SIGNALS / GENERIC_TABLE_SIGNALS / _LABEL_ROW_KEYWORDS
+#   * rag.heading_anchors._STRUCTURAL_BODY_BREAK_LABELS
+#   * rag.chunker.DEFAULT_PHRASE_TEMPLATES
+#   * rag.table_routing.TABLE_ORDER_HINT
+#
+# When the file is missing or malformed, all lazy properties fall back to
+# the original hard-coded Python literals — so the pipeline is safe by
+# default. To override for a specific deployment, set:
+#   AGENTIC_POLICY_LAYOUT_CONFIG=/path/to/custom-layout.yaml
+#
+# Schema is self-documenting: comments in YAML explain each section.
+# Each section here provides EXAMPLES of how to override defaults;
+# empty values mean "no override, use Python defaults".
+
+# Per-slot tunables. Slot ids 1-15 mirror the Brain Framework's
+# 15-slot template. Empty lists mean "no override, use Python defaults".
+slots:
+  "1":
+    label_row: true   # slot 1 is the slot-1 schema label-row table
+    heading_synonyms: []   # empty = no override
+    table_signals: []
+  "2":
+    label_row: true
+    heading_synonyms: []
+    table_signals: []
+  "3":
+    label_row: true
+    heading_synonyms: []
+    table_signals: []
+  "4":
+    label_row: false
+    heading_synonyms: []
+    table_signals: []
+  "5":
+    # Introduction. Add custom synonyms here to extend the default set.
+    heading_synonyms: []
+    table_signals: []
+  "6":
+    # Policy Statement
+    heading_synonyms: []
+    table_signals: []
+  "7":
+    # 1. Purpose
+    heading_synonyms: []
+    table_signals: []
+  "8":
+    # 2. Scope & Beneficiaries
+    heading_synonyms: []
+    table_signals: []
+  "9":
+    # 3. Exclusions
+    heading_synonyms: []
+    table_signals: []
+  "10":
+    # 4. Award Structure & Payout Tiers
+    heading_synonyms: []
+    table_signals: []
+    column_templates:
+      # Per-column override templates — used by RowPhraseBuilder
+      # when synthesizing header→value phrases. Customers can
+      # override these to match their domain vocabulary.
+      Amount: "payout amount is {value}"
+      Tier: "tier level is {value}"
+      Coverage: "coverage is {value}"
+  "11":
+    label_row: true   # slot 11 is policy review note (label-row)
+    heading_synonyms: []
+    table_signals: []
+  "12":
+    heading_synonyms: []
+    table_signals: []
+  "13":
+    heading_synonyms: []
+    table_signals: []
+  "14":
+    heading_synonyms: []
+    table_signals: []
+  "15":
+    external: true   # slot 15 is the Brain logo + image slot
+
+# Per-slot table-routing order hints. Used by `_apply_order_hint()` to
+# disambiguate among multiple candidate tables in a section. The hint
+# applies only when position-based routing produces multiple candidates.
+table_order_hints:
+  "10": "first_after_9"   # Awards table = first 3+-col table after slot 9's heading
+  "14": "all_in_section"   # History = all tables in slot 14's section
+
+# Per-column header→value phrase templates. Used when no per-slot
+# override exists. Round-robin assignment per cell within a row.
+phrase_templates:
+  - "{header}: {value}"
+  - "the {header} is {value}"
+  - "{header} equals {value}"
+
+# RAG label-chunking contract (Phase 4: load from config rather than
+# env var). When true, every section-heading label occurrence in a
+# paragraph becomes its own paragraph boundary.
+rag_label_chunking: true
+
+# Hybrid RAG scoring weights (Phase 4: loadable from config; same defaults
+# as the env-var knobs).
+rag_alpha: 0.7                       # 0.7 semantic, 0.3 keyword
+rag_top_k_per_backend: 5
+rag_rerank_pool: 5
+rag_min_confidence: 0.05
+rag_timeout_seconds: 120.0
