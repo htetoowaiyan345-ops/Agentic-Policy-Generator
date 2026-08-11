@@ -64,7 +64,9 @@ def test_one_paragraph_dense_input_matches_many_labels():
     )
     fm = _sentence_split_field_map([paragraph])
     # All ten labels should resolve.
-    assert fm.get("Type:") == "Policy."
+    # Per spec: Type extracts only the classification (not subject +
+    # classification), so "Policy." → "Policy" (trailing period stripped).
+    assert fm.get("Type:") == "Policy"
     assert "Brief Description:" in fm
     assert "Effective Date/Period:" in fm
     assert "Approved by:" in fm
@@ -194,7 +196,9 @@ def test_alternating_label_value_pairs_caught_by_parse():
     ]
     fm = _sentence_split_field_map(paragraphs)
     # Each label should map to its next-line value.
-    assert fm.get("Type:") == "HR Policy"
+    # Per spec: Type extracts only the classification; "HR Policy" is
+    # subject ("HR") + classification ("Policy"), so Type = "Policy".
+    assert fm.get("Type:") == "Policy"
     assert fm.get("Policy Number:") == "HR-ARP-001"
     assert fm.get("Applicable Sector(s):") == "Corporate Services & Operations"
     assert fm.get("Functional Area(s):") == "Human Resources"
@@ -233,7 +237,9 @@ def test_parse_recovers_cleaner_dropped_value():
     dropped: list[dict] = []
     fm = field_parser.parse(paragraphs, dropped_paragraphs=dropped)
     assert "Type:" in fm
-    assert fm["Type:"] == "HR Policy"
+    # Per spec: Type extracts only the classification; "HR Policy" splits
+    # to "Policy" (subject + classification separation).
+    assert fm["Type:"] == "Policy"
     assert "Policy Number:" in fm
     assert fm["Policy Number:"] == "HR-ARP-001"
 
@@ -255,7 +261,9 @@ def test_alternating_skips_header_lines_with_no_canonical():
     ]
     fm = field_parser.parse(paragraphs, dropped_paragraphs=[])
     assert "Type:" in fm
-    assert fm["Type:"] == "HR Policy"
+    # Per spec: Type extracts only the classification; "HR Policy" splits
+    # to "Policy" (subject + classification separation).
+    assert fm["Type:"] == "Policy"
     assert "Policy Number:" in fm
     assert fm["Policy Number:"] == "HR-ARP-001"
 

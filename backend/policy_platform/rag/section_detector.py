@@ -44,6 +44,13 @@ def looks_like_section_heading(paragraph: str) -> bool:
         return False
     first_line = text.split("\n")[0].strip()
 
+    # Check 0: Bare-number section marker "3." — must be checked before
+    # the length check because "3." is only 2 chars. General pattern for
+    # numbered policy documents where a section starts with just a
+    # number and dot on its own line.
+    if re.match(r"^\s*\d+\.\s*$", first_line):
+        return True
+
     # Very short paragraphs (< 3 chars) are not headings.
     if len(first_line) < 3:
         return False
@@ -92,6 +99,17 @@ def looks_like_section_heading(paragraph: str) -> bool:
     }
     cleaned = first_line.rstrip(":.-\ufffd").rstrip()
     if cleaned.lower() in KNOWN_HEADINGS and ":" not in first_line:
+        return True
+
+    # Check 5: Numbered sub-section heading "3.1. Title:" — a numbered
+    # heading (with optional sub-number) followed by a short capitalized
+    # title ending with a colon or dash. This is general — applies to any
+    # policy with numbered sub-sections (e.g. "3.1. Health Care:",
+    # "2.1. Scope:"). The title is restricted to <= 50 chars and must
+    # end with a terminator to distinguish from numbered clauses that
+    # have long body text (e.g. "2.1. This policy applies to..." has
+    # no colon and long body, so it does NOT match).
+    if re.match(r"^\s*\d+(?:\.\d+)*\.\s+[A-Z][A-Za-z\s\-&/]{0,50}\s*[:\-]\s*$", first_line):
         return True
 
     # Check 4: Multi-line: heading on first line, body on subsequent lines.

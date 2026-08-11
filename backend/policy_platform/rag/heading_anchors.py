@@ -332,8 +332,23 @@ def _is_boundary(paragraph: str) -> bool:
     if _is_toc_entry(paragraph):
         return False
     for pattern in _COMPILED_BOUNDARIES:
-        if pattern.match(first):
-            return True
+        m = pattern.match(first)
+        if not m:
+            continue
+        # Distinguish whitespace-separated matches (e.g.
+        # "Benefits are payable by the Company..." matched by the
+        # slot-10 synonym "benefits") from heading-style matches
+        # (e.g. "Type: of benefits"). A real section heading is
+        # either short OR has a strong separator (:, -, .) on the
+        # matched label. Long prose starting with a heading word is
+        # body content, not a heading.
+        end_pos = m.end()
+        if end_pos < len(first):
+            sep = first[end_pos - 1]
+            if sep.isspace():
+                if not _is_heading_like_line(first):
+                    continue
+        return True
     # Generic fallback: any paragraph that looks like a section
     # heading is also a boundary. This is strict by design - the
     # section_detector only matches strong heading signals.
@@ -343,6 +358,22 @@ def _is_boundary(paragraph: str) -> bool:
             return True
     except Exception:
         pass
+    return False
+
+
+def _is_heading_like_line(line: str) -> bool:
+    """True if the line still reads like a heading (not body prose)
+    after a whitespace-separated synonym match.
+
+    A real heading is short OR contains a strong separator (:/-/dash).
+    A long body sentence starting with a section-related word (e.g.
+    "Benefits are payable by the Company...") is NOT a heading.
+    """
+    stripped = line.strip()
+    if len(stripped) <= 60:
+        return True
+    if ":" in line or "\u2013" in line or " - " in line:
+        return True
     return False
 
 
@@ -819,6 +850,19 @@ def _is_cross_slot_boundary(paragraph: str) -> bool:
     # find_heading_match() handles the opposite case (the History
     # slot itself extending forward).
     if _cross_slot_label_regex().match(first):
+        # A cross-slot label that opens a long prose sentence (e.g.
+        # "Benefits are payable by the Company which employs the
+        # employee. The policy does not apply...") is body content,
+        # not a real cross-slot heading. Reject it unless the line
+        # still reads like a heading (short, or has a strong
+        # separator like ':' or '-'). This prevents the body walk
+        # from stopping mid-section when a body sentence happens to
+        # start with a section-related word.
+        m = _cross_slot_label_regex().match(first)
+        end_pos = m.end() if m else 0
+        if end_pos and end_pos < len(first) and first[end_pos - 1].isspace():
+            if not _is_heading_like_line(first):
+                return False
         return True
     # Structural body-break labels. These aren't Brain-section
     # heading synonyms (so the regex above doesn't catch them) but

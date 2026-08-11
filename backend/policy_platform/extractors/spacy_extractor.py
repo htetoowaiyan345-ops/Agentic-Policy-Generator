@@ -21,6 +21,7 @@ from typing import Iterable
 from policy_platform.framework.brain_fields import (
     BRAIN_LABEL_ROWS,
     canonical_label,
+    parse_field_value,
 )
 
 
@@ -167,11 +168,15 @@ def extract_field_map(
         if split is None:
             continue
         canonical, value = split
+        # Phase 6: validate the value via field-specific rules.
+        cleaned = parse_field_value(canonical, value)
+        if cleaned is None:
+            continue
         matched += 1
         if canonical not in field_map or (
-            not field_map[canonical] and value
+            not field_map[canonical] and cleaned
         ):
-            field_map[canonical] = value
+            field_map[canonical] = cleaned
 
     extraction_path = "spacy" if matched > 0 else "spacy-fallback"
     return field_map, extraction_path

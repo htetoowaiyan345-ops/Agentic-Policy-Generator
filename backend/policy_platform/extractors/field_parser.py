@@ -35,6 +35,7 @@ from policy_platform.framework.brain_fields import (
     canonical_label,
     field_map,
     iter_brain_labels,
+    parse_field_value,
 )
 
 
@@ -144,10 +145,20 @@ def _sentence_split_with_brain_labels(s: str) -> list[str]:
 def _label_match(clause: str) -> tuple[str, str] | None:
     """Try the regex `Label: value` on a clause. Stripped and trimmed.
 
-    Returns (canonical_label, value) or None.
+    Returns (canonical_label, raw_value) or None. The raw value is
+    NOT validated here — validation happens at a higher level
+    (parse_field_value in brain_fields.py) so internal helpers
+    can see all candidate matches.
 
-    Pure-digit values (e.g. phone numbers or reference IDs) are rejected
-    — they are almost certainly extraction artifacts, not real label values.
+    Pure-digit values (e.g. phone numbers or reference IDs) are
+    still rejected here because they are always extraction artifacts.
+
+    Phase 6 — clamp the greedy regex capture at the first sentence
+    boundary (`.` followed by capital letter, or `,` followed by a
+    known Brain-label prefix). This prevents the regex from
+    swallowing continuation text like "Policy. to all sectors..."
+    into a single value. General heuristic — works for any future
+    file whose values may span across sentence boundaries.
     """
     s = clause.strip()
     if not s:
@@ -163,10 +174,67 @@ def _label_match(clause: str) -> tuple[str, str] | None:
     # (phone numbers, reference IDs), not legitimate label values.
     if re.fullmatch(r"\d+", value):
         return None
+    # Phase 6 — clamp at first sentence boundary (general heuristic).
+    value = _clamp_label_value(value)
+    if not value:
+        return None
     canon = canonical_label(label + ":")
     if canon is None:
         return None
     return canon, value
+
+
+def _clamp_label_value(value: str) -> str:
+    """Clamp a greedy regex-captured value at the first sentence boundary.
+
+    The `_LABEL_LINE_RE` captures greedily — `Type: Policy. to all
+    sectors` becomes value="Policy. to all sectors". This helper
+    stops the capture at the first sentence/label boundary so
+    downstream validation sees only the actual value.
+
+    General heuristic — does NOT hardcode any specific labels.
+    Stops at:
+      - `.` or `;` followed by a space and an uppercase letter
+        (sentence boundary).
+      - `,` followed by a space and a known Brain-label prefix
+        (next label in comma-separated dense paragraphs).
+
+    Does NOT clamp values that contain dates or reference numbers
+    (they may legitimately have commas).
+    """
+    v = value
+    # Don't clamp dates or reference numbers.
+    from policy_platform.framework.brain_fields import (
+        _looks_like_date,
+        _looks_like_reference,
+    )
+    if _looks_like_date(v) or _looks_like_reference(v):
+        return v
+    # Find first sentence boundary: `. ` or `; ` followed by uppercase.
+    sentence_end = -1
+    for i in range(len(v)):
+        ch = v[i]
+        if ch in (".", ";") and i + 2 < len(v) and v[i + 1] == " ":
+            next_char = v[i + 2]
+            if next_char.isupper():
+                sentence_end = i
+                break
+    if sentence_end > 0:
+        v = v[:sentence_end].rstrip()
+    # If still has `, BrainLabel:` pattern, stop there too.
+    # Look for ", " followed by a known Brain label prefix.
+    from policy_platform.framework.brain_fields import canonical_label
+    for j in range(len(v)):
+        if v[j] == "," and j + 2 < len(v) and v[j + 1] == " ":
+            # Find next colon after the comma.
+            tail = v[j + 2:]
+            colon = tail.find(":")
+            if colon > 0:
+                cand = tail[:colon + 1].strip()
+                if canonical_label(cand) is not None:
+                    v = v[:j].rstrip()
+                    break
+    return v.strip()
 
 
 def _join_continued_lines(paragraphs: list[str]) -> list[str]:
@@ -400,13 +468,17 @@ def _sentence_split_field_map(
     """Phase B fallback: re-join continued lines, split on sentence boundaries,
     then match each clause as a label-row.
 
+    Phase 6 — values are validated via `parse_field_value()` from
+    brain_fields.py. Invalid values are rejected.
+
     Args:
         paragraphs: A sequence of cleaned paragraphs.
         dropped_paragraphs: Optional list of cleaner-dropped records
             (each a dict with keys like 'text', 'reason', 'index').
         cleaned_to_original: Optional parallel list mapping cleaned-line-index
-            to original-line-index. Used by Phase B.1 (alternating layout)
-            to recover cleaner-dropped values via index alignment.
+            to original-line-index in the pre-cleaning paragraph stream.
+            When provided, Phase B.1 uses index alignment to recover
+            cleaner-dropped values that lie between two cleaned labels.
 
     Returns a FieldMap dict.
     """
@@ -424,8 +496,12 @@ def _sentence_split_field_map(
     pairs.extend(_split_into_label_clauses(joined))
     out: dict[str, str] = {}
     for canon, value in pairs:
-        if canon not in out or (not out[canon] and value):
-            out[canon] = value
+        # Phase 6: validate the value via field-specific rules.
+        cleaned = parse_field_value(canon, value)
+        if cleaned is None:
+            continue
+        if canon not in out or (not out[canon] and cleaned):
+            out[canon] = cleaned
     return out
 
 

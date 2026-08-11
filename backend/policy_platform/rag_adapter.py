@@ -12,6 +12,7 @@ the existing renderer.
 """
 from __future__ import annotations
 
+import re
 from typing import List
 
 from . import config
@@ -25,6 +26,27 @@ from .rag.heading_anchors import _strip_heading_label
 _RULE = "rag_hybrid"
 _RULE_HEADING = "heading_anchor"
 _RULE_TABLE = "table_passthrough"
+
+
+# Split at numbered-clause starts (e.g. "2.1.", "1.1.", "3.4.") that
+# already exist in the source document. Lookahead-only so the matched
+# prefix is preserved on the next chunk. The negative lookbehind
+# `(?<![\d.])` prevents splitting mid-number like "1.2.3".
+#
+# The regex requires a period after the digit(s) (or a multi-part
+# number like "2.1") to qualify as a clause boundary. This prevents
+# splitting at dates ("03 July 2026"), version numbers ("FY26-27"),
+# or tier numbers ("Tier 1 Minor") which are NOT numbered clauses.
+_CLAUSE_SPLIT_RE = re.compile(
+    r"(?<![\d.])"
+    r"(?="
+    r"\d+(?:\.\d+)+\.?\s+[A-Z]"  # multi-part: "2.1. ", "3.4.2. "
+    r"|"
+    r"\d+\.\s+[A-Z]"               # single-part with period: "2. ", "1. "
+    r")"
+)
+# Split at bullet markers (▪) that already exist in the source.
+_BULLET_SPLIT_RE = re.compile(r"(\s*\u25aa\s*)")
 
 
 def build_classification_from_rag(
@@ -60,7 +82,7 @@ def build_classification_from_rag(
 
         if assignment.chunk_text and assignment.table:
             stripped_text = _strip_heading_label(assignment.chunk_text, slot_id)
-            content_paragraphs = [_normalize_chunk(stripped_text)]
+            content_paragraphs = _split_into_source_paragraphs(stripped_text)
             content_tables = [assignment.table]
             if getattr(assignment, "extra_tables", None):
                 content_tables.extend(assignment.extra_tables)
@@ -76,7 +98,7 @@ def build_classification_from_rag(
             routing_rule = _RULE_TABLE
         elif assignment.chunk_text:
             stripped_text = _strip_heading_label(assignment.chunk_text, slot_id)
-            content_paragraphs = [_normalize_chunk(stripped_text)]
+            content_paragraphs = _split_into_source_paragraphs(stripped_text)
             status = "Found"
             if assignment.backend == "heading_anchor":
                 routing_rule = _RULE_HEADING
@@ -133,9 +155,48 @@ def _normalize_chunk(text: str) -> str:
     - Trim leading/trailing whitespace.
     - Ensure trailing sentence terminator (renderer will add one if needed).
     """
-    import re
-
     s = re.sub(r"\s+", " ", text or "").strip()
     if s and s[-1] not in ".!?":
         s = s + "."
     return s
+
+
+def _split_into_source_paragraphs(text: str) -> list[str]:
+    """Split a prose chunk at numbered-clause boundaries and bullet
+    markers that already exist in the source document.
+
+    Goal: preserve the source PDF's paragraph structure 1:1. Each
+    numbered clause (2.1., 1.1., 3.4., ...) and each bullet (▪) becomes
+    its own content_paragraph item, matching how the source PDF lays
+    them out on separate lines.
+
+    No new line breaks are invented. The split regex only fires at
+    clauses/bullets that already exist. When the input has no numbered
+    clauses or bullets (e.g. a single-sentence scope like "All local
+    employees directly affected by a verified flood event."), the
+    function falls back to a single-paragraph list so short-scope
+    documents are unaffected.
+    """
+    if not text or not text.strip():
+        return [_normalize_chunk(text)] if text else []
+    chunks = [c for c in _CLAUSE_SPLIT_RE.split(text) if c.strip()]
+    out: list[str] = []
+    for chunk in chunks:
+        pieces = _BULLET_SPLIT_RE.split(chunk)
+        cur = ""
+        for pc in pieces:
+            if not pc:
+                continue
+            if pc.strip() == "\u25aa":
+                if cur.strip():
+                    out.append(_normalize_chunk(cur))
+                cur = "\u25aa "
+            else:
+                cur += pc
+        if cur.strip():
+            out.append(_normalize_chunk(cur))
+    if not out:
+        return [_normalize_chunk(text)]
+    if len(out) == 1:
+        return out
+    return out

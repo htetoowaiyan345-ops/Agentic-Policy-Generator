@@ -6,6 +6,7 @@ rule-based analyzer. The renderer and downstream code are unchanged.
 """
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from typing import Iterable, Optional
@@ -38,25 +39,316 @@ def _maybe_inject_title_from_top_paragraph(
     first short heading-like paragraph near the top as the title.
 
     Structural heuristic — no hardcoded labels, no defaults. Only fires when
-    the field_map has no Policy Title AND a top paragraph looks title-like
-    (2-15 words, no trailing period). Lets documents that put the title as
-    a standalone heading (e.g. "POLICY TEMPLATE - AWARD AND RECOGNITION PROGRAM")
-    still fill the Policy Title slot.
+    the field_map has no Policy Title AND a top paragraph looks title-like.
+
+    Phase 6 — strict selection rules to extract only the main title:
+      - Look at first 5 paragraphs after dispatch() normalization.
+      - Reject any candidate that:
+        * contains `:` (it's a Label:Value line)
+        * contains `;` (multi-clause prose)
+        * ends with `.` followed by lowercase (sentence, not title)
+        * starts with a digit and contains `|` or `Page` (page footer)
+        * is shorter than 8 chars (too short to be a real title)
+        * contains `.` mid-string before the end (multi-sentence prose)
+      - Among the remaining candidates, pick the FIRST one that survives.
+      - Multi-line: if the candidate contains `\n`, take only first segment.
+      - Title prefix stripping: strip leading "Document Type – Title"
+        or "Document Type: Title" prefix to extract just the title.
+      - Phase 6+: validate the candidate via `parse_field_value` which
+        also rejects section-marker words (Purpose, Scope, etc.).
+
+    Lets documents that put the title as a standalone heading (e.g.
+    "POLICY TEMPLATE - AWARD AND RECOGNITION PROGRAM") still fill the
+    Policy Title slot. This works for any file — no per-file hardcoding.
     """
     if field_map.get("Policy Title:"):
         return field_map
     if not paragraphs:
         return field_map
-    for p in paragraphs[:3]:
+    for p in paragraphs[:5]:
         if not p:
             continue
         clean = str(p).strip()
         if not clean:
             continue
-        word_count = len(clean.split())
-        if 2 <= word_count <= 15 and not clean.endswith("."):
-            return {**field_map, "Policy Title:": clean}
+        # Rejection rules (Phase 6 — general heuristics).
+        if ":" in clean:
+            continue
+        if ";" in clean:
+            continue
+        if len(clean) < 8 or len(clean) > 200:
+            continue
+        # Page footer: starts with digit + contains `|` or "Page".
+        if (
+            clean[:1].isdigit()
+            and ("|" in clean or "Page" in clean or "page" in clean)
+        ):
+            continue
+        # Sentence ending: `.` followed by lowercase (sentence, not title).
+        if clean.endswith(".") and len(clean) > 1 and clean[-2].islower():
+            continue
+        # Has a period before the end (multi-sentence prose).
+        if clean[:-1].count(".") > 0:
+            continue
+        # Multi-line: if there's a newline, take only first segment.
+        first_segment = clean.split("\n", 1)[0].strip()
+        if not first_segment or len(first_segment) < 8:
+            continue
+        # Phase 6 — strip document-type prefix. Many real-world PDFs
+        # render titles as "Group Policy – Employee Health Benefit Policy"
+        # where the first part is a document classification. General
+        # pattern: strip leading capitalized-word(s) followed by a
+        # separator (`–`, `—`, `-`, or `:`).
+        stripped = _strip_title_prefix(first_segment)
+        # Final validation via parse_field_value (rejects section-marker
+        # words like "Purpose", "Scope", etc., and applies length cap).
+        from .framework.brain_fields import parse_field_value
+        validated = parse_field_value("Policy Title:", stripped)
+        if validated is None:
+            continue
+        return {**field_map, "Policy Title:": validated}
     return field_map
+
+
+def _normalize_value_for_compare(value: str) -> str:
+    """Normalize a value for cross-field comparison.
+
+    Lowercases, collapses whitespace, strips punctuation. Used to
+    detect whether two values refer to the same thing (e.g., "Human
+    Resources" appearing in both Functional Area and Applies to).
+    General helper — no per-file hardcoding.
+    """
+    return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+
+
+def _refine_field_map_cross_field(field_map: dict) -> dict:
+    """Apply cross-field refinement rules to the populated field_map.
+
+    General heuristics — no per-file hardcoding. Rules:
+
+      1. Applies to: drop values that match (case-insensitive,
+         whitespace-normalized) any value already in Functional Area(s)
+         or Responsible Function(s). General rule: "Do not extract
+         Responsible departments or policy owners unless they are
+         explicitly part of the audience."
+
+      2. Supersedes: drop values that match the Policy Number (the
+         current document's reference). General rule: "Do Not Extract:
+         Current document version."
+
+      3. Last Reviewed: drop values that match the Effective Date/Period
+         exactly. General rule: "Do Not Extract: Effective Date / Issue
+         Date / Revision Date."
+
+      4. Responsible Function Officer(s): when the slot is empty AND
+         Approved by is populated, inherit Approved by. General rule:
+         "Include individuals listed under Approved by, Policy Owner,
+         Responsible Officer, Accountable Executive, Sponsor."
+
+    The rules apply independently and are not order-dependent (each
+    rule only operates on the input map's existing values).
+
+    If a cross-field rule empties a slot, the value is removed so the
+    renderer writes the standard "Data is not found in source file"
+    marker.
+    """
+    if not field_map:
+        return field_map
+
+    out = dict(field_map)
+
+    # Gather normalized values from supporting slots for dedup checks.
+    policy_number = out.get("Policy Number:", "")
+    effective_date = out.get("Effective Date/Period:", "")
+    approved_by = out.get("Approved by:", "")
+
+    # Gather Functional Area + Responsible Function values for Applies-to
+    # dedup. Multi-value fields are comma-joined; split them.
+    def _split_multi(v: str) -> list[str]:
+        if not v:
+            return []
+        # Split on comma, semicolon, ` and `, ` & `.
+        v2 = re.sub(r"\s+and\s+", ",", v, flags=re.IGNORECASE)
+        v2 = re.sub(r"\s+&\s+", ",", v2)
+        return [p.strip() for p in re.split(r"[,;]", v2) if p.strip()]
+
+    func_area_parts = {
+        _normalize_value_for_compare(p)
+        for p in _split_multi(out.get("Functional Area(s):", ""))
+    }
+    resp_func_parts = {
+        _normalize_value_for_compare(p)
+        for p in _split_multi(out.get("Responsible Function(s):", ""))
+    }
+    protected_areas = func_area_parts | resp_func_parts
+
+    # Rule 1: Applies to — drop values that match a protected area.
+    applies_to = out.get("Applies to:", "")
+    if applies_to:
+        parts = _split_multi(applies_to)
+        kept = [
+            p for p in parts
+            if _normalize_value_for_compare(p) not in protected_areas
+        ]
+        if not kept:
+            out.pop("Applies to:", None)
+        elif len(kept) != len(parts):
+            out["Applies to:"] = ", ".join(kept)
+
+    # Rule 2: Supersedes — drop values that match the Policy Number.
+    supersedes = out.get("Supersedes:", "")
+    if supersedes and policy_number:
+        pol_norm = _normalize_value_for_compare(policy_number)
+        if pol_norm:
+            parts = [p.strip() for p in supersedes.split(";") if p.strip()]
+            kept = [
+                p for p in parts
+                if _normalize_value_for_compare(p) != pol_norm
+            ]
+            if not kept:
+                out.pop("Supersedes:", None)
+            elif len(kept) != len(parts):
+                out["Supersedes:"] = "; ".join(kept)
+
+    # Rule 3: Last Reviewed — drop values that match Effective Date/Period.
+    last_reviewed = out.get("Last Reviewed:", "")
+    if last_reviewed and effective_date:
+        if (
+            _normalize_value_for_compare(last_reviewed)
+            == _normalize_value_for_compare(effective_date)
+        ):
+            out.pop("Last Reviewed:", None)
+
+    # Rule 4: Responsible Function Officer(s) — inherit Approved by when empty.
+    officer_val = out.get("Responsible Function Officer(s):", "")
+    if not officer_val and approved_by:
+        out["Responsible Function Officer(s):"] = approved_by
+
+    return out
+
+
+def _maybe_inject_reason_from_intro_paragraph(
+    field_map: dict, paragraphs: list
+) -> dict:
+    """If the Reason for Policy slot is empty after label-row synthesis,
+    infer it from a paragraph that begins with a reason-intro phrase.
+
+    General English patterns detected:
+      - "This policy is required/needed/necessary/intended/designed/established …"
+      - "The purpose of this policy is …"
+      - "In order to …"
+      - "To ensure/comply with/meet …"
+      - "Because/Since/As …"
+
+    Only fires when the field_map has no Reason for Policy AND a
+    paragraph matches the intro pattern. The matched paragraph is
+    truncated to a single sentence (≤ 600 chars) to keep the slot
+    concise.
+
+    Works for any file whose reason-for-policy section starts with
+    one of these general phrasing patterns — no per-file hardcoding.
+    """
+    if field_map.get("Reason for Policy:"):
+        return field_map
+    if not paragraphs:
+        return field_map
+    reason_intros = (
+        "this policy is required",
+        "this policy is needed",
+        "this policy is necessary",
+        "this policy is intended",
+        "this policy is designed",
+        "this policy is established",
+        "this policy is aimed",
+        "this policy aims",
+        "this standard is required",
+        "this standard is intended",
+        "this procedure is required",
+        "this guideline is required",
+        "this framework is required",
+        "this manual is required",
+        "this charter is required",
+        "this directive is required",
+        "this regulation is required",
+        "this document is required",
+        "this document is intended",
+        "this document is designed",
+        "the purpose of this policy",
+        "the purpose of this standard",
+        "the purpose of this document",
+        "in order to",
+        "to ensure",
+        "to comply with",
+        "to meet",
+        "to satisfy",
+        "to address",
+        "to protect",
+        "because ",
+        "since ",
+        "as ",
+        "aimed to provide",
+        "designed to",
+        "intended to",
+        "established to",
+        "created to",
+    )
+    for p in paragraphs[:30]:
+        if not p:
+            continue
+        clean = str(p).strip()
+        if not clean or len(clean) < 20 or len(clean) > 1000:
+            continue
+        low = clean.lower()
+        if not any(low.startswith(intro) for intro in reason_intros):
+            continue
+        # Take only first sentence.
+        first_sentence = re.split(r"(?<=[.!?])\s+", clean, maxsplit=1)[0]
+        # Cap length.
+        truncated = first_sentence[:600].rstrip()
+        if not truncated:
+            continue
+        return {**field_map, "Reason for Policy:": truncated}
+    return field_map
+
+
+# Phase 6 — title prefix stripping pattern. Matches leading
+# capitalized word(s) followed by a separator (– en-dash, — em-dash,
+# hyphen, or colon). General heuristic — works for any future file
+# whose title follows the "Document Type – Title" or "Document Type:
+# Title" pattern.
+_TITLE_PREFIX_RE = re.compile(
+    r"^([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*)\s*[\u2013\u2014\-:]\s*"
+)
+
+
+def _strip_title_prefix(candidate: str) -> str:
+    """Strip a leading document-type prefix from a title candidate.
+
+    General heuristic — detects patterns like:
+      - "Group Policy – Employee Health Benefit Policy"
+        → "Employee Health Benefit Policy"
+      - "Standard Procedure: Leave Application" → "Leave Application"
+      - "Framework - Data Privacy" → "Data Privacy"
+      - "Sexual Harassment Policy for All Employers" → unchanged
+        (no separator prefix)
+
+    Works for any document whose title is prefixed with a document-
+    classification noun phrase followed by a separator (`–`, `—`,
+    `-`, or `:`). HR_00002 PDF is used only as a reference for the
+    expected format — no per-file hardcoding.
+    """
+    v = candidate.strip()
+    m = _TITLE_PREFIX_RE.match(v)
+    if m:
+        # Only strip if the prefix is 1-4 capitalized words. This
+        # avoids stripping single common words like "Annual" or
+        # "Final" that are not document-type prefixes.
+        prefix_words = m.group(1).split()
+        if 1 <= len(prefix_words) <= 4:
+            remainder = v[m.end():].strip()
+            if remainder:
+                return remainder
+    return v
 
 
 # Process-wide RAG pipeline. The underlying sentence-transformer +
@@ -329,6 +621,21 @@ def _run_extracted_pipeline(
     field_map = _maybe_inject_title_from_top_paragraph(
         field_map, list(extracted.paragraphs)
     )
+    field_map = _maybe_inject_reason_from_intro_paragraph(
+        field_map, list(extracted.paragraphs)
+    )
+    field_map = _refine_field_map_cross_field(field_map)
+    # Phase 7: prose-inference for label-light documents. Fills empty
+    # slots from body prose using general English patterns. Existing
+    # label-row values are not overwritten.
+    from .extractors.narrative_inference import infer_narrative_fields
+    inferred = infer_narrative_fields(
+        list(extracted.paragraphs), field_map
+    )
+    if inferred:
+        for k, v in inferred.items():
+            if not field_map.get(k):
+                field_map[k] = v
 
     # Step 3: RAG-Hybrid retrieval
     try:
@@ -635,6 +942,21 @@ def _run_extracted_pipeline(
     field_map = _maybe_inject_title_from_top_paragraph(
         field_map, list(extracted.paragraphs)
     )
+    field_map = _maybe_inject_reason_from_intro_paragraph(
+        field_map, list(extracted.paragraphs)
+    )
+    field_map = _refine_field_map_cross_field(field_map)
+    # Phase 7: prose-inference for label-light documents. Fills empty
+    # slots from body prose using general English patterns. Existing
+    # label-row values are not overwritten.
+    from .extractors.narrative_inference import infer_narrative_fields
+    inferred = infer_narrative_fields(
+        list(extracted.paragraphs), field_map
+    )
+    if inferred:
+        for k, v in inferred.items():
+            if not field_map.get(k):
+                field_map[k] = v
 
     # Step 3: RAG-Hybrid retrieval
     try:

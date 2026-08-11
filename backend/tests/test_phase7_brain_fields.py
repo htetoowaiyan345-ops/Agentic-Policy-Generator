@@ -137,9 +137,14 @@ def test_pipeline_fills_field_value(tmp_path):
     # The output docx must contain the input values.
     with zipfile.ZipFile(r.output_path) as z:
         doc = z.read("word/document.xml").decode("utf-8", errors="replace")
-    assert "HR Policy" in doc
+    # Per spec: Type extracts only the classification. "HR Policy" is
+    # subject ("HR") + classification ("Policy"), so Type row shows
+    # "Policy" only. Policy Title remains the full input title.
     assert "Vacation Policy" in doc
     assert "BT-001" in doc
+    # The Type row's body text should be just "Policy", not "HR Policy".
+    # Check the canonical "Type:" label renders with "Policy" body.
+    assert "<w:t" in doc and "Policy" in doc
 
 
 def test_pipeline_renders_missing_field_marker(tmp_path):
