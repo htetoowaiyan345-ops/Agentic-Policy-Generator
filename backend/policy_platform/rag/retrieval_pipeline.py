@@ -165,6 +165,169 @@ def _prose_table_overlap(anchor_text: str, table: List[List[str]]) -> bool:
     return overlap >= 0.70
 
 
+def _has_version_history_markers(paragraphs) -> bool:
+    """True if the document contains version-history markers.
+
+    Used as a guard for slot 14 (History) RAG fallback: if the document
+    has no version-history content, RAG may pick semantically-similar
+    but wrong content (e.g. checkbox lines, form fields). In that case
+    slot 14 should return 'Data is not found' instead of fabricating
+    content.
+
+    Markers checked (general, not hardcoded to specific files):
+    - "version" / "versions" / "versioned"
+    - "FY" followed by digits (e.g. FY26, FY26-27)
+    - "initial draft" / "first draft"
+    - "revision history" / "version history" / "document history"
+    - "change log" / "changelog"
+    - "amendment history"
+    """
+    import re as _re
+    if not paragraphs:
+        return False
+    combined = " ".join(p.lower() for p in paragraphs)
+    if "version" in combined:
+        return True
+    if "initial draft" in combined or "first draft" in combined:
+        return True
+    if "revision history" in combined or "version history" in combined:
+        return True
+    if "document history" in combined or "change log" in combined or "changelog" in combined:
+        return True
+    if "amendment history" in combined:
+        return True
+    if _re.search(r"\bfy\s*\d", combined):
+        return True
+    return False
+
+
+def _has_exclusions_section_markers(paragraphs) -> bool:
+    """True if the document contains an Exclusions section heading.
+
+    Used as a guard for slot 9 (Exclusions) RAG fallback: if the document
+    has no Exclusions section, RAG may pick semantically-similar but
+    wrong content (e.g. a clause from the claims process that mentions
+    "not eligible") when no dedicated Exclusions section exists in the
+    source.
+
+    Checks for the standard Exclusions section-heading synonyms used
+    by the heading-anchor detector. General pattern, not hardcoded to
+    specific files.
+    """
+    import re as _re
+    if not paragraphs:
+        return False
+    # The section-heading regex matches a line that starts with the
+    # synonym followed by a separator (:, -, ., or EOL). We use the
+    # same pattern as _EXCLUSIONS_HEADING_RE in narrative_inference.py.
+    heading_re = _re.compile(
+        r"^\s*(?:\d+(?:\.\d+)*\.?\s+)?"
+        r"(?:exclusions?|exceptions?|limitations?|not\s+covered|out\s+of\s+scope|not\s+applicable|excluded\s+groups?|excluded\s+persons?|excluded\s+entities?)"
+        r"\s*[:\-.]?\s*$",
+        _re.IGNORECASE,
+    )
+    for p in paragraphs:
+        first_line = p.split("\n")[0].strip() if p else ""
+        if heading_re.match(first_line):
+            return True
+    return False
+
+
+def _has_related_policies_section_markers(paragraphs) -> bool:
+    """True if the document contains a Related Policies section heading.
+
+    Used as a guard for slot 13 (Related Policies) RAG fallback: if the
+    document has no Related Policies section, RAG may pick semantically-
+    similar but wrong content (e.g. a body sentence mentioning
+    "supporting documents" in the claims process). In that case slot
+    13 should return 'Data is not found'.
+
+    Checks for the standard Related Policies section-heading synonyms
+    at the START of a line (with optional numbering prefix). General
+    pattern, not hardcoded to specific files.
+    """
+    import re as _re
+    if not paragraphs:
+        return False
+    heading_re = _re.compile(
+        r"^\s*(?:\d+(?:\.\d+)*\.?\s+)?"
+        r"(?:related\s+(?:policies|documents|forms|procedures|guidelines|materials|resources)|"
+        r"references|associated\s+(?:policies|documents)|"
+        r"linked\s+(?:policies|documents)|companion\s+(?:policies|documents)|"
+        r"supplementary\s+(?:policies|documents)|reference\s+materials|"
+        r"external\s+references|further\s+reading|see\s+also|"
+        r"for\s+more\s+information|see\s+related|other\s+(?:policies|resources))"
+        r"\b",
+        _re.IGNORECASE,
+    )
+    for p in paragraphs:
+        first_line = p.split("\n")[0].strip() if p else ""
+        if heading_re.match(first_line):
+            return True
+    return False
+
+
+def _has_introduction_section_markers(paragraphs) -> bool:
+    """True if the document contains an Introduction section heading.
+
+    Used as a guard for slot 5 (Introduction) RAG fallback and
+    position-based fallback: if the document has no Introduction section,
+    both fallbacks may pick semantically-similar but wrong content (e.g.
+    a Scope sentence). In that case slot 5 should return 'Data is not
+    found' instead.
+
+    Checks for the standard Introduction section-heading synonyms used
+    by the heading-anchor detector. General pattern, not hardcoded to
+    specific files.
+    """
+    import re as _re
+    if not paragraphs:
+        return False
+    heading_re = _re.compile(
+        r"^\s*(?:\d+(?:\.\d+)*\.?\s+)?"
+        r"(?:introduction|background|preamble|overview|policy\s+introduction|"
+        r"executive\s+overview|introduction\s+and\s+scope|"
+        r"introduction\s+and\s+purpose|introduction\s+and\s+background)"
+        r"\s*[:\-.]?\s*$",
+        _re.IGNORECASE,
+    )
+    for p in paragraphs:
+        first_line = p.split("\n")[0].strip() if p else ""
+        if heading_re.match(first_line):
+            return True
+    return False
+
+
+def _has_policy_statement_section_markers(paragraphs) -> bool:
+    """True if the document contains a Policy Statement section heading.
+
+    Used as a guard for slot 6 (Policy Statement) RAG fallback: if the
+    document has no Policy Statement section, RAG may pick semantically-
+    similar but wrong content (e.g. a Scope sentence). In that case
+    slot 6 should return 'Data is not found'.
+
+    Checks for the standard Policy Statement section-heading synonyms
+    used by the heading-anchor detector. General pattern, not hardcoded
+    to specific files.
+    """
+    import re as _re
+    if not paragraphs:
+        return False
+    heading_re = _re.compile(
+        r"^\s*(?:\d+(?:\.\d+)*\.?\s+)?"
+        r"(?:policy\s+statement|policy\s+statement\s*[-:&\s]+\s*(?:purpose|company|scope)?|"
+        r"statement\s+of\s+policy|company\s+policy|corporate\s+policy)"
+        r"\s*[:\-.]?\s*$",
+        _re.IGNORECASE,
+    )
+    for p in paragraphs:
+        first_line = p.split("\n")[0].strip() if p else ""
+        if heading_re.match(first_line):
+            return True
+    return False
+
+
+
 def _find_intro_paragraph(paragraphs, section_index):
     """Find the Introduction paragraph by position.
 
@@ -581,17 +744,28 @@ class RetrievalPipeline:
         # handles policy documents where the Introduction has no heading
         # (just a standalone paragraph).
         if 5 in slots_needing_rag and 5 not in result.slots:
-            intro_para = _find_intro_paragraph(paragraphs, section_index)
-            if intro_para is not None:
-                idx, text = intro_para
+            # Guard: only use position fallback if the document has
+            # an Introduction section heading. Without this guard,
+            # the fallback may pick a Scope sentence as Introduction.
+            if not _has_introduction_section_markers(paragraphs):
                 result.slots[5] = SlotAssignment(
                     slot_id=5,
-                    chunk_text=text,
-                    source_idx=idx,
-                    score=1.0,
-                    backend="position_fallback",
+                    chunk_text=None,
+                    backend="no_introduction_section",
                 )
                 slots_needing_rag.remove(5)
+            else:
+                intro_para = _find_intro_paragraph(paragraphs, section_index)
+                if intro_para is not None:
+                    idx, text = intro_para
+                    result.slots[5] = SlotAssignment(
+                        slot_id=5,
+                        chunk_text=text,
+                        source_idx=idx,
+                        score=1.0,
+                        backend="position_fallback",
+                    )
+                    slots_needing_rag.remove(5)
 
         if not slots_needing_rag:
             result.elapsed_seconds = time.perf_counter() - t0
@@ -687,6 +861,78 @@ class RetrievalPipeline:
                     if sid not in result.slots:
                         result.slots[sid] = SlotAssignment(slot_id=sid, chunk_text=None, backend="timeout")
                 break
+
+            # Slot 14 (History) fallback guard: if the document contains
+            # no version-history markers (version, FY, initial draft,
+            # revision history, change log, amendment history), skip
+            # RAG for this slot and return no_match. Without this guard,
+            # RAG may pick semantically-similar but wrong content (e.g.
+            # a checkbox line or form field) when no dedicated History
+            # section exists in the source.
+            if slot_id == 14 and not _has_version_history_markers(paragraphs):
+                result.slots[slot_id] = SlotAssignment(
+                    slot_id=slot_id,
+                    chunk_text=None,
+                    backend="no_history_markers",
+                )
+                continue
+
+            # Slot 9 (Exclusions) fallback guard: if the document has
+            # no Exclusions section heading, skip RAG and return
+            # no_match. Without this guard, RAG may pick semantically-
+            # similar but wrong content (e.g. a clause from the claims
+            # process that mentions "not eligible") when no dedicated
+            # Exclusions section exists in the source.
+            if slot_id == 9 and not _has_exclusions_section_markers(paragraphs):
+                result.slots[slot_id] = SlotAssignment(
+                    slot_id=slot_id,
+                    chunk_text=None,
+                    backend="no_exclusions_section",
+                )
+                continue
+
+            # Slot 13 (Related Policies) fallback guard: if the document
+            # has no Related Policies section heading, skip RAG and
+            # return no_match. Without this guard, RAG may pick
+            # semantically-similar but wrong content (e.g. a body
+            # sentence mentioning "supporting documents" in the claims
+            # process) when no dedicated Related Policies section
+            # exists in the source.
+            if slot_id == 13 and not _has_related_policies_section_markers(paragraphs):
+                result.slots[slot_id] = SlotAssignment(
+                    slot_id=slot_id,
+                    chunk_text=None,
+                    backend="no_related_policies_section",
+                )
+                continue
+
+            # Slot 6 (Policy Statement) fallback guard: if the document
+            # has no Policy Statement section heading, skip RAG and
+            # return no_match. Without this guard, RAG may pick
+            # semantically-similar but wrong content (e.g. a Scope
+            # sentence) when no dedicated Policy Statement section
+            # exists in the source.
+            if slot_id == 6 and not _has_policy_statement_section_markers(paragraphs):
+                result.slots[slot_id] = SlotAssignment(
+                    slot_id=slot_id,
+                    chunk_text=None,
+                    backend="no_policy_statement_section",
+                )
+                continue
+
+            # Slot 5 (Introduction) fallback guard: if the document
+            # has no Introduction section heading, skip RAG and
+            # return no_match. Without this guard, RAG may pick
+            # semantically-similar but wrong content (e.g. a Scope
+            # sentence) when no dedicated Introduction section exists
+            # in the source.
+            if slot_id == 5 and not _has_introduction_section_markers(paragraphs):
+                result.slots[slot_id] = SlotAssignment(
+                    slot_id=slot_id,
+                    chunk_text=None,
+                    backend="no_introduction_section",
+                )
+                continue
 
             queries = SLOT_QUERIES.get(slot_id, [])
             assignment = self._rag_assign_slot(

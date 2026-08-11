@@ -235,7 +235,6 @@ SECTION_HEADING_SYNONYMS: dict[int, list[str]] = {
         "linked policies",
         "companion policies",
         "supplementary policies",
-        "supporting documents",
         "reference materials",
         "external references",
         "further reading",

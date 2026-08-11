@@ -501,10 +501,17 @@ def render_not_found_placeholder(p_elem, slot_name: str) -> None:
 
     Per the user's directive the marker phrasing is exact:
     `Data is not found in source file`.
+
+    Strips the leading section number (e.g. "3. ") from `slot_name` so the
+    placeholder reads as `Exclusions: Data is not found in source file`
+    instead of `3. Exclusions: Data is not found in source file`.
     """
     if p_elem.tag.split("}")[-1] != "p":
         return
-    text = f"{slot_name}: Data is not found in source file"
+    # Strip leading "N." section number from the label, if present.
+    import re as _re
+    clean_label = _re.sub(r"^\s*\d+\.\s*", "", slot_name)
+    text = f"{clean_label}: Data is not found in source file"
     # Wipe existing runs.
     for r in list(p_elem.findall(qn("w:r"))):
         p_elem.remove(r)
