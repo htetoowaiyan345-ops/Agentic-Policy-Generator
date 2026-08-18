@@ -646,6 +646,23 @@ def _run_extracted_pipeline(
             table_paragraph_indices=list(extracted.table_paragraph_indices)
                 if getattr(extracted, "table_paragraph_indices", None) else None,
         )
+        # Burmese post-processing: when the English RAG pipeline returns
+        # ``no_*_section`` markers (because no English heading was found),
+        # try a Burmese heading-anchor match and override the slot result.
+        # This is a non-invasive hook — ``RetrievalPipeline`` is unchanged.
+        try:
+            from .extract_myanmar.burmese_pipeline import (
+                apply_burmese_heading_anchors,
+                apply_burmese_label_row_overrides,
+            )
+            apply_burmese_heading_anchors(
+                list(extracted.paragraphs), rag_result
+            )
+            apply_burmese_label_row_overrides(
+                list(extracted.paragraphs), rag_result
+            )
+        except Exception:
+            pass
         classified = build_classification_from_rag(
             rag_result,
             source_paragraph_count=len(extracted.paragraphs),
@@ -967,6 +984,23 @@ def _run_extracted_pipeline(
             table_paragraph_indices=list(extracted.table_paragraph_indices)
                 if getattr(extracted, "table_paragraph_indices", None) else None,
         )
+        # Burmese post-processing: when the English RAG pipeline returns
+        # ``no_*_section`` markers (because no English heading was found),
+        # try a Burmese heading-anchor match and override the slot result.
+        # This is a non-invasive hook — ``RetrievalPipeline`` is unchanged.
+        try:
+            from .extract_myanmar.burmese_pipeline import (
+                apply_burmese_heading_anchors,
+                apply_burmese_label_row_overrides,
+            )
+            apply_burmese_heading_anchors(
+                list(extracted.paragraphs), rag_result
+            )
+            apply_burmese_label_row_overrides(
+                list(extracted.paragraphs), rag_result
+            )
+        except Exception:
+            pass
         classified = build_classification_from_rag(
             rag_result,
             source_paragraph_count=len(extracted.paragraphs),

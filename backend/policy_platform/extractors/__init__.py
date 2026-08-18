@@ -386,6 +386,42 @@ def _deduplicate_value_leading_label(label: str, value: str) -> str:
     return value
 
 
+def _paragraphs_look_burmese_corrupt(paragraphs: list[str]) -> bool:
+    """Heuristic: True if pdfplumber output looks like a Burmese PDF
+    whose CIDs were decoded against a malformed ToUnicode CMap.
+
+    The signature is a high density of virama (U+103A) + vowel sign
+    (U+1031) chars relative to consonants, which signals that
+    intermediate characters were dropped during CID decoding.
+
+    Pure function; never raises.
+    """
+    sample = "\n".join(p for p in paragraphs[:50] if p)
+    if not sample:
+        return False
+    burmese_count = sum(1 for ch in sample if 0x1000 <= ord(ch) <= 0x109F)
+    if burmese_count < 100:
+        return False
+    consonant_count = sum(1 for ch in sample if 0x1000 <= ord(ch) <= 0x1020)
+    virama_count = sample.count("\u103A")
+    vowel_count = sample.count("\u1031")
+    if consonant_count == 0:
+        return False
+    ratio = (virama_count + vowel_count) / consonant_count
+    return ratio > 0.3
+
+
+def _burmese_data_not_found_placeholder() -> str:
+    """Return the "Data is not found in source file" placeholder.
+
+    English version is used because the user specified that exact
+    string in their test output. (Burmese translation lives in
+    ``policy_platform.i18n.burmese_strings.DATA_NOT_FOUND_MY`` and
+    could be substituted if needed.)
+    """
+    return "Data is not found in source file."
+
+
 def _clean_pdf_column_wrap_tail(line: str) -> str:
     """Phase U3: clean PDF column-wrap garbage tails from
     `Label: value` lines.
@@ -577,6 +613,118 @@ def _split_paragraphs_on_brain_labels(lines: list[str]) -> list[str]:
     return out
 
 
+_BURMESE_SPLITTER_SYNONYMS_CACHE: list[str] | None = None
+
+
+def _load_burmese_splitter_synonyms() -> list[str]:
+    """Load all Burmese heading synonyms (slots 5-14) for the inline splitter.
+
+    Returns the union of `policy_platform.i18n.burmese_synonyms` heading
+    synonyms across all slots. Cached after first load.
+    """
+    global _BURMESE_SPLITTER_SYNONYMS_CACHE
+    if _BURMESE_SPLITTER_SYNONYMS_CACHE is not None:
+        return _BURMESE_SPLITTER_SYNONYMS_CACHE
+    out: list[str] = []
+    try:
+        from policy_platform.i18n.burmese_synonyms import get_all_burmese_synonyms
+        all_syns = get_all_burmese_synonyms()
+        for syns in all_syns.values():
+            for syn in syns:
+                if syn and syn not in out:
+                    out.append(syn)
+    except Exception:
+        pass
+    _BURMESE_SPLITTER_SYNONYMS_CACHE = sorted(out, key=len, reverse=True)
+    return _BURMESE_SPLITTER_SYNONYMS_CACHE
+
+
+def _split_paragraphs_on_burmese_headings(lines: list[str]) -> list[str]:
+    """Split lines at inline Burmese section headings.
+
+    Burmese policy PDFs commonly encode section headings inline within a
+    paragraph (e.g. `�။ �ည်ရွယ်ချက်၁-၁။ ဤမ�ဝါဒ...`), unlike English
+    docs which use separate lines. This splitter finds Myanmar digit
+    prefix + Burmese heading synonym followed by Burmese body and
+    splits the paragraph at that boundary.
+
+    Metadata-based Burmese extraction produces text with garbled
+    mid-word characters (replacement chars U+FFFD). To handle this,
+    the splitter uses a 4-char prefix of each synonym and matches
+    greedily on the FIRST 4-char prefix that occurs after Myanmar
+    digits. This still requires exact matches on a known heading's
+    first 4 chars, preserving specificity (no false positives on
+    body text), but tolerates corruption in trailing chars.
+
+    Pre-filters paragraphs without Myanmar digits so English-only text
+    passes through unchanged.
+    """
+    import re as _re
+    syns = _load_burmese_splitter_synonyms()
+    if not syns:
+        return list(lines)
+    # Use 4-char prefixes of each synonym for matching. Longer synonyms
+    # have longer unique prefixes; 4 chars gives reasonable specificity
+    # without being too strict for garbled extraction.
+    prefixes = sorted({s[:4] for s in syns if len(s) >= 4}, key=len, reverse=True)
+    if not prefixes:
+        return list(lines)
+    prefix_alt = "|".join(_re.escape(p) for p in prefixes)
+    pattern = _re.compile(
+        r"(?:^|(?<=\s))"  # start of string or after whitespace
+        r"(?:[\u1040-\u1049]+[\u104B.]\s*)"
+        r"(?:" + prefix_alt + r")",
+    )
+    out: list[str] = []
+    for line in lines:
+        if not line:
+            out.append(line)
+            continue
+        # Pre-filter: only split if Myanmar digit present.
+        if not any("\u1040" <= ch <= "\u1049" for ch in line):
+            out.append(line)
+            continue
+        # Find first split match.
+        m = pattern.search(line)
+        if m is None:
+            out.append(line)
+            continue
+        split_pos = m.start()
+        # The heading includes: Myanmar digit prefix + synonym prefix
+        # + the synonym's FULL remaining text (matched greedily via the
+        # synonym list's longest-first sort).
+        head_end = m.end()
+        # Try to extend the heading by matching the full synonym if
+        # present. We check if the matched prefix is part of any full
+        # synonym and extend to the end of that synonym.
+        matched_prefix = m.group()[len(m.group()) - 4:]  # last 4 chars matched
+        extended = False
+        for syn in syns:
+            if syn.startswith(matched_prefix):
+                # Check if the line continues with the rest of the synonym
+                rest = syn[4:]
+                if rest and line[head_end:head_end + len(rest)] == rest:
+                    head_end += len(rest)
+                    extended = True
+                    break
+                if not rest:
+                    extended = True
+                    break
+        head = line[:split_pos].rstrip()
+        heading = line[split_pos:head_end].rstrip()
+        body = line[head_end:].strip()
+        if head and heading and body:
+            out.append(head)
+            out.append(heading)
+            out.append(body)
+        elif heading and body:
+            out.append(heading)
+            out.append(body)
+        else:
+            out.append(line)
+    return out
+
+
 def _build_combined_label_regex() -> "re.Pattern[str]":
     """Build a single regex that matches ALL Brain labels — both
     label-row labels (slots 1, 2, 3, 4, 11) AND section-title labels
@@ -757,6 +905,38 @@ def dispatch(path: Path) -> ExtractedDocument:
             f"Unsupported file extension '{ext}'. Supported: {sorted(SUPPORTED_EXTENSIONS)}"
         )
 
+    # Burmese-aware routing: if the PDF has unsafe Myanmar fonts and
+    # the pdfplumber output looks corrupted (high virama/vowel ratio),
+    # swap in the metadata-based extraction output. This cross-validates
+    # the PDF's /ToUnicode CMap against the bundled MyanmarText.ttf and
+    # produces clean Burmese text. English PDFs skip this path entirely
+    # because they have no unsafe Burmese fonts and pdfplumber works
+    # fine for them.
+    if ext == ".pdf" and doc.paragraphs:
+        try:
+            from ..extract_myanmar.font_inspector import (
+                inspect_pdf_fonts,
+                classify_pdf,
+            )
+            from ..extract_myanmar.myanmar_extractor import (
+                extract_text_smart,
+                METHOD_METADATA_RECOVERED,
+            )
+            fonts = inspect_pdf_fonts(path)
+            quality = classify_pdf(fonts)
+            if quality.verdict == "unsafe" and _paragraphs_look_burmese_corrupt(
+                doc.paragraphs
+            ):
+                smart = extract_text_smart(path)
+                if (
+                    smart.method == METHOD_METADATA_RECOVERED
+                    and smart.text
+                    and smart.score <= 0.5
+                ):
+                    doc.paragraphs = smart.text.split("\n")
+        except Exception:
+            pass
+
     # Step 1: cleaner.
     cleaned, dropped, original_indices = clean_paragraphs(doc.paragraphs)
     doc.cleaner_dropped = dropped
@@ -767,9 +947,14 @@ def dispatch(path: Path) -> ExtractedDocument:
         doc.original_indices = original_indices
         return doc
 
-    merged = _join_mid_sentence_lines(cleaned)
+    # Burmese-aware normalization: strip soft hyphens (U+00AD) and
+    # NBSPs (U+00A0) introduced by the source PDF. Pre-filter on
+    # Myanmar digit means English docs pass through unchanged.
+    from ..extract_myanmar.burmese_pipeline import normalize_burmese_lines
+    merged = normalize_burmese_lines(_join_mid_sentence_lines(cleaned))
     split = _split_paragraphs_on_brain_labels(merged)
-    normalized = _normalize_label_colons(split)
+    burmese_split = _split_paragraphs_on_burmese_headings(split)
+    normalized = _normalize_label_colons(burmese_split)
     new_orig = _rebuild_original_indices(cleaned, original_indices, normalized)
 
     # Phase U3: clean PDF column-wrap garbage tails from
