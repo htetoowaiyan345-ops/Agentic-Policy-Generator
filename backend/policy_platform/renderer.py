@@ -23,6 +23,7 @@ from docx.oxml.ns import qn
 from . import config
 from .analyzer import ClassificationResult
 from .extractors.base import ExtractedDocument
+from .extract_myanmar.debug_logging import log_checkpoint
 from .framework.brain_fields import (
     BRAIN_APPROVAL_FIELDS,
     BRAIN_BRIEF_DESCRIPTION_FIELDS,
@@ -991,6 +992,20 @@ def render(
     #   - Re-assert Calibri 10pt and 1.5 line + 4pt before/after.
     _normalize_word_format(doc)
 
+    if classified.sections:
+        all_text_chunks = []
+        for sec_id, slot in sorted(classified.sections.items()):
+            if slot and getattr(slot, "chunk_text", None):
+                all_text_chunks.append(
+                    f"[Slot {sec_id}] {slot.chunk_text}"
+                )
+        if all_text_chunks:
+            log_checkpoint(
+                "before_docx_write",
+                "\n\n".join(all_text_chunks),
+                run_id=output_path.stem,
+            )
+
     doc.save(str(output_path))
     _verify_media_against(brain_path, output_path)
     _restore_media_store_compression(output_path)
@@ -1575,6 +1590,12 @@ def _normalize_word_format(doc) -> None:
         their bold flag — e.g., `INTRODUCTION`, `1. Purpose`).
       - Re-assert Calibri 10pt on body runs and 1.5 line + 4pt
         before/after spacing.
+      - For runs that contain Myanmar (Burmese) text, also set the
+        `Noto Sans Myanmar` font face so the DOCX renders correctly
+        when opened in Word/LibreOffice (the bundled Myanmar Text font
+        has cmap issues that propagate through Word's PDF generator,
+        causing Unicode-level corruption; Noto Sans Myanmar uses
+        modern Unicode-compliant glyph IDs).
 
     Run after bullet polish, just before save.
     """
@@ -1708,3 +1729,65 @@ def _normalize_word_format(doc) -> None:
                 szCs = OxmlElement("w:szCs")
                 szCs.set(qn("w:val"), "20")
                 rPr.append(szCs)
+
+    _apply_myanmar_font_to_burmese_runs(doc)
+
+
+_MYANMAR_CODEPOINT_RANGE = (
+    range(0x1000, 0x109F + 1),
+    range(0xAA60, 0xAA7F + 1),
+    range(0xA9E0, 0xA9FF + 1),
+)
+_MYANMAR_FROZEN = frozenset(
+    cp for r in _MYANMAR_CODEPOINT_RANGE for cp in r
+)
+
+
+def _text_contains_myanmar(text: str | None) -> bool:
+    """True if `text` contains any Myanmar (Burmese) codepoint."""
+    if not text:
+        return False
+    return any(ord(ch) in _MYANMAR_FROZEN for ch in text)
+
+
+def _apply_myanmar_font_to_burmese_runs(doc) -> None:
+    """For runs that contain Myanmar text, set the font face to
+    `Noto Sans Myanmar` (preferred modern Unicode font). Also sets the
+    `cs` (complex script) font and `eastAsia` font slots so Word renders
+    the run correctly regardless of which script is dominant.
+
+    Noto Sans Myanmar is preferred over Myanmar Text because:
+      - Myanmar Text's cmap has historical issues with stacked-consonant
+        ligatures that cause Unicode corruption when extracted from Word PDFs
+      - Noto Sans Myanmar uses modern Unicode-compliant glyph IDs
+      - Noto Sans Myanmar has better support for newer Myanmar extensions
+    """
+    for p in doc.element.body.iter(qn("w:p")):
+        # Skip paragraphs inside table cells (preserve Brain template
+        # styling for label rows and structural table headers).
+        ancestor = p.getparent()
+        in_table = False
+        while ancestor is not None:
+            if ancestor.tag.split("}")[-1] == "tc":
+                in_table = True
+                break
+            ancestor = ancestor.getparent()
+        for r in p.findall(qn("w:r")):
+            t_elems = r.findall(qn("w:t"))
+            if not t_elems:
+                continue
+            text = "".join((t.text or "") for t in t_elems)
+            if not _text_contains_myanmar(text):
+                continue
+            rPr = r.find(qn("w:rPr"))
+            if rPr is None:
+                rPr = OxmlElement("w:rPr")
+                r.insert(0, rPr)
+            rFonts = rPr.find(qn("w:rFonts"))
+            if rFonts is None:
+                rFonts = OxmlElement("w:rFonts")
+                rPr.append(rFonts)
+            # Set the complex-script + east-asia font names so Word
+            # renders Myanmar glyphs with the bundled `Noto Sans Myanmar`.
+            rFonts.set(qn("w:cs"), "Noto Sans Myanmar")
+            rFonts.set(qn("w:eastAsia"), "Noto Sans Myanmar")

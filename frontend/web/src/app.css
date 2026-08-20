@@ -1,5 +1,27 @@
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
+/* Local Noto Sans Myanmar (Google Fonts, modern Unicode-compliant).
+   Preferred over MyanmarText because MyanmarText's cmap has historical
+   issues with stacked-consonant ligatures that propagate through
+   Word's PDF /ToUnicode generation, causing Unicode-level corruption. */
+@font-face {
+  font-family: 'Noto Sans Myanmar';
+  src: url('/fonts/NotoSansMyanmar.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Local Myanmar Text fallback (Microsoft Word's bundled Burmese font).
+   Used as secondary fallback if Noto Sans Myanmar doesn't have a glyph. */
+@font-face {
+  font-family: 'Myanmar Text';
+  src: url('/fonts/MyanmarText.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   --bg: #FFFFFF;
   --ink: #111111;
@@ -14,6 +36,7 @@
   --serif: "Source Serif 4", Georgia, serif;
   --sans: "Inter", -apple-system, sans-serif;
   --mono: "JetBrains Mono", "SF Mono", monospace;
+  --myanmar: "Noto Sans Myanmar", "Myanmar Text", "Pyidaungsu", "Myanmar3", sans-serif;
 }
 
 html, body {
@@ -21,6 +44,16 @@ html, body {
   font-family: var(--sans); color: var(--ink);
   font-size: 15px; line-height: 1.55;
   -webkit-font-smoothing: antialiased; text-wrap: pretty;
+}
+
+/* Burmese / Myanmar text uses Noto Sans Myanmar (loaded via Google Fonts)
+   with fallbacks to local Burmese fonts. The Unicode-range covers the
+   Myanmar block (U+1000..U+109F), Myanmar Extended-A/B. */
+html, body {
+  font-family: var(--sans), var(--myanmar);
+}
+:root:lang(my), body:lang(my) {
+  font-family: var(--myanmar);
 }
 
 body::before {

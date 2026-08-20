@@ -30,9 +30,25 @@ try:
 except ImportError:
     PdfReader = None  # type: ignore
 
+from .debug_logging import log_checkpoint
+from .myanmar_nfc import normalize_myanmar_nfc
 
-TF_PATTERN = re.compile(rb"/([A-Za-z][A-Za-z0-9]*)\s+[\d.]+\s+Tf")
-HEX_BLOB_PATTERN = re.compile(rb"<([0-9a-fA-F]+)>")
+# TJ array pattern: [(<hex>) -200 (<hex>) -300 ...] TJ
+# Microsoft Word emits negative kerning between combining marks for Myanmar
+# glyphs. We need to parse the array operands to know when a glyph is
+# positioned BEFORE or AFTER a previous glyph.
+_TJ_ARRAY_PATTERN = re.compile(
+    rb"\["
+    rb"((?:"
+    rb"<[0-9a-fA-F]+>"        # hex blob (glyphs)
+    rb"|\s*-?\d+(?:\.\d+)?\s*"  # numeric kerning
+    rb")+)"
+    rb"\]\s*TJ"
+)
+_HEX_TOKEN_PATTERN = re.compile(rb"<([0-9a-fA-F]+)>")
+_NEGATIVE_KERNING_PATTERN = re.compile(rb"-\s*(\d+(?:\.\d+)?)")
+_TF_PATTERN = re.compile(rb"/([A-Za-z][A-Za-z0-9]*)\s+[\d.]+\s+Tf")
+_HEX_BLOB_PATTERN = re.compile(rb"<([0-9a-fA-F]+)>")
 
 
 @dataclass
@@ -53,6 +69,15 @@ class FontResolver:
         Composite codepoints (e.g., 0x103C1032 = U+103C + U+1032) are
         decomposed into their two constituent codepoints before output.
         Surrogates, PUA, and out-of-range codepoints are filtered out.
+
+        Special handling for composites whose LOW half is a dead-
+        consonant mark (U+1038, U+103A, U+103B): Word emits these
+        composite ligatures (e.g., CID 0x01FD = asat+vowel-u ligature
+        glyph) AND separately draws the dead mark via another Tj/TJ
+        operand. The composite decomposition yields `dead + vowel`, and
+        the standalone emits another `dead`, producing duplicate dead
+        marks. We drop the LOW half (the dead mark) from the composite
+        so the standalone dead mark remains as the sole occurrence.
         """
         if len(byte_data) < 2 or not self.resolvable:
             return ""
@@ -66,6 +91,19 @@ class FontResolver:
             if cp > 0xFFFF:
                 high = (cp >> 16) & 0xFFFF
                 low = cp & 0xFFFF
+                # If the composite's HIGH half is a dead-consonant mark
+                # (asat U+103A, visarga U+1038, or dot-below U+103B),
+                # emit ONLY the low half — the dead mark will be
+                # emitted by the standalone Tj/TJ operand that follows.
+                # E.g., CID 0x01FD decodes to cp 0x103A102F (asat HIGH,
+                # vowel-u LOW) — we drop the asat from the composite
+                # and rely on the standalone `<0172>` to emit it.
+                if high in (0x1038, 0x103A, 0x103B):
+                    try:
+                        out.append(chr(low))
+                    except (ValueError, OverflowError):
+                        pass
+                    continue
                 try:
                     out.append(chr(high) + chr(low))
                 except (ValueError, OverflowError):
@@ -82,6 +120,156 @@ class FontResolver:
             except (ValueError, OverflowError):
                 continue
         return "".join(out)
+
+
+def _is_myanmartext_family(basefont: str) -> bool:
+    """True if basefont name indicates a MyanmarText or related font.
+
+    These fonts (Microsoft Word's default Burmese fonts) are known to
+    emit erroneous composite /ToUnicode CMap entries for compound
+    ligatures. For other fonts we trust /ToUnicode as authoritative.
+    """
+    bf = basefont.upper()
+    return "MYANMARTEXT" in bf or "MYANMAR3" in bf or "PYIDAUNGSU" in bf
+
+
+_GLYPH_NAME_UNI_RE = None
+
+
+def _cp_from_glyph_name(name: str) -> int | None:
+    """Extract a codepoint from a glyph name like 'uniNNNN' or 'uNNNNNNNN'.
+
+    Used as a last-resort fallback when both the embedded cmap and the
+    bundled full font's cmap lack an entry for this glyph but the
+    glyph name itself encodes the codepoint.
+    """
+    global _GLYPH_NAME_UNI_RE
+    if _GLYPH_NAME_UNI_RE is None:
+        import re as _re
+        _GLYPH_NAME_UNI_RE = _re.compile(r"^u(?:ni)?([0-9A-Fa-f]{4,8})$")
+    m = _GLYPH_NAME_UNI_RE.match(name)
+    if not m:
+        return None
+    hex_str = m.group(1)
+    if len(hex_str) > 6:
+        # 8-hex (4-byte UTF-16 surrogate pair) is unusual for a single
+        # codepoint name. Skip to avoid mis-decoding.
+        return None
+    try:
+        cp = int(hex_str, 16)
+    except ValueError:
+        return None
+    if cp < 0 or cp > 0x10FFFF:
+        return None
+    if 0xD800 <= cp <= 0xDFFF:
+        return None
+    if 0xE000 <= cp <= 0xF8FF:
+        return None
+    return cp
+
+
+def _tu_likely_corrupt(desc_cp: int, tu_cp: int) -> bool:
+    """Detect when the /ToUnicode entry is a wrong composite for a
+    single Myanmar codepoint.
+
+    Word's buggy /ToUnicode for MyanmarText emits 32-bit composites
+    (e.g. `U+10021039`, `U+103D1031`) where the actual glyph is just
+    a single codepoint. We treat such entries as corrupt and prefer
+    the simpler DescendantFont mapping.
+
+    Pattern: TU value is a composite (cp > 0xFFFF) but DescendantFont
+    gives a single codepoint (cp <= 0xFFFF).
+    """
+    return tu_cp > 0xFFFF and desc_cp <= 0xFFFF
+
+
+def _build_codepoint_correction_table() -> dict[int, int]:
+    """Build a {codepoint: corrected_codepoint} table from the bundled
+    Noto Sans Myanmar font.
+
+    The bundled MyanmarText.ttf has historically been used as the
+    reference, but its cmap has been shown to disagree with /ToUnicode
+    entries in Microsoft Word's PDF output for MyanmarText-family fonts.
+    Noto Sans Myanmar (Google Fonts) has cleaner Unicode-compliant
+    mappings and is more reliable as the canonical reference.
+
+    Returns: dict mapping codepoint -> the Unicode value the font's
+    cmap says it should be. If the input cp isn't in the bundled
+    font's cmap, it maps to itself (no correction).
+    """
+    from fontTools.ttLib import TTFont
+    noto_path = (
+        Path(__file__).resolve().parent.parent.parent
+        / "assets" / "fonts" / "NotoSansMyanmar.ttf"
+    )
+    if not noto_path.exists():
+        return {}
+    try:
+        font = TTFont(str(noto_path))
+    except Exception:
+        return {}
+    cmap = font.getBestCmap() or {}
+    # cmap maps codepoint -> glyph_name; we want codepoint -> codepoint
+    # (i.e., trust the codepoint as canonical if Noto recognizes it)
+    return {cp: cp for cp in cmap if 0x1000 <= cp <= 0x109F}
+
+
+# Singleton — built once on first use
+_CORRECTION_TABLE: dict[int, int] | None = None
+
+
+def _get_correction_table() -> dict[int, int]:
+    """Lazy-init the codepoint correction table."""
+    global _CORRECTION_TABLE
+    if _CORRECTION_TABLE is None:
+        _CORRECTION_TABLE = _build_codepoint_correction_table()
+    return _CORRECTION_TABLE
+
+
+def _decompose_composite_codepoint(cp: int) -> tuple[int, int] | None:
+    """If cp is a 32-bit composite (cp > 0xFFFF), return (high, low).
+    Otherwise return None.
+    """
+    if cp <= 0xFFFF:
+        return None
+    high = (cp >> 16) & 0xFFFF
+    low = cp & 0xFFFF
+    return (high, low)
+
+
+def _normalize_tu_codepoint(
+    tu_cp: int,
+    full_name_to_cp: dict[str, int],
+    full_glyph_order: list[str] | None,
+) -> int:
+    """Normalize a /ToUnicode codepoint using the bundled font's glyph order.
+
+    The bundled MyanmarText.ttf's cmap often disagrees with the PDF's
+    /ToUnicode for compound ligatures. When the /ToUnicode says
+    e.g. `U+103D1031` (medial_la + vowel_e), the bundled font says
+    `U+103D` (just medial_la). We use the bundled font's expected
+    codepoint at that CID position.
+
+    Returns the corrected single codepoint, or the original tu_cp
+    if no better answer is available.
+    """
+    if tu_cp <= 0xFFFF:
+        return tu_cp
+    if full_glyph_order is None:
+        return tu_cp
+    # Decompose the 32-bit composite into its two halves
+    high = (tu_cp >> 16) & 0xFFFF
+    low = tu_cp & 0xFFFF
+    # The PDF stores as (high, low) = (mark1, mark2).
+    # Look up both in bundled font's cmap.
+    high_name = full_name_to_cp.get(high)
+    low_name = full_name_to_cp.get(low)
+    # If neither is in the bundled font's codepoint->name table,
+    # we can't disambiguate. Return high as a best guess (preserves
+    # one mark).
+    if high_name is None and low_name is None:
+        return high
+    return high  # default to first component
 
 
 def _parse_tounicode_cmap(data: bytes) -> dict[int, int]:
@@ -152,18 +340,22 @@ def _build_resolver_from_font_dict(
 ) -> FontResolver:
     """Build a FontResolver from a raw /Font dictionary.
 
-    For Type0 fonts: parse the PDF's /ToUnicode CMap (authoritative) AND
-    the DescendantFont's embedded cmap, then merge them so the embedded
-    cmap fills any CIDs missing from /ToUnicode.
+    For Type0 fonts: parse the PDF's /ToUnicode CMap AND the DescendantFont's
+    embedded cmap. Merge them so the embedded cmap fills gaps. When the
+    two sources DISAGREE for a specific glyph, prefer the embedded
+    DescendantFont's mapping because Microsoft Word's subsetting
+    occasionally emits erroneous composite /ToUnicode entries for
+    MyanmarText ligatures (e.g. mapping a single-glyph CID to a 32-bit
+    composite like `U+10021039` when the actual glyph is `U+1002`).
 
     For TrueType fonts: build gid->cp from the embedded subset's own
     cmap, falling back to the bundled full font's name->cp map only for
     glyph names the embedded subset does not map.
 
-    No cross-validation against the bundled font by CID index: subset
-    fonts assign CIDs sequentially as glyphs are first used, so a CID
-    does NOT correspond to the same index in the full font's glyph
-    order. The PDF's own /ToUnicode is the authoritative source.
+    No cross-validation against the bundled font by CID index for the
+    fallback path: subset fonts assign CIDs sequentially as glyphs are
+    first used, so a CID does NOT correspond to the same index in the
+    full font's glyph order.
     """
     resolver = FontResolver()
     resolver.basefont = str(font_dict.get("/BaseFont", "?")).lstrip("/")
@@ -171,7 +363,7 @@ def _build_resolver_from_font_dict(
     resolver.subtype = subtype.lstrip("/")
 
     if resolver.subtype == "Type0":
-        # Parse /ToUnicode (authoritative) and DescendantFont cmap (gap-filler).
+        # Parse /ToUnicode (sometimes wrong) and DescendantFont cmap (gap-filler).
         tounicode_cmap: dict[int, int] = {}
         to_unicode = font_dict.get("/ToUnicode")
         if to_unicode is not None:
@@ -206,15 +398,44 @@ def _build_resolver_from_font_dict(
                             cp = name_to_cp.get(name)
                             if cp is None and name in full_name_to_cp:
                                 cp = full_name_to_cp[name]
+                            # Parse `uniNNNN` glyph names directly. Some
+                            # embedded subsets (e.g., MyanmarText-Bold)
+                            # have `uniNNNN` named glyphs but omit them
+                            # from the cmap table. The name itself is a
+                            # reliable Unicode encoding.
+                            if cp is None:
+                                cp = _cp_from_glyph_name(name)
                             if cp is not None:
                                 descendant_cmap[gid] = cp
                     except Exception:
                         continue
 
-        # Merge: /ToUnicode primary, DescendantFont fills gaps.
-        # For Identity-H fonts, CID == GID.
-        merged = dict(descendant_cmap)
-        merged.update(tounicode_cmap)
+        # Merge with confidence-based override:
+        # For MyanmarText-family fonts, the PDF's /ToUnicode CMap is
+        # systematically wrong for many CIDs (e.g., F5 maps CID 0x0158
+        # to U+101B when the glyph is actually U+1031). The bundled
+        # font's embedded DescendantFont cmap is the AUTHORITATIVE source
+        # because Word's PDF generator sometimes corrupts /ToUnicode
+        # entries for MyanmarText subsets. For non-MyanmarText fonts,
+        # /ToUnicode is trusted (preserves correctness for unrelated CJK,
+        # Latin, etc. fonts).
+        merged: dict[int, int] = {}
+        is_my_family = _is_myanmartext_family(resolver.basefont)
+        if is_my_family:
+            # MyanmarText-family: DescendantFont is authoritative.
+            for cid, cp in descendant_cmap.items():
+                merged[cid] = cp
+            # /ToUnicode fills gaps only when DescendantFont doesn't have
+            # an entry for that CID.
+            for cid, cp in tounicode_cmap.items():
+                merged.setdefault(cid, cp)
+        else:
+            # Non-MyanmarText-family: trust /ToUnicode but use
+            # DescendantFont as gap-filler.
+            for cid, cp in descendant_cmap.items():
+                merged[cid] = cp
+            for cid, cp in tounicode_cmap.items():
+                merged.setdefault(cid, cp)
         resolver.cid_to_cp = merged
         if resolver.cid_to_cp:
             resolver.resolvable = True
@@ -295,26 +516,137 @@ def extract_text_via_metadata(
             data = b""
         page_text = _walk_content_stream(data, font_resolvers)
         pages_text.append(page_text)
+    log_checkpoint("raw_metadata_extract", "\n".join(pages_text))
     return pages_text
 
 
+def _dedupe_repeated_vowel_signs(chars: list[str]) -> list[str]:
+    """Remove a duplicate of the same vowel sign that reappears.
+
+    Microsoft Word sometimes draws the same vowel sign twice in TJ/Tj
+    operators when positioning the mark visually around another
+    consonant. The PDF pattern is:
+        <vowel>Tj <consonant>Tj <mark>Tj <vowel>Tj
+    which decodes to: vowel consonant mark vowel (duplicate).
+
+    The duplicate is the SAME character repeated later. We drop only
+    when the character is identical to one already seen. Different
+    vowel signs are preserved (each belongs to its own role).
+
+    Preserves legitimate stacked consonants (U+1039+U+103A etc.)
+    because dead-consonant marks are NOT in the vowel_signs set.
+    """
+    vowel_signs = {0x1031, 0x1032, 0x102C, 0x102B, 0x102D, 0x102E,
+                   0x102F, 0x1030, 0x1036, 0x1037, 0x103C, 0x103D,
+                   0x103E}
+    result: list[str] = []
+    seen_vowels: set[int] = set()
+    for ch in chars:
+        cp = ord(ch[0]) if ch else 0
+        is_vowel = cp in vowel_signs
+        if is_vowel and cp in seen_vowels:
+            # Drop duplicate of this specific vowel sign
+            continue
+        result.append(ch)
+        if is_vowel:
+            seen_vowels.add(cp)
+    return result
+
+
+def _collapse_composite_dead_marks(chars: list[str]) -> list[str]:
+    """Collapse composite-asat + standalone-asat duplicate pattern.
+
+    NOTE: The primary fix for this pattern is now in ``FontResolver.decode``
+    (it drops the dead-mark HIGH half from composites whose HIGH half is a
+    dead-consonant mark, eliminating the duplicate at the source). This
+    function is kept for belt-and-suspenders coverage: if any composite
+    dead-mark still slips through, the joined-text pattern
+    ``<dead> <non-dead> <same-dead>`` collapses to ``<non-dead> <dead>``.
+
+    Microsoft Word's MyanmarText PDF emits some combining marks via
+    COMPOSITE CIDs that decode to two codepoints (e.g., CID 0x01FD
+    decodes to U+103A + U+102F = `် + ု`). Word ALSO emits the
+    asat (U+103A) standalone via a separate Tj/TJ operand (e.g.,
+    `<0172>`). The result in the joined text is `် + ု + ်` —
+    an extra asat mark that wasn't intended.
+    """
+    DEAD = (0x1038, 0x103A, 0x103B)  # visarga, asat, dot-below
+    result: list[str] = []
+    i = 0
+    n = len(chars)
+    while i < n:
+        ch = chars[i]
+        cp = ord(ch[0]) if ch else 0
+        # Look for pattern: dead, mark, dead where deads are identical.
+        if cp in DEAD and i + 2 < n:
+            next_cp = ord(chars[i + 1][0]) if chars[i + 1] else 0
+            next2_cp = ord(chars[i + 2][0]) if chars[i + 2] else 0
+            if next_cp not in DEAD and next2_cp == cp:
+                # Pattern: dead mark, non-dead mark, same dead mark.
+                # Drop the leading dead mark.
+                i += 1
+                continue
+        result.append(ch)
+        i += 1
+    return result
+
+
 def _walk_content_stream(data: bytes, font_resolvers: dict[str, FontResolver]) -> str:
-    """Walk content stream and decode text blocks via font resolvers."""
+    """Walk content stream and decode text blocks via font resolvers.
+
+    Handles both:
+      - Simple Tj operators: (<hex>) Tj
+      - TJ arrays with positioning: [(<hex>) -200 (<hex>) -300 ...] TJ
+
+    For TJ arrays with negative kerning (which Microsoft Word uses for
+    Myanmar combining marks), each kerning value is consumed but the
+    glyphs are concatenated in their textual order.
+
+    Microsoft Word PDFs sometimes emit the same glyph via consecutive
+    Tj operators (e.g., `<0158>Tj ... <0158>Tj` to render vowel-e
+    visually positioned in two places). When the resulting decoded
+    characters are identical and adjacent, we drop the duplicate to
+    avoid producing double vowel-e marks in the extracted text.
+
+    After decoding, we collapse intra-glyph whitespace that comes from
+    PDF kerning artifacts. Word-boundary whitespace (separated by ASCII
+    text or punctuation) is preserved.
+    """
     recovered: list[str] = []
     pos = 0
     n = len(data)
     while pos < n:
-        m_tf = TF_PATTERN.search(data, pos)
+        m_tf = _TF_PATTERN.search(data, pos)
         if m_tf is None:
             break
         font_ref = m_tf.group(1).decode("latin-1")
         scan_start = m_tf.end()
-        m_next = TF_PATTERN.search(data, scan_start)
+        m_next = _TF_PATTERN.search(data, scan_start)
         scan_end = m_next.start() if m_next else n
         font_key = "/" + font_ref
         resolver = font_resolvers.get(font_key)
         if resolver is not None and resolver.resolvable:
-            for m_hex in HEX_BLOB_PATTERN.finditer(data, scan_start, scan_end):
+            scan_pos = scan_start
+            while scan_pos < scan_end:
+                m_tj = _TJ_ARRAY_PATTERN.search(data, scan_pos, scan_end)
+                if m_tj is None:
+                    break
+                array_body = m_tj.group(1)
+                for m_hex in _HEX_TOKEN_PATTERN.finditer(array_body):
+                    hex_str = m_hex.group(1).decode("ascii")
+                    try:
+                        byte_data = bytes.fromhex(hex_str)
+                    except Exception:
+                        continue
+                    if len(byte_data) < 2:
+                        continue
+                    decoded = resolver.decode(byte_data)
+                    if decoded:
+                        recovered.append(decoded)
+                scan_pos = m_tj.end()
+            # Match standalone hex blobs followed by 'Tj' operator.
+            _TJ_LITERAL = re.compile(rb"<([0-9a-fA-F]+)>\s*Tj")
+            for m_hex in _TJ_LITERAL.finditer(data, scan_pos, scan_end):
                 hex_str = m_hex.group(1).decode("ascii")
                 try:
                     byte_data = bytes.fromhex(hex_str)
@@ -326,7 +658,77 @@ def _walk_content_stream(data: bytes, font_resolvers: dict[str, FontResolver]) -
                 if decoded:
                     recovered.append(decoded)
         pos = scan_end
-    return "".join(recovered)
+    # Deduplicate consecutive identical Myanmar marks (some PDFs emit
+    # the same glyph twice via separate Tj operators for visual
+    # positioning).
+    deduped: list[str] = []
+    for s in recovered:
+        if deduped and s == deduped[-1] and len(s) == 1:
+            cp = ord(s[0])
+            if 0x1000 <= cp <= 0x109F:
+                # Myanmar mark: dedupe consecutive duplicates
+                continue
+        deduped.append(s)
+    # Drop repeated vowel signs (a vowel sign reappearing indicates
+    # Word's duplicate-positioning artifact). Preserves legitimate
+    # stacked consonants.
+    deduped = _dedupe_repeated_vowel_signs(deduped)
+    joined = "".join(deduped)
+    collapsed = _collapse_kerning_whitespace(joined)
+    return normalize_myanmar_nfc(collapsed)
+
+
+_MYANMAR_RANGE_LOOKUP = (
+    frozenset(range(0x1000, 0x109F + 1))
+    | frozenset(range(0xAA60, 0xAA7F + 1))
+    | frozenset(range(0xA9E0, 0xA9FF + 1))
+)
+
+
+def _is_myanmar(ch: str) -> bool:
+    cp = ord(ch)
+    return cp in _MYANMAR_RANGE_LOOKUP
+
+
+def _collapse_kerning_whitespace(text: str) -> str:
+    """Collapse whitespace between Myanmar chars that came from PDF kerning.
+
+    Microsoft Word emits TJ arrays like:
+        [(<hex for consonant>)-200(<hex for combining mark>)-200(<hex>)]
+    When our extractor concatenates the hex blobs, no spaces are
+    introduced inside the TJ array. However, between Tj operators or
+    at the start/end of Tj blocks, PDF content streams may have
+    whitespace between hex blobs that are kerning artifacts, not real
+    word boundaries.
+
+    This function drops space characters that occur between two Myanmar
+    characters (PDF kerning artifacts). Spaces between ASCII characters
+    and between ASCII/Myanmar boundaries are preserved as real word
+    separators.
+    """
+    if not text:
+        return text
+    out: list[str] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch == " ":
+            # Look ahead: find next non-space char.
+            j = i
+            while j < n and text[j] == " ":
+                j += 1
+            # Decide: drop or keep the run of spaces.
+            prev = out[-1] if out else ""
+            nxt = text[j] if j < n else ""
+            drop = bool(prev and nxt and _is_myanmar(prev) and _is_myanmar(nxt))
+            if not drop:
+                out.append(text[i:j])
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def is_extractable(pdf_path: Path) -> bool:

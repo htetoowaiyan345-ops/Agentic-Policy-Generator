@@ -12,6 +12,11 @@ Tests the generic invariants of the moved-out Burmese helpers in
   : section marker complement.
 - ``split_paragraphs_on_burmese_headings`` : inline heading split.
 
+Also tests the Myanmar Unicode canonical reordering module
+(``policy_platform.extract_myanmar.burmese_reorder``) which fixes the
+PDF TJ array corruption where combining marks appear in wrong logical
+positions (UAX #9 §11.4).
+
 No fixture-specific golden text, no hardcoded golden sentences, no
 per-file defaults. All tests use generic invariants.
 """
@@ -470,6 +475,72 @@ class TestParagraphsLookBurmeseCorrupt(unittest.TestCase):
         # 60 consonants + 5 viramas = ratio ~0.08, not corrupt
         text = "\u1000" * 60 + "\u103a" * 5 + "padding" * 10
         self.assertFalse(func([text]))
+
+
+class TestReorderMyanmarSyllables(unittest.TestCase):
+    """Tests for Myanmar Unicode canonical reordering (UAX #9 §11.4).
+
+    This fixes the PDF TJ array corruption where combining marks appear
+    in wrong logical positions. For each Myanmar syllable, marks are
+    sorted into canonical order: medial ra (U+103C) before vowels
+    (U+102B-U+1032) before visarga (U+1038) before virama (U+103A).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from policy_platform.extract_myanmar.burmese_reorder import (
+            reorder_myanmar_syllables,
+        )
+        cls.reorder = staticmethod(reorder_myanmar_syllables)
+
+    def test_reorders_virama_after_medial_ra(self):
+        # pa + virama + medial_ra + nga (wrong order)
+        # should become pa + medial_ra + nga + virama (canonical)
+        wrong = "\u1015\u103a\u103c\u1004"
+        right = self.reorder(wrong)
+        self.assertEqual(right, "\u1015\u103c\u1004\u103a")
+
+    def test_reorders_vowels_before_virama(self):
+        # pa + virama + vowel_ii + vowel_u + nga
+        # should become pa + vowel_ii + vowel_u + nga + virama
+        wrong = "\u1015\u103a\u102c\u102f\u1004"
+        right = self.reorder(wrong)
+        self.assertEqual(right, "\u1015\u102c\u102f\u1004\u103a")
+
+    def test_canonical_text_unchanged(self):
+        # Already in canonical order — should be unchanged
+        canonical = "\u1015\u103c\u1004\u103a"
+        self.assertEqual(self.reorder(canonical), canonical)
+
+    def test_single_mark_unchanged(self):
+        # Single mark after base — no reorder needed
+        self.assertEqual(self.reorder("\u1015\u103a"), "\u1015\u103a")
+
+    def test_no_myanmar_unchanged(self):
+        # ASCII text passes through unchanged
+        self.assertEqual(self.reorder("hello world"), "hello world")
+
+    def test_empty_string(self):
+        self.assertEqual(self.reorder(""), "")
+
+    def test_mixed_myanmar_and_ascii(self):
+        # Burmese syllable inside ASCII text — only the syllable is reordered
+        wrong = "hello \u1015\u103a\u103c\u1004 world"
+        right = self.reorder(wrong)
+        self.assertEqual(right, "hello \u1015\u103c\u1004\u103a world")
+
+    def test_multiple_syllables(self):
+        # Two syllables — each is reordered independently
+        wrong = "\u1015\u103a\u103c\u1004 \u1000\u103a\u102c"
+        right = self.reorder(wrong)
+        self.assertEqual(right, "\u1015\u103c\u1004\u103a \u1000\u102c\u103a")
+
+    def test_medial_la_after_medial_ra(self):
+        # pa + virama + medial_la + medial_ra + nga
+        # should become pa + medial_ra + medial_la + nga + virama
+        wrong = "\u1015\u103a\u103d\u103c\u1004"
+        right = self.reorder(wrong)
+        self.assertEqual(right, "\u1015\u103c\u103d\u1004\u103a")
 
 
 if __name__ == "__main__":

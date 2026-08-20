@@ -13,6 +13,7 @@ from policy_platform.extract_myanmar.metadata_extractor import (
     extract_text_via_metadata,
     is_extractable,
     _parse_tounicode_cmap,
+    _cp_from_glyph_name,
 )
 
 FIXTURE = Path(
@@ -105,6 +106,71 @@ class TestFontResolverDecode(unittest.TestCase):
         )
         out = r.decode(bytes([0x00, 0x00, 0x00, 0x01]))
         self.assertEqual(out, "\u103E\u102F\u1000")
+
+
+class TestCpFromGlyphName(unittest.TestCase):
+    """Tests for parsing cp from `uniNNNN` / `uNNNNNNNN` glyph names.
+
+    Microsoft Word's PDF export sometimes emits embedded fonts whose
+    glyphs follow the `uniNNNN` naming convention but are not listed in
+    the embedded cmap table. The name itself is a reliable Unicode
+    encoding and can be used as a last-resort fallback.
+    """
+
+    def test_uni_four_hex(self) -> None:
+        self.assertEqual(_cp_from_glyph_name("uni1019"), 0x1019)
+        self.assertEqual(_cp_from_glyph_name("uni103B"), 0x103B)
+        self.assertEqual(_cp_from_glyph_name("uni1000"), 0x1000)
+
+    def test_uni_lowercase_hex(self) -> None:
+        self.assertEqual(_cp_from_glyph_name("uni101a"), 0x101A)
+
+    def test_uni_uppercase_hex(self) -> None:
+        self.assertEqual(_cp_from_glyph_name("uni101F"), 0x101F)
+
+    def test_u_prefix_alternate(self) -> None:
+        # Some fonts use the shorter `uNNNN` form (no `ni`).
+        self.assertEqual(_cp_from_glyph_name("u1000"), 0x1000)
+
+    def test_uni_five_hex_pua_returns_none(self) -> None:
+        # 5-digit hex would be > 0xFFFF, so still a single cp.
+        # But it's a 21-bit value -- still within Unicode range.
+        # We accept it if it's a valid codepoint.
+        self.assertEqual(_cp_from_glyph_name("uni10000"), 0x10000)
+
+    def test_uni_six_hex_returns_codepoint(self) -> None:
+        # 6-digit hex, valid Unicode.
+        self.assertEqual(_cp_from_glyph_name("uni10FFFF"), 0x10FFFF)
+
+    def test_uni_eight_hex_returns_none(self) -> None:
+        # 8-digit hex would be > 0x10FFFF, so reject.
+        self.assertIsNone(_cp_from_glyph_name("u10000000"))
+
+    def test_uni_surrogate_returns_none(self) -> None:
+        # Surrogate range is invalid for single-cp output.
+        self.assertIsNone(_cp_from_glyph_name("uniD800"))
+        self.assertIsNone(_cp_from_glyph_name("uniDFFF"))
+
+    def test_uni_pua_returns_none(self) -> None:
+        # Private Use Area is excluded.
+        self.assertIsNone(_cp_from_glyph_name("uniE000"))
+        self.assertIsNone(_cp_from_glyph_name("uniF8FF"))
+
+    def test_glyph_private_name_returns_none(self) -> None:
+        # Microsoft Word's subset renames unmapped glyphs to `glyphNNNNN`.
+        self.assertIsNone(_cp_from_glyph_name("glyph00513"))
+        self.assertIsNone(_cp_from_glyph_name("glyph00020"))
+
+    def test_latin_name_returns_none(self) -> None:
+        # Non-hex glyph names like 'A', 'space', 'endash' don't encode cp.
+        self.assertIsNone(_cp_from_glyph_name("A"))
+        self.assertIsNone(_cp_from_glyph_name("space"))
+        self.assertIsNone(_cp_from_glyph_name("endash"))
+
+    def test_empty_returns_none(self) -> None:
+        self.assertIsNone(_cp_from_glyph_name(""))
+        self.assertIsNone(_cp_from_glyph_name("uni"))
+        self.assertIsNone(_cp_from_glyph_name("uniZZZZ"))
 
 
 class TestExtractFixture(unittest.TestCase):

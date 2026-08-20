@@ -22,6 +22,8 @@ import re
 import zipfile
 from pathlib import Path
 
+from policy_platform.extract_myanmar.debug_logging import log_checkpoint
+
 
 def _html_escape(s: str) -> str:
     """Minimal HTML escape — used when we synthesise rich payloads from
@@ -161,4 +163,20 @@ def build_preview_from_docx(docx_path):
             normalised.append(['p', _normalise_paragraph_payload(payload)])
         elif kind == 't':
             normalised.append(['t', _normalise_table_payload(payload)])
+
+    preview_lines = []
+    for kind, payload in normalised:
+        if kind == 'p' and isinstance(payload, dict):
+            preview_lines.append(payload.get('text', ''))
+        elif kind == 't' and isinstance(payload, dict):
+            for row in payload.get('rows', []):
+                for cell in row:
+                    if isinstance(cell, dict):
+                        preview_lines.append(cell.get('text', ''))
+    log_checkpoint(
+        "before_ui_serve",
+        "\n\n".join(preview_lines),
+        run_id=Path(docx_path).stem,
+    )
+
     return {'lines': normalised}
