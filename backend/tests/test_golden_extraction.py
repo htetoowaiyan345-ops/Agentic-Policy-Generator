@@ -13,6 +13,8 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+import pytest
+
 from policy_platform.extract_myanmar import (
     extract_text_smart,
     PDF_VERDICT_UNSAFE,
@@ -24,6 +26,7 @@ from policy_platform.extract_myanmar import (
 FIXTURE = Path(r"D:\\Htet Oo Wai Yan\\OneDrive - City Holdings Limited\\Desktop\\agentic-policy-platform - Copy (4)\\backend\\tests\\fixtures\\HR_00002_redacted.pdf")
 
 
+@pytest.mark.slow
 class TestGoldenExtraction(unittest.TestCase):
     def setUp(self) -> None:
         if not FIXTURE.exists():

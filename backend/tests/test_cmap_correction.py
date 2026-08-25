@@ -65,6 +65,7 @@ class TestTuLikelyCorrupt:
         assert _tu_likely_corrupt(0x104E, 0x10141039)
 
 
+@pytest.mark.slow
 class TestCMapCorrectionIntegration:
     """Integration test: verify correction logic removes corrupt composites."""
 

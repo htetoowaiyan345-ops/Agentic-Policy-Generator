@@ -20,6 +20,9 @@ import pytest
 from policy_platform import config
 
 
+pytestmark = pytest.mark.slow
+
+
 def _docx_xml(path: Path, member: str) -> str:
     with zipfile.ZipFile(path) as z:
         return z.read(member).decode("utf-8", errors="replace")

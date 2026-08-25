@@ -918,22 +918,18 @@ def dispatch(path: Path) -> ExtractedDocument:
                 inspect_pdf_fonts,
                 classify_pdf,
             )
-            from ..extract_myanmar.myanmar_extractor import (
-                extract_text_smart,
-                METHOD_METADATA_RECOVERED,
-            )
             fonts = inspect_pdf_fonts(path)
             quality = classify_pdf(fonts)
             if quality.verdict == "unsafe" and _paragraphs_look_burmese_corrupt(
                 doc.paragraphs
             ):
-                smart = extract_text_smart(path)
-                if (
-                    smart.method == METHOD_METADATA_RECOVERED
-                    and smart.text
-                    and smart.score <= 0.5
-                ):
-                    doc.paragraphs = smart.text.split("\n")
+                # Skip the legacy `extract_text_smart` cross-check: for
+                # Myanmar PDFs it runs a SECOND Tesseract OCR pass
+                # (72+ seconds) but the result is discarded because
+                # `_unsafe_extract` prefers `tesseract_ocr` over
+                # `metadata_recovered`. The OCR text from
+                # `pdf_extractor.extract()` above is already clean.
+                pass
         except Exception:
             pass
 

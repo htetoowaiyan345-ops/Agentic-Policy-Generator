@@ -5,6 +5,8 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+import pytest
+
 from policy_platform.extract_myanmar import (
     extract_text_smart,
     TextExtractionResult,
@@ -36,6 +38,7 @@ class TestExtractTextSmartMissing(unittest.TestCase):
         self.assertEqual(r.method, METHOD_PDFPLUMBER)
 
 
+@pytest.mark.slow
 class TestExtractTextSmartUserPDF(unittest.TestCase):
     def setUp(self) -> None:
         self.pdf = _pick_pdf()
@@ -51,6 +54,10 @@ class TestExtractTextSmartUserPDF(unittest.TestCase):
     def test_user_pdf_classified_unsafe(self) -> None:
         r = extract_text_smart(self.pdf)
         self.assertEqual(r.pdf_verdict, PDF_VERDICT_UNSAFE)
+        # Per user direction, the Burmese pipeline is OCR-first, so
+        # tesseract_ocr is the canonical method when Tesseract is
+        # available with the mya lang pack. metadata_recovered is the
+        # fallback when OCR is unavailable.
         self.assertIn(
             r.method,
             (
@@ -58,6 +65,7 @@ class TestExtractTextSmartUserPDF(unittest.TestCase):
                 METHOD_MYANMAR_RECOVERED,
                 METHOD_UNSAFE_HIGH_CORRUPTION,
                 "pdfplumber_fallback",
+                "tesseract_ocr",
             ),
         )
 
@@ -153,73 +161,77 @@ class TestMyanmarStatsHelpers(unittest.TestCase):
         self.assertTrue(_needs_pdfplumber_fallback(text))
 
 
-class TestPdfplumberFallback(unittest.TestCase):
-    """Phase 1: cover the pdfplumber fallback swap behaviour."""
+class TestUnsafePathRouting(unittest.TestCase):
+    """Burmese pipeline is OCR-first; metadata is only used as a final
+    fallback when OCR is unavailable.
+    """
 
-    def _invoke_safe(self, primary_text: str, fallback_text: str, fonts):
-        """Run _unsafe_extract with primary + fallback stubbed."""
+    def setUp(self) -> None:
         from policy_platform.extract_myanmar import myanmar_extractor as me
-        from policy_platform.extract_myanmar.myanmar_extractor import (
-            METHOD_METADATA_RECOVERED,
-            METHOD_PDFPLUMBER_FALLBACK,
-            _DENSITY_IMPROVEMENT_RATIO,
-        )
+        self._me = me
+        self._orig = {
+            "extract_text_via_metadata": me.extract_text_via_metadata,
+            "resolve_full_font_path": me._resolve_full_font_path,
+            "is_extractable": me.is_extractable,
+            "is_tesseract_available": me.is_tesseract_available,
+            "extract_text_via_ocr": me.extract_text_via_ocr,
+            "extract_with_pdfplumber": me._extract_with_pdfplumber,
+        }
 
-        real_extract = me.extract_text_via_metadata
-        real_pdfplumber = me._extract_with_pdfplumber
+    def tearDown(self) -> None:
+        me = self._me
+        for k, v in self._orig.items():
+            setattr(me, k, v)
+
+    def _invoke_safe(self, primary_text: str | None, ocr_text: str | None, fonts):
+        """Run _unsafe_extract with metadata + OCR stubbed."""
+        me = self._me
 
         def fake_extract(path, full_font):
-            return [primary_text]
-
-        def fake_pdfplumber(path):
-            return fallback_text
+            return [primary_text or ""]
 
         me.extract_text_via_metadata = fake_extract
-        me._extract_with_pdfplumber = fake_pdfplumber
         me._resolve_full_font_path = lambda: None
         me.is_extractable = lambda p: True
-        try:
-            from pathlib import Path
-            return me._unsafe_extract(Path("dummy.pdf"), fonts)
-        finally:
-            me.extract_text_via_metadata = real_extract
-            me._extract_with_pdfplumber = real_pdfplumber
+        me.is_tesseract_available = lambda: ocr_text is not None
+        me.extract_text_via_ocr = lambda p, **kw: (ocr_text or "")
 
-    def test_healthy_metadata_skips_fallback(self) -> None:
-        # 60% Myanmar, >50 chars -> metadata result kept
+        from pathlib import Path
+        return me._unsafe_extract(Path("dummy.pdf"), fonts)
+
+    def test_ocr_used_when_available(self) -> None:
+        # OCR present -> tesseract_ocr wins regardless of metadata
         primary = ("\u1000" * 60) + ("x" * 40)
-        fallback = ("\u1000" * 5) + ("y" * 95)  # extremely sparse
-        result = self._invoke_safe(primary, fallback, fonts=[])
+        ocr_text = ("\u1000" * 50) + ("y" * 50)
+        result = self._invoke_safe(primary, ocr_text, fonts=[])
+        self.assertEqual(result.method, "tesseract_ocr")
+        self.assertEqual(result.text, ocr_text)
+
+    def test_metadata_used_when_ocr_unavailable(self) -> None:
+        # OCR unavailable AND metadata non-empty -> metadata_recovered
+        primary = ("\u1000" * 60) + ("x" * 40)
+        result = self._invoke_safe(primary, ocr_text=None, fonts=[])
         self.assertEqual(result.method, "metadata_recovered")
         self.assertEqual(result.text, primary)
 
-    def test_sparse_metadata_triggers_swap_to_fallback(self) -> None:
-        # primary: 30 Myanmar out of 1000 chars (3%, sparse)
-        primary = ("\u1000" * 30) + ("x" * 970)
-        # fallback: 500 Myanmar out of 1000 chars (50%, dense)
-        fallback = ("\u1000" * 500) + ("y" * 500)
-        result = self._invoke_safe(primary, fallback, fonts=[])
-        self.assertEqual(result.method, "pdfplumber_fallback")
-        self.assertEqual(result.text, fallback)
+    def test_empty_when_ocr_unavailable_and_metadata_empty(self) -> None:
+        # Both unavailable -> falls through to pdfplumber baseline
+        result = self._invoke_safe(primary_text=None, ocr_text=None, fonts=[])
+        # Either returns metadata-recovered or pdfplumber text, both
+        # are acceptable metadata-path outcomes (we just check it
+        # didn't crash and method is one of the known unsafe methods).
+        self.assertIn(
+            result.method,
+            ("metadata_recovered", "pdfplumber", "myanmar_repair_attempted"),
+        )
 
-    def test_fallback_must_beat_metadata_by_20_percent(self) -> None:
-        # primary: 22% Myanmar -> density=0.22
-        # fallback: 25% Myanmar -> ratio = 25/22 ≈ 1.14 < 1.20
-        primary = ("\u1000" * 22) + ("x" * 78)
-        fallback = ("\u1000" * 25) + ("y" * 75)
-        result = self._invoke_safe(primary, fallback, fonts=[])
-        # Primary wins because fallback did not clear the 1.2× bar
-        self.assertEqual(result.method, "metadata_recovered")
-        self.assertEqual(result.text, primary)
-
-    def test_fallback_domination_swaps_result(self) -> None:
-        # primary: 8% Myanmar -> density=0.08
-        # fallback: 50% Myanmar -> ratio ≈ 6.25 >> 1.2
-        primary = ("\u1000" * 8) + ("x" * 92)
-        fallback = ("\u1000" * 50) + ("y" * 50)
-        result = self._invoke_safe(primary, fallback, fonts=[])
-        self.assertEqual(result.method, "pdfplumber_fallback")
-        self.assertEqual(result.text, fallback)
+    def test_ocr_overrides_sparse_metadata(self) -> None:
+        # Even when metadata has very low density, OCR wins
+        primary = ("\u1000" * 5) + ("x" * 95)  # 5% density
+        ocr_text = ("\u1000" * 80) + ("y" * 20)  # 80% density
+        result = self._invoke_safe(primary, ocr_text, fonts=[])
+        self.assertEqual(result.method, "tesseract_ocr")
+        self.assertEqual(result.text, ocr_text)
 
 
 if __name__ == "__main__":

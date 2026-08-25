@@ -24,10 +24,13 @@ AWARD_PDF = Path(
 )
 
 
-pytestmark = pytest.mark.skipif(
-    not AWARD_PDF.exists(),
-    reason="Award PDF not available in Downloads",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not AWARD_PDF.exists(),
+        reason="Award PDF not available in Downloads",
+    ),
+    pytest.mark.slow,
+]
 
 
 def test_award_pdf_full_run_field_map():

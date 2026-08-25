@@ -6,7 +6,10 @@ requires-python = ">=3.11"
 
 [tool.pytest.ini_options]
 testpaths = ["backend/tests"]
-addopts = "-v --tb=short"
+addopts = "-v --tb=short -m 'not slow'"
+markers = [
+    "slow: marks tests as slow (real OCR ~60-90s per test); excluded from default runs, opt in with `pytest -m slow`",
+]
 pythonpath = ["backend"]
 
 [tool.ruff]

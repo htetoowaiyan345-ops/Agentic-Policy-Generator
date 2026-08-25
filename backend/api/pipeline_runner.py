@@ -28,7 +28,7 @@ from api import versions_io
 
 # Per-file hard timeout. The RAG pipeline self-times out at this same
 # value (DEFAULT_TIMEOUT_SECONDS in policy_platform.rag.retrieval_pipeline).
-PER_FILE_TIMEOUT_SECONDS = 60.0
+PER_FILE_TIMEOUT_SECONDS = 120.0
 
 run_states = {}
 run_lock = threading.Lock()

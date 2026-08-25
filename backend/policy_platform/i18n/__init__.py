@@ -1,16 +1,17 @@
 """Public surface for the i18n module.
 
-Re-exports the per-paragraph language detector, Burmese normalization,
-and synonym/query loaders. The pipeline threads ``lang`` through as a
-parameter; this module is the single source of truth for what
-``en`` / ``my`` / ``mixed`` mean.
+Re-exports Burmese synonym/query loaders. The pipeline threads ``lang``
+through as a parameter; this module is the single source of truth for
+``en`` / ``my`` / ``mixed`` handling.
 """
-from .lang_detect import detect_paragraph_lang, detect_document_lang
-from .burmese_normalize import normalize_burmese, is_burmese_text
+from .burmese_synonyms import (
+    get_burmese_synonyms,
+    get_all_burmese_synonyms,
+    reset_cache,
+)
 
 __all__ = [
-    "detect_paragraph_lang",
-    "detect_document_lang",
-    "normalize_burmese",
-    "is_burmese_text",
+    "get_burmese_synonyms",
+    "get_all_burmese_synonyms",
+    "reset_cache",
 ]

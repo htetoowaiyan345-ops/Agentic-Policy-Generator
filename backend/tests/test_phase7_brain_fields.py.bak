@@ -122,7 +122,6 @@ def test_approval_labels_includes_all_required():
 # End-to-end via pipeline (uses Brain template)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.slow
 def test_pipeline_fills_field_value(tmp_path):
     """When input has `Type: <value>`, the output's Type row shows it."""
     p = tmp_path / "input.txt"
@@ -148,7 +147,6 @@ def test_pipeline_fills_field_value(tmp_path):
     assert "<w:t" in doc and "Policy" in doc
 
 
-@pytest.mark.slow
 def test_pipeline_renders_missing_field_marker(tmp_path):
     """When input lacks `Policy Number:`, the renderer writes the
     `Data is not found in source file` marker after the label.
@@ -212,7 +210,6 @@ def test_brain_label_rows_include_slots_2_4_11():
     assert "Policy Review Note:" in labels
 
 
-@pytest.mark.slow
 def test_pipeline_substitutes_brief_description(tmp_path):
     """When input has `Brief Description:`, the slot 2 paragraph is rewritten."""
     p = tmp_path / "inp.txt"
@@ -227,7 +224,6 @@ def test_pipeline_substitutes_brief_description(tmp_path):
     assert "Covers vacation requests" in doc
 
 
-@pytest.mark.slow
 def test_pipeline_marks_missing_brief_description(tmp_path):
     """When input has no `Brief Description:`, slot 2 paragraph shows marker."""
     p = tmp_path / "inp.txt"
@@ -242,7 +238,6 @@ def test_pipeline_marks_missing_brief_description(tmp_path):
     assert "Data is not found in source file" in doc
 
 
-@pytest.mark.slow
 def test_pipeline_substitutes_reason_for_policy(tmp_path):
     p = tmp_path / "inp.txt"
     p.write_text(
@@ -256,7 +251,6 @@ def test_pipeline_substitutes_reason_for_policy(tmp_path):
     assert "To comply with regulatory requirements." in doc
 
 
-@pytest.mark.slow
 def test_pipeline_substitutes_policy_review_note(tmp_path):
     p = tmp_path / "inp.txt"
     p.write_text(
@@ -270,7 +264,6 @@ def test_pipeline_substitutes_policy_review_note(tmp_path):
     assert "Reviewed annually by Compliance team." in doc
 
 
-@pytest.mark.slow
 def test_pipeline_no_page_breaks_inserted(tmp_path):
     """Per the user's directive the new Brain has 0 page-breaks;
     output mirrors that — no `<w:pageBreakBefore/>` inserted."""
@@ -283,7 +276,6 @@ def test_pipeline_no_page_breaks_inserted(tmp_path):
     assert "<w:pageBreakBefore/>" not in doc, "output must not insert page breaks"
 
 
-@pytest.mark.slow
 def test_pipeline_tables_10_14_have_no_data_when_no_input(tmp_path):
     """Slots 10 (Award) and 14 (HISTORY) cells show the unified marker
     `Data is not found in source file` when input has no table data."""
@@ -299,7 +291,6 @@ def test_pipeline_tables_10_14_have_no_data_when_no_input(tmp_path):
     assert "No data found in source" not in doc
 
 
-@pytest.mark.slow
 def test_no_brain_examples_leak_when_no_input(tmp_path):
     """When the input has no `Label: value` lines, the renderer's output
     must NOT contain any of the Brain's example values from slots 1, 2,
@@ -327,7 +318,6 @@ def test_no_brain_examples_leak_when_no_input(tmp_path):
         assert leak not in doc, f"Brain example leaked into output: {leak!r}"
 
 
-@pytest.mark.slow
 def test_pipeline_label_value_keeps_brain_format(tmp_path):
     """The output preserves the Brain's `Label: value` formatting."""
     p = tmp_path / "input.txt"
@@ -350,7 +340,6 @@ def test_pipeline_label_value_keeps_brain_format(tmp_path):
     assert found_label_value, "Output missing the 'Type: <value>' row in the Brain's format"
 
 
-@pytest.mark.slow
 def test_pipeline_preserves_logo_image():
     """The Brain logo image survives the per-label substitution pass."""
     p = Path("C:/Users/htetoowaiyan/Downloads/Policy For Coronavirus Disease.pdf")
@@ -397,8 +386,7 @@ def test_synonym_responsible_functions_vs_officer_split():
 
 def test_synonym_reason_and_review_note_variants():
     """`Rationale:`, `Background:`, `Context:` map to `Reason for Policy:`;
-    
-ote:`, `Review Notes:` map to `Policy Review Note:`."""
+    `Note:`, `Review Notes:` map to `Policy Review Note:`."""
     assert canonical_label("Rationale:") == "Reason for Policy:"
     assert canonical_label("Background:") == "Reason for Policy:"
     assert canonical_label("Context:") == "Reason for Policy:"
@@ -477,7 +465,6 @@ def test_parse_falls_back_to_rules_by_default():
     assert field_parser.last_extraction_path() == "rules"
 
 
-@pytest.mark.slow
 def test_parse_uses_spacy_when_env_var_set(monkeypatch):
     """With `AGENTIC_POLICY_USE_SPACY=1` AND spaCy installed: path is 'spacy'."""
     from policy_platform.extractors import field_parser

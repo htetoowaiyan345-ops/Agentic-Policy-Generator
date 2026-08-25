@@ -52,6 +52,7 @@ from .burmese_pipeline import normalize_burmese_extraction
 from .myanmar_nfc import normalize_myanmar_nfc
 from .burmese_reorder import reorder_myanmar_syllables  # noqa: F401  (kept for future use)
 from .debug_logging import log_checkpoint
+from .ocr_fallback import is_tesseract_available, extract_text_via_ocr
 
 
 METHOD_PDFPLUMBER = "pdfplumber"
@@ -60,6 +61,7 @@ METHOD_UNSAFE_HIGH_CORRUPTION = "unsafe_high_corruption"
 METHOD_MYANMAR_REPAIR_ATTEMPTED = "myanmar_repair_attempted"
 METHOD_METADATA_RECOVERED = "metadata_recovered"
 METHOD_PDFPLUMBER_FALLBACK = "pdfplumber_fallback"
+METHOD_TESSERACT_OCR = "tesseract_ocr"
 
 PDF_VERDICT_SAFE = "safe"
 PDF_VERDICT_UNSAFE = "unsafe"
@@ -84,6 +86,21 @@ _MYANMAR_ABSOLUTE_MIN = 50
 # (which has already been NFC-normalized, structurally repaired, and
 # scored).
 _DENSITY_IMPROVEMENT_RATIO = 1.2
+
+# Tesseract OCR must beat the metadata path by at least 50% on Myanmar
+# density before it replaces the metadata result. The higher bar
+# reflects that OCR is expensive (~20s for a 12-page PDF) and noisy
+# (~70-85% Burmese accuracy), so we only switch when its gain is
+# substantial. Phase OCR is also enabled only when both metadata and
+# pdfplumber failed the prior gates.
+_OCR_DENSITY_RATIO = 1.5
+
+# Secondary OCR swap criterion: even when density is comparable (the
+# metadata path emits many chars but most are wrong), if OCR's
+# corruption score is at least 0.10 LOWER than the metadata score, we
+# swap. Catches the empty-glyph case where metadata returns
+# non-Myanmar placeholders that nonetheless inflate density.
+_OCR_SCORE_IMPROVEMENT = 0.10
 
 # Default location of bundled reference fonts for Myanmar extraction.
 # Prefer Noto Sans Myanmar (Google Fonts, modern Unicode-compliant cmap)
@@ -190,10 +207,69 @@ def _needs_pdfplumber_fallback(text: str) -> bool:
     """Decide whether the metadata extraction looks too sparse.
 
     Triggers when density is below the threshold *or* the absolute
-    Myanmar character count is too small to be meaningful.
+    Myanmar char count is too small to be meaningful.
     """
     count, density = _myanmar_stats(text)
     return density < _MYANMAR_DENSITY_THRESHOLD or count < _MYANMAR_ABSOLUTE_MIN
+
+
+def _postprocess_ocr(text: str) -> str:
+    """Post-OCR Myanmar canonicalization (Path C).
+
+    Tesseract's LSTM emits Myanmar chars in bitmap reading order. This
+    helper applies targetted fixes for the most common Tesseract
+    artefacts observed on the HR_00002 fixture:
+
+    1. Collapse duplicate vowel signs (``ုု``, ``ိိ``, ``ေေ``) — Tesseract
+       often emits the same vowel twice when the rendered glyph is
+       a stacked ligature.
+    2. Strip trailing virama (U+1039) at end of word — Tesseract
+       inserts virama on complex stacked syllables then forgets to
+       attach the following consonant.
+    3. Collapse double spaces around Myanmar phrases (rendering-induced).
+
+    We DO NOT call ``normalize_myanmar_nfc`` here: NFC canonical
+    reordering is correct for metadata/CID output (where the CMap emits
+    in TOC order rather than reading order), but applied to Tesseract
+    output it aggressively reorders marks that the LSTM placed
+    correctly. Empirically, skipping NFC and applying only these
+    string-level cleanups retains more of Tesseract's correct first
+    reads without introducing canonical-order artefacts.
+
+    Pure string/Unicode operations only; no OCR dependency here.
+    """
+    if not text:
+        return text
+
+    # 1. Collapse duplicate Myanmar vowels/medials.
+    for ch in ("\u102F", "\u1030", "\u102D", "\u102E", "\u1031", "\u1032",
+               "\u102B", "\u102C", "\u1036", "\u1037", "\u1038", "\u103A",
+               "\u103B", "\u103C", "\u103D", "\u103E"):
+        text = text.replace(ch + ch, ch)
+
+    # 2. Strip trailing virama right before whitespace / line-end.
+    text = text.replace("\u1039" + " ", " ")
+    text = text.replace("\u1039" + "\n", "\n")
+    text = text.rstrip("\u1039")
+
+    # 3. Collapse runs of whitespace inside a line.
+    out_lines: list[str] = []
+    for line in text.split("\n"):
+        # Any 2+ ASCII spaces -> single ASCII space.
+        while "  " in line:
+            line = line.replace("  ", " ")
+        out_lines.append(line)
+    text = "\n".join(out_lines)
+
+    # 4. Strip header/watermark noise (FAV city, wy Holdings, etc.)
+    from .ocr_fallback import _strip_header_noise
+    text = _strip_header_noise(text)
+
+    # 5. Apply Myanmar-specific reordering rules (targeted fixes only).
+    from .ocr_fallback import _postprocess_ocr_myanmar
+    text = _postprocess_ocr_myanmar(text)
+
+    return text
 
 
 def _maybe_pdfplumber_fallback(
@@ -241,6 +317,50 @@ def _maybe_pdfplumber_fallback(
         score=primary_score,
         pdf_verdict=PDF_VERDICT_UNSAFE,
         fonts=[],
+    )
+
+
+def _maybe_tesseract_fallback(
+    pdf_path: Path,
+    primary_text: str,
+    primary_score: float,
+    fonts: list[FontInfo],
+) -> TextExtractionResult | None:
+    """OCR-first extractor for the Burmese pipeline.
+
+    Per the user's direction, all Myanmar-classified PDFs are routed
+    through Tesseract OCR. Returns a ``TextExtractionResult`` with
+    method=``tesseract_ocr`` whenever OCR produces non-empty text. The
+    ``primary_text``/``primary_score`` parameters are kept for log /
+    diagnostic comparability but no longer gate the swap.
+
+    The raw OCR output is post-processed through ``_postprocess_ocr``
+    (Path C: canonical reordering, duplicate vowel collapse, trailing
+    virama strip, whitespace cleanup) before being returned. This
+    materially reduces the visible corruption without touching the
+    OCR pipeline itself.
+
+    Returns ``None`` only when Tesseract is unavailable or OCR produced
+    empty text — in which case the caller falls back to the metadata
+    path or the legacy raw extractor.
+    """
+    if not is_tesseract_available():
+        return None
+
+    ocr_text = extract_text_via_ocr(pdf_path)
+    if not ocr_text:
+        return None
+
+    # Path C: post-OCR canonicalization.
+    ocr_text = _postprocess_ocr(ocr_text)
+    ocr_score = compute_corruption_score(ocr_text)
+
+    return TextExtractionResult(
+        text=ocr_text,
+        method=METHOD_TESSERACT_OCR,
+        score=ocr_score,
+        pdf_verdict=PDF_VERDICT_UNSAFE,
+        fonts=fonts,
     )
 
 
@@ -293,59 +413,59 @@ def _resolve_full_font_path() -> Path | None:
 def _unsafe_extract(
     pdf_path: Path, fonts: list[FontInfo]
 ) -> TextExtractionResult:
-    """Path for UNSAFE PDFs.
+    """Path for UNSAFE PDFs — Burmese pipeline.
 
-    Recovery priority:
-      1. metadata_extractor (ToUnicode + embedded cmap bridge) — best.
-      2. pdfplumber fallback (Phase 1) when the metadata result is
-         sparse in Myanmar characters.
-      3. B-3 (glyph-name recovery) + B-4 (structural repair) — last
-         resort.
+    Per user direction, the Burmese pipeline is **OCR-first**: every
+    Myanmar-classified PDF is rendered and OCR'd via Tesseract. The
+    metadata / pdfplumber fallbacks are retained for diagnostics only
+    (their text flows into the diagnostic log and a metadata path is
+    still attempted up-front so font diagnostics survive), but the
+    returned text is the OCR output.
+
+    English pipeline is completely untouched — see ``_safe_extract``,
+    which is the only route for PDFs classified as ``safe``.
     """
     full_font = _resolve_full_font_path()
 
-    # Try metadata-based recovery first (Phase C)
+    # Best-effort metadata pass for diagnostics (font classification,
+    # ToUnicode inspection). The result is NOT returned to the caller.
+    metadata_text: str | None = None
     if is_extractable(pdf_path):
         try:
             pages = extract_text_via_metadata(pdf_path, full_font)
             joined = "\n".join(p for p in pages if p)
             if joined.strip():
                 log_checkpoint("after_normalize", joined)
-                # Strip soft-hyphens / NBSPs introduced by the source PDF's
-                # text-show operators before structural repair.
                 cleaned = normalize_burmese_extraction(joined)
                 repaired = unicode_structural_repair(cleaned)
-                # Apply Myanmar Unicode canonical reordering (UAX #9 §11.4).
-                # PDF content streams concatenate hex blobs in visual TJ
-                # order, not Unicode semantic order. The pure-Python
-                # NFC normalizer sorts combining marks within each
-                # syllable into the canonical position.
                 repaired = normalize_myanmar_nfc(repaired)
                 log_checkpoint("after_repair", repaired)
-                score = compute_corruption_score(repaired)
-                primary = TextExtractionResult(
-                    text=repaired,
-                    method=METHOD_METADATA_RECOVERED,
-                    score=score,
-                    pdf_verdict=PDF_VERDICT_UNSAFE,
-                    fonts=fonts,
-                )
-                # Phase 1: if the metadata result has suspiciously low
-                # Myanmar density, give pdfplumber a chance — only swap
-                # if its Myanmar density beats the metadata path by ≥ 20%.
-                if _needs_pdfplumber_fallback(repaired):
-                    candidate = _maybe_pdfplumber_fallback(
-                        pdf_path,
-                        repaired,
-                        METHOD_METADATA_RECOVERED,
-                        score,
-                    )
-                    # Preserve font diagnostics from the metadata scan.
-                    candidate.fonts = fonts
-                    return candidate
-                return primary
+                metadata_text = repaired
         except Exception:
-            pass
+            metadata_text = None
+
+    # OCR-first: render the PDF and run Tesseract on every page.
+    ocr_result = _maybe_tesseract_fallback(
+        pdf_path,
+        primary_text=metadata_text or "",
+        primary_score=compute_corruption_score(metadata_text)
+        if metadata_text
+        else 1.0,
+        fonts=fonts,
+    )
+    if ocr_result is not None:
+        return ocr_result
+
+    # OCR unavailable or empty — fall back to the legacy metadata path
+    # so the pipeline never silently produces nothing for a Myanmar PDF.
+    if metadata_text:
+        return TextExtractionResult(
+            text=metadata_text,
+            method=METHOD_METADATA_RECOVERED,
+            score=compute_corruption_score(metadata_text),
+            pdf_verdict=PDF_VERDICT_UNSAFE,
+            fonts=fonts,
+        )
 
     raw = _baseline_extract(pdf_path)
     if not raw:

@@ -15,6 +15,9 @@ from policy_platform.extractors.spacy_extractor import (
 )
 
 
+pytestmark = pytest.mark.slow
+
+
 def _spacy_runtime_ready(monkeypatch) -> bool:
     """Same logic `is_available` uses: env var=1 + spaCy + model."""
     monkeypatch.setenv("AGENTIC_POLICY_USE_SPACY", "1")

@@ -235,6 +235,10 @@ def extract(path: Path) -> ExtractedDocument:
 
     For backward compatibility, we also keep a PyMuPDF-first fallback
     when pdfplumber produces no content.
+
+    For Myanmar/Burmese PDFs, if the default extraction produces corrupt
+    output (broken CMaps, wrong character order), falls back to Tesseract
+    OCR with post-OCR correction.
     """
     pdfplumber_doc = _try_pdfplumber(path)
     if pdfplumber_doc.paragraphs or pdfplumber_doc.tables:
@@ -243,6 +247,27 @@ def extract(path: Path) -> ExtractedDocument:
         if pymupdf_doc is not None and pymupdf_doc.tables:
             if len(pymupdf_doc.tables) > len(pdfplumber_doc.tables):
                 pdfplumber_doc.tables = pymupdf_doc.tables
+
+        # Myanmar OCR fallback: if extraction looks corrupt, try OCR.
+        try:
+            from .ocr_fallback import should_use_ocr, extract_text_via_ocr
+            from .myanmar_post_ocr import correct_myanmar_ocr
+            if should_use_ocr(pdfplumber_doc.paragraphs, pdfplumber_doc.tables):
+                # Use preprocess=False — OpenCV preprocessing destroys
+                # Myanmar ligatures (verified: 18 lines vs 81 lines).
+                ocr_text = extract_text_via_ocr(path, preprocess=False)
+                if ocr_text:
+                    corrected = correct_myanmar_ocr(ocr_text)
+                    # Replace paragraphs with OCR-corrected lines.
+                    # Keep existing tables from pdfplumber.
+                    ocr_paragraphs = [
+                        line for line in corrected.split("\n") if line.strip()
+                    ]
+                    pdfplumber_doc.paragraphs = ocr_paragraphs
+        except ImportError:
+            # ocr_fallback or myanmar_post_ocr not available; skip.
+            pass
+
         return pdfplumber_doc
     pymupdf_doc = _try_pymupdf(path)
     if pymupdf_doc is None or not (pymupdf_doc.paragraphs or pymupdf_doc.tables):
