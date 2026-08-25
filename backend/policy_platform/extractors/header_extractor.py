@@ -20,7 +20,10 @@ be None).
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from PIL import Image
 
 
 # Heuristic regex for version labels
@@ -62,6 +65,9 @@ def _score_title(line: str, position: int = 0) -> float:
          (start with `APPLICABLE TO`, `SCOPE`, `AUDIENCE`, `This
          policy`, `The policy`, etc.). These are body sentences that
          happen to be long and can otherwise out-score the real title.
+      7. **Myanmar title density bonus**: lines with ≥5 Myanmar chars
+         and length 30-120 chars get a +30 bonus. This helps Myanmar
+         policy titles out-score OCR header artifacts.
     """
     s = line.strip()
     if not s:
@@ -85,6 +91,11 @@ def _score_title(line: str, position: int = 0) -> float:
     score = len(s)
     if s == s.upper() and any(c.isalpha() for c in s):
         score += 60
+    # Myanmar title density bonus. Conservative: ≥5 Myanmar chars
+    # (not 1-2 char OCR artifacts) and length 30-120 (typical title range).
+    myanmar_count = sum(1 for c in s if 0x1000 <= ord(c) <= 0x109F)
+    if 30 <= len(s) <= 120 and myanmar_count >= 5:
+        score += 30
     # Penalize very long lines (likely content, not title).
     if len(s) > 120:
         score -= 80
@@ -150,9 +161,11 @@ def _looks_like_label_value(s: str) -> bool:
     for sid, syns in SECTION_HEADING_SYNONYMS.items():
         for syn in syns:
             known.add(syn.rstrip(":").lower())
-    # Match a label at start, followed by `:` and a value.
+    # Match a label at start, followed by `:` and a value. Burmese
+    # characters (U+1000-U+109F and U+AA60-U+AA7F) are accepted so
+    # Myanmar labels like `မူဝါဒအမည်:` are also caught.
     m = _re.match(
-        r"^\s*([A-Za-z][A-Za-z0-9 ()/&.,'\-_]*?)\s*[:\t]\s*\S",
+        r"^\s*([A-Za-z\u1000-\u109F\uAA60-\uAA7F][A-Za-z0-9 ()/&.,'\-_\u1000-\u109F\uAA60-\uAA7F]*?)\s*[:\t]\s*\S",
         s,
     )
     if not m:
@@ -226,3 +239,265 @@ def extract(input_path, pdf_metadata: dict[str, Any] | None = None,
             pass
 
     return {"title": title, "version": version, "source": source}
+
+
+# ---------------------------------------------------------------------------
+# Header table value extraction (for Myanmar and other label-row tables
+# that pdfplumber/PyMuPDF miss in the visual header region).
+# ---------------------------------------------------------------------------
+
+# Same regex as brain_fields._LABEL_LINE_RE / field_parser._LABEL_LINE_RE
+# after the Gate-1 broadening (accepts Burmese chars in label).
+_HEADER_TABLE_LABEL_LINE_RE = re.compile(
+    r"^\s*([A-Za-z\u1000-\u109F\uAA60-\uAA7F][A-Za-z0-9 ()/&.,'\-_\u1000-\u109F\uAA60-\uAA7F]*?)\s*[:\t]\s*(.+?)\s*$"
+)
+
+
+def _parse_header_table_text(header_text: str) -> dict[str, str]:
+    """Parse OCR output from a header table region into label -> value.
+
+    Generic, no per-file hardcoding. Handles three layouts:
+      1. explicit `Label: value` lines (English or Burmese)
+      2. tab/2+ space separated pairs (e.g., `Policy no  HR_GP_00002`)
+      3. **alternating label/value lines** (e.g., line N is labels,
+         line N+1 is values). This is the dominant layout in Myanmar
+         policy PDFs where the table headers come back as a single line
+         of labels and the next line has the values.
+
+    For layout 3, label phrases are matched greedily from left to right
+    against ``canonical_label()``. Tokens like "Policy no" resolve to
+    "Policy Number:" via synonym matching, while "Approved" alone resolves
+    to "Approved by:" but only after consuming the next token "by".
+
+    Returns dict of canonical_label -> raw_value. Empty if nothing matches.
+    """
+    from policy_platform.framework.brain_fields import canonical_label
+
+    out: dict[str, str] = {}
+    if not header_text:
+        return out
+
+    def _store_if_canon(label: str, value: str) -> bool:
+        if not value or re.fullmatch(r"\d+", value):
+            return False
+        canon = canonical_label(label + ":")
+        if canon and canon not in out:
+            out[canon] = value
+            return True
+        return False
+
+    def _split_labels_with_spans(label_line: str) -> list[tuple[int, int, str]]:
+        """Split a labels line into (start_char, end_char, canonical_label)
+        spans using canonical_label().
+
+        Tokenizes by whitespace, then walks tokens left-to-right. At each
+        starting token, tries phrases of length 1, then 2, then ... up to
+        max_phrase_len (5). Picks the SHORTEST phrase that resolves to a
+        canonical label. Rationale: short forms like "Approved", "Policy",
+        "Prepared" are registered synonyms in BRAIN_LABEL_ROWS, so a
+        single token often matches completely. Longer phrases only matter
+        when no short match exists (e.g., "Policy no" requires 2 tokens
+        because "Policy" alone doesn't resolve).
+        """
+        token_spans: list[tuple[int, int, str]] = []
+        i = 0
+        n = len(label_line)
+        while i < n:
+            while i < n and label_line[i].isspace():
+                i += 1
+            if i >= n:
+                break
+            start = i
+            while i < n and not label_line[i].isspace():
+                i += 1
+            token_spans.append((start, i, label_line[start:i]))
+
+        out_spans: list[tuple[int, int, str]] = []
+        ti = 0
+        max_phrase_len = 5
+        while ti < len(token_spans):
+            tok_start_pos = token_spans[ti][0]
+            match: tuple[int, int, str] | None = None
+            for L in range(1, min(max_phrase_len, len(token_spans) - ti) + 1):
+                phrase = " ".join(t[2] for t in token_spans[ti:ti + L]).strip(":")
+                c = canonical_label(phrase + ":")
+                if c is not None:
+                    end_idx = ti + L
+                    end_pos = (
+                        token_spans[end_idx][0] if end_idx < len(token_spans) else n
+                    )
+                    match = (end_pos, L, c)
+                    break  # shortest match wins
+            if match is not None:
+                _, L, canon = match
+                out_spans.append((tok_start_pos, match[0], canon))
+                ti += L
+            else:
+                ti += 1
+        return out_spans
+
+    lines = [ln.strip() for ln in header_text.splitlines() if ln.strip()]
+
+    # Strategy 3 (run first): alternating label/value lines.
+    # Use character-position spans from the labels line to slice the
+    # values line at the same column positions. This handles multi-token
+    # values (e.g., "Daw Win Win Tint" for "Approved by:") correctly.
+    #
+    # OCR may insert 1-2 short lines between labels and values (e.g., a
+    # leftover "date" token between the labels line and the values line
+    # in Myanmar PDFs). Try pairing each labels line with up to 3 lines
+    # forward; the values line is the one whose char positions best match
+    # the label column positions.
+    for i in range(len(lines) - 1):
+        labels_line = lines[i]
+
+        spans = _split_labels_with_spans(labels_line)
+        if len(spans) < 2:
+            continue
+
+        # Find the best matching values line within next 3 lines.
+        # Requirements for a values line:
+        #   1. fewer label matches than the labels line
+        #   2. at least as many whitespace tokens as labels (each label
+        #      needs at least one value token)
+        best_values: str | None = None
+        for j in range(i + 1, min(i + 4, len(lines))):
+            cand = lines[j]
+            cand_spans = _split_labels_with_spans(cand)
+            cand_n_canon = len(cand_spans)
+            cand_tokens = len(cand.split())
+            if cand_n_canon < len(spans) and cand_tokens >= len(spans):
+                best_values = cand
+                break
+        if best_values is None:
+            continue
+        values_line = best_values
+
+        # Compute fractional column boundaries from labels line and use
+        # them to slice the values line. Tokenize values_line first so
+        # each label gets whole tokens (cleaner than raw char slices).
+        labels_len = len(labels_line)
+        if labels_len == 0:
+            continue
+        vlen = len(values_line)
+        value_tokens = values_line.split()
+        n_val = len(value_tokens)
+
+        # Map each span's start position to a fractional position,
+        # then find which value token falls at that fractional position.
+        # Use cumulative character offsets of value tokens.
+        token_offsets: list[int] = []
+        offset = 0
+        for tok in value_tokens:
+            token_offsets.append(offset)
+            offset += len(tok) + 1  # +1 for space
+
+        pairs: list[tuple[str, str]] = []
+        n_labels = len(spans)
+
+        # First pass: compute initial fractional token boundaries.
+        boundaries: list[tuple[int, int]] = []  # (tok_start_idx, tok_end_idx)
+        for idx, (start, end, canon) in enumerate(spans):
+            start_frac = start / labels_len
+            end_frac = end / labels_len
+
+            tok_start_idx = 0
+            for ti, off in enumerate(token_offsets):
+                if off / vlen >= start_frac:
+                    tok_start_idx = ti
+                    break
+
+            if idx + 1 < n_labels:
+                next_start = spans[idx + 1][0]
+                next_frac = next_start / labels_len
+                tok_end_idx = n_val
+                for ti, off in enumerate(token_offsets):
+                    if off / vlen >= next_frac:
+                        tok_end_idx = ti
+                        break
+            else:
+                tok_end_idx = n_val
+
+            boundaries.append((tok_start_idx, tok_end_idx))
+
+        # Second pass: if any label got 0 tokens but the previous label
+        # has more than 1 token, redistribute. This handles name fields
+        # like "Daw Win Win Tint" that span multiple tokens.
+        if any(end - start == 0 for start, end in boundaries):
+            # Find first label with multi-token value AND next empty label.
+            for i in range(n_labels - 1):
+                cur_start, cur_end = boundaries[i]
+                next_start, next_end = boundaries[i + 1]
+                if (cur_end - cur_start) >= 2 and (next_end - next_start) == 0:
+                    # Move tokens from current to next.
+                    move_count = (cur_end - cur_start) // 2
+                    move_count = max(move_count, 1)
+                    new_cur_end = cur_end - move_count
+                    new_next_start = new_cur_end
+                    # Recompute next's end as new_next_start + move_count
+                    # or until next boundary.
+                    new_next_end = next_end + move_count
+                    if new_next_end > n_val:
+                        new_next_end = n_val
+                    boundaries[i] = (cur_start, new_cur_end)
+                    boundaries[i + 1] = (new_next_start, new_next_end)
+                    break
+
+        # Materialize pairs.
+        for idx, (start, end, canon) in enumerate(spans):
+            tok_start_idx, tok_end_idx = boundaries[idx]
+            value = " ".join(value_tokens[tok_start_idx:tok_end_idx]).strip()
+            pairs.append((canon, value))
+
+        for canon, val in pairs:
+            if val and not re.fullmatch(r"\d+", val):
+                if canon not in out:
+                    out[canon] = val
+
+    # Strategy 1: explicit `Label: value` (Burmese or English).
+    for line in lines:
+        m = _HEADER_TABLE_LABEL_LINE_RE.match(line)
+        if m:
+            label = m.group(1).strip()
+            value = m.group(2).strip()
+            _store_if_canon(label, value)
+
+    # Strategy 2: tab or 2+ space separated pair on a single line.
+    for line in lines:
+        parts = re.split(r"\t+|\s{2,}", line, maxsplit=1)
+        if len(parts) == 2:
+            label = parts[0].strip().rstrip(":")
+            value = parts[1].strip()
+            if 2 <= len(label) <= 60:
+                _store_if_canon(label, value)
+
+    return out
+
+
+def extract_header_table_values(image: Image.Image) -> dict[str, str]:
+    """End-to-end: OCR a full page image (rendered at HEADER_DPI) and
+    parse label-value pairs from the OCR text.
+
+    Args:
+        image: PIL Image of a full page (page 1 of the PDF, rendered at
+               HEADER_DPI by the caller).
+
+    Returns:
+        Dict of canonical_label -> value. Empty if nothing matched.
+    """
+    from policy_platform.extractors.ocr_fallback import (
+        _ocr_page1_high_dpi,
+    )
+
+    if image is None:
+        return {}
+
+    try:
+        page_text = _ocr_page1_high_dpi(image)
+    except Exception:
+        return {}
+
+    if not page_text:
+        return {}
+
+    return _parse_header_table_text(page_text)

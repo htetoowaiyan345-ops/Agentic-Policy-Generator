@@ -962,6 +962,20 @@ def dispatch(path: Path) -> ExtractedDocument:
 
     doc.paragraphs = normalized
     doc.original_indices = new_orig
+
+    # Re-derive source_lang from final normalized paragraphs in case the
+    # cleaner/normalizer dropped Myanmar-specific markers. If the extractor
+    # already set source_lang, only override when currently empty.
+    if not doc.source_lang:
+        try:
+            from .ocr_fallback import _has_myanmar
+            if _has_myanmar("\n".join(normalized)):
+                doc.source_lang = "my"
+            else:
+                doc.source_lang = "en"
+        except ImportError:
+            pass
+
     return doc
 
 

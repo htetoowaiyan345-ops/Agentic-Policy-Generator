@@ -7,11 +7,15 @@ through as a parameter; this module is the single source of truth for
 from .burmese_synonyms import (
     get_burmese_synonyms,
     get_all_burmese_synonyms,
+    get_burmese_label_synonyms,
+    get_canonical_for_burmese_label,
     reset_cache,
 )
 
 __all__ = [
     "get_burmese_synonyms",
     "get_all_burmese_synonyms",
+    "get_burmese_label_synonyms",
+    "get_canonical_for_burmese_label",
     "reset_cache",
 ]

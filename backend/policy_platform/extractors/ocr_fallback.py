@@ -189,6 +189,39 @@ def _pdf_to_images(
 
 
 # ---------------------------------------------------------------------------
+# Header table extraction (label-row tables on page 1)
+# ---------------------------------------------------------------------------
+#
+# Generic for any policy PDF: scans the full page 1 (not just top region,
+# because the header table can sit below the title in Myanmar layouts) and
+# feeds the OCR output through a generic label-value parser. No per-file
+# hardcoding — relies on ``canonical_label()`` (English + Burmese YAML
+# reverse index) for label recognition.
+
+# Higher DPI for header-table OCR (label-row accuracy). Configurable.
+HEADER_DPI = int(os.environ.get("TESSERACT_HEADER_DPI", "200"))
+
+
+def _ocr_page1_high_dpi(image: Image.Image) -> str:
+    """OCR a single page image (already rendered at HEADER_DPI) and
+    return the raw OCR text. Generic: scans the full page, the parser
+    is responsible for finding label-value pairs.
+
+    Args:
+        image: PIL Image of a full page, rendered at HEADER_DPI.
+
+    Returns:
+        Raw OCR text from the entire page.
+    """
+    _configure_tesseract()
+    config = f"--oem {DEFAULT_OEM} --psm {DEFAULT_PSM}"
+    text = pytesseract.image_to_string(
+        image, lang=DEFAULT_LANG, config=config
+    )
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
 # Single-page OCR
 # ---------------------------------------------------------------------------
 
@@ -236,6 +269,7 @@ def extract_text_via_ocr(
     psm: int = DEFAULT_PSM,
     max_workers: int = MAX_WORKERS,
     preprocess: bool = True,
+    psm_per_page: dict[int, int] | None = None,
 ) -> str:
     """Extract text from a PDF using Tesseract OCR with OpenCV preprocessing.
 
@@ -250,6 +284,9 @@ def extract_text_via_ocr(
         psm: Tesseract page segmentation mode (default: 6 = uniform block)
         max_workers: Number of parallel OCR threads
         preprocess: Whether to apply OpenCV preprocessing
+        psm_per_page: Optional dict mapping page index (0-based) to a
+            page-specific PSM override. Useful for hybrid OCR where
+            page 1 (header table) needs PSM=4 and rest use PSM=6.
     """
     _configure_tesseract()
 
@@ -262,9 +299,10 @@ def extract_text_via_ocr(
     page_texts: list[str] = [None] * len(images)  # type: ignore[list-item]
 
     def _ocr_page(idx: int, img: Image.Image) -> tuple[int, str]:
+        page_psm = (psm_per_page or {}).get(idx, psm)
         try:
             return idx, _ocr_single_page(
-                img, lang=lang, oem=oem, psm=psm,
+                img, lang=lang, oem=oem, psm=page_psm,
                 preprocess=preprocess, preprocess_mode="light"
             )
         except Exception as e:

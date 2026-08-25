@@ -23,6 +23,13 @@ class ExtractedDocument:
     source_sha256: str = ""
     source_format: str = ""
     cleaner_dropped: list[dict] = field(default_factory=list)
+    # Detected language of the source. One of: "en", "my", "mixed", or "".
+    # Set by the extractor (pdf_extractor, docx_extractor, etc.) based on
+    # character-class detection of the extracted paragraphs.
+    source_lang: str = ""
+    # Per-paragraph language tag, parallel to `paragraphs`. Empty string
+    # when not computed. Reserved for future use; not populated yet.
+    paragraph_languages: list[str] = field(default_factory=list)
     # Parallel list to `paragraphs` (post-cleaner). Each entry is the
     # index in the original (pre-cleaner) paragraph stream that the
     # cleaned paragraph came from. Used by parsers to recover

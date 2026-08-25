@@ -250,12 +250,22 @@ def extract(path: Path) -> ExtractedDocument:
 
         # Myanmar OCR fallback: if extraction looks corrupt, try OCR.
         try:
-            from .ocr_fallback import should_use_ocr, extract_text_via_ocr
+            from .ocr_fallback import (
+                should_use_ocr,
+                extract_text_via_ocr,
+                HEADER_DPI,
+                _pdf_to_images,
+            )
             from .myanmar_post_ocr import correct_myanmar_ocr
+            from .header_extractor import extract_header_table_values
             if should_use_ocr(pdfplumber_doc.paragraphs, pdfplumber_doc.tables):
                 # Use preprocess=False — OpenCV preprocessing destroys
                 # Myanmar ligatures (verified: 18 lines vs 81 lines).
-                ocr_text = extract_text_via_ocr(path, preprocess=False)
+                # Hybrid: page 1 (header table) uses PSM=4 to capture
+                # table cells; rest use PSM=6 for word recognition.
+                ocr_text = extract_text_via_ocr(
+                    path, preprocess=False, psm_per_page={0: 4}
+                )
                 if ocr_text:
                     corrected = correct_myanmar_ocr(ocr_text)
                     # Replace paragraphs with OCR-corrected lines.
@@ -263,10 +273,42 @@ def extract(path: Path) -> ExtractedDocument:
                     ocr_paragraphs = [
                         line for line in corrected.split("\n") if line.strip()
                     ]
-                    pdfplumber_doc.paragraphs = ocr_paragraphs
+
+                    # Phase G3.4: Re-OCR the header region of page 1 at
+                    # higher DPI (default 200) to recover label-row values
+                    # that pdfplumber missed (Myanmar PDF tables come
+                    # back empty). Convert extracted values to synthetic
+                    # `Label: value` lines and prepend so the existing
+                    # field_parser picks them up via canonical_label().
+                    header_values: dict[str, str] = {}
+                    try:
+                        header_pages = _pdf_to_images(path, dpi=HEADER_DPI)
+                        if header_pages:
+                            header_values = extract_header_table_values(
+                                header_pages[0]
+                            )
+                    except Exception:
+                        header_values = {}
+
+                    synth_lines = [
+                        f"{k} {v}" for k, v in header_values.items()
+                    ]
+                    pdfplumber_doc.paragraphs = synth_lines + ocr_paragraphs
         except ImportError:
             # ocr_fallback or myanmar_post_ocr not available; skip.
             pass
+
+        # Detect language after extraction. Scan final paragraphs (which
+        # may include OCR-corrected Myanmar text) for Myanmar characters.
+        try:
+            from .ocr_fallback import _has_myanmar
+            full_text = "\n".join(pdfplumber_doc.paragraphs)
+            if _has_myanmar(full_text):
+                pdfplumber_doc.source_lang = "my"
+            else:
+                pdfplumber_doc.source_lang = "en"
+        except ImportError:
+            pdfplumber_doc.source_lang = ""
 
         return pdfplumber_doc
     pymupdf_doc = _try_pymupdf(path)

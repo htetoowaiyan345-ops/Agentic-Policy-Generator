@@ -56,8 +56,12 @@ def _enabled_sentence_split() -> bool:
 
 
 # Regex matching any `Label: value` line. Allows letters, digits, spaces,
-# punctuation in the label. Same shape as brain_fields._LABEL_LINE_RE.
-_LABEL_LINE_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9 ()/&.,'\-_]*?)\s*[:\t]\s*(.+?)\s*$")
+# punctuation in the label. Burmese characters (U+1000-U+109F and
+# U+AA60-U+AA7F) are accepted so Myanmar PDFs can use Burmese labels
+# such as `မူဝါဒအမည်: ...`. Same shape as brain_fields._LABEL_LINE_RE.
+_LABEL_LINE_RE = re.compile(
+    r"^\s*([A-Za-z\u1000-\u109F\uAA60-\uAA7F][A-Za-z0-9 ()/&.,'\-_\u1000-\u109F\uAA60-\uAA7F]*?)\s*[:\t]\s*(.+?)\s*$"
+)
 
 
 # Sentence terminators that END a clause. We split BEFORE these when the
@@ -330,7 +334,11 @@ def _split_into_label_clauses(joined: list[str]) -> list[tuple[str, str]]:
 # A "label-only" line is short (≤60 chars), has no colon/tab/period, and
 # looks like a label (Title Case or brain-canonicalized). When we find
 # such a line, the NEXT non-empty line is treated as its value.
-_LABELISH_LINE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 ()/&,'\-_]{0,60}$")
+# Burmese characters (U+1000-U+109F and U+AA60-U+AA7F) are accepted so
+# Myanmar PDFs can use Burmese labels in alternating-label-value layouts.
+_LABELISH_LINE_RE = re.compile(
+    r"^[A-Za-z\u1000-\u109F\uAA60-\uAA7F][A-Za-z0-9 ()/&,'\-_\u1000-\u109F\uAA60-\uAA7F]{0,60}$"
+)
 
 
 def _is_labelish(s: str) -> bool:

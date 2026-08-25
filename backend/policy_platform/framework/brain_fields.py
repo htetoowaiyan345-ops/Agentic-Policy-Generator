@@ -259,6 +259,20 @@ def canonical_label(input_label: str) -> str | None:
                 best = (len(ncan), canonical)
     if best is not None:
         return best[1]
+    # Phase 6 — Burmese reverse-index fallback. Only consulted when English
+    # exact + prefix matching both failed. Maps Burmese phrases from
+    # ``burmese_synonyms.yaml`` to canonical English labels.
+    try:
+        from policy_platform.i18n.burmese_synonyms import (
+            get_canonical_for_burmese_label,
+        )
+        # Strip trailing colon before reverse lookup (loader accepts both).
+        cleaned = input_label.strip().rstrip(":").strip()
+        result = get_canonical_for_burmese_label(cleaned)
+        if result:
+            return result
+    except Exception:
+        pass
     return None
 
 
@@ -289,8 +303,12 @@ def is_exact_label_or_synonym(text: str) -> str | None:
 
 
 # Regex matching any `Label: value` line. Allows letters, digits, spaces,
-# punctuation in the label.
-_LABEL_LINE_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9 ()/&.,'\-_]*?)\s*[:\t]\s*(.+?)\s*$")
+# punctuation in the label. Burmese characters (U+1000-U+109F and
+# U+AA60-U+AA7F) are accepted so Myanmar PDFs can use Burmese labels
+# such as `မူဝါဒအမည်: ...`.
+_LABEL_LINE_RE = re.compile(
+    r"^\s*([A-Za-z\u1000-\u109F\uAA60-\uAA7F][A-Za-z0-9 ()/&.,'\-_\u1000-\u109F\uAA60-\uAA7F]*?)\s*[:\t]\s*(.+?)\s*$"
+)
 
 
 def field_map(input_paragraphs: Iterable[str]) -> dict[str, str]:
