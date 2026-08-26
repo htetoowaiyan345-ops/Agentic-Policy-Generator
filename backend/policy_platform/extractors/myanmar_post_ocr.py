@@ -411,9 +411,12 @@ def _fix_composite_chars(text: str) -> str:
         _anusvara + r"([\u102D-\u1032])"
     )
 
-    # Fix: orphaned asat (virama) without preceding consonant
+    # Fix: orphaned asat (virama) without preceding valid character.
+    # The preceding character must be either a consonant (U+1000-U+1021),
+    # a medial (U+103B-U+103E), a kinzi (U+1064), or the dot-below
+    # sign U+1037 (so that canonical `ည့်`/`င့်` patterns are preserved).
     text = re.sub(
-        r"(?<![\u1000-\u1021\u103B-\u103E])" + _asat, "", text
+        r"(?<![\u1000-\u1021\u103B-\u103E\u1037\u1064])" + _asat, "", text
     )
 
     # Fix: double asat
@@ -428,12 +431,13 @@ def _fix_composite_chars(text: str) -> str:
     text = text.replace(_visarga + _asat, _asat + _visarga)
 
     # Fix: broken kinzi sequences
-    # င + virama (U+1039) should be င + asat (U+103A)
+    # င + virama (U+1039) should be င + asat (U+103A) for kinzi.
+    # This is the ONLY case where virama should be replaced by asat.
+    # NOTE: The previous global replace "\u1039" -> "\u103A" corrupted
+    # stacked ligatures like ကုမ္ပဏီ (where U+1039 is correct for
+    # stacking the second consonant below the first). Do NOT add a global
+    # virama-to-asat replacement; only convert in the kinzi context.
     text = text.replace("\u1003\u1039", "\u1003\u103A")
-
-    # Fix: virama → asat for all stacked consonants
-    # Tesseract sometimes outputs virama (U+1039) instead of asat (U+103A)
-    text = text.replace("\u1039", "\u103A")
 
     # NOTE: Phase-4 added stacked-ligature normalization and triple-mark
     # collapse. The stacked-ligature fix is preserved as a SAFE normalization
