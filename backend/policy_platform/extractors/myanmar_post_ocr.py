@@ -507,6 +507,72 @@ def _fix_visarga_compound_vowel(text: str) -> str:
     return text
 
 
+# Extended Myanmar consonant range used for _fix_trailing_asat matches.
+# Includes basic consonants (U+1000-U+1021), great sa (U+103F), and the
+# extended block (U+1050-U+1059) used for Pali/Sanskrit loanwords.
+_TRAILING_ASAT_CONSONANT = (
+    r"[\u1000-\u1021\u103F\u1050-\u1059]"
+)
+
+
+def _fix_trailing_asat(text: str) -> str:
+    """Recover dropped trailing asat (်, U+103A) after ည့ or င့.
+
+    Tesseract commonly emits "half-character" endings where the asat
+    U+103A is dropped after the dot-below sign U+1037, producing
+    incomplete syllables that break word continuation.
+
+    Four targeted patterns (medial marks U+103B-U+103E are allowed
+    between the consonant and ည/င because stacked-ligature words like
+    ခွင့် have `consonant + medial-wa + င + ့ + ်`):
+
+      A. consonant[+medial]* + ည + ့ + (anything non-asat)
+              →  insert ်
+         e.g. သည့ဝန်  →  သည့်ဝန်
+              သည့နေ့  →  သည့်နေ့
+              သည့ပမာဏ → သည့်ပမာဏ
+              သည့။     →  သည့်။
+
+      B. consonant[+medial]* + င + ့ + boundary  →  insert ်
+         e.g. ခွင့။    →  ခွင့်။
+              နိုင့ပါ  →  နိုင့်ပါ
+
+      C. consonant[+medial]* + င + ့ + း + (boundary OR Myanmar char)
+              →  replace ့း with ့်
+         e.g. ခွင့း      →  ခွင့်
+              ခွင့းထုတ် → ခွင့်ထုတ်
+
+    Pattern A is broad: any character following `ည့` indicates the asat
+    is missing (correct Burmese uses `ည့်+...` where the `ည့်` belongs
+    to the previous word). The negative lookahead prevents double-
+    insertion when `်` is already present. Patterns B and C also allow
+    optional medial marks (e.g., `ွ` in `ခွင့်`).
+    """
+    # Optional medial marks between consonant and ည/င (captured).
+    _MEDIAL = r"([\u103B-\u103E]*)"
+    # Pattern A: missing ် after ည့, followed by anything non-asat.
+    text = re.sub(
+        rf"({_TRAILING_ASAT_CONSONANT}){_MEDIAL}ည့(?!\u103A)",
+        r"\1\2ည့်",
+        text,
+    )
+    _B = r"[\s\u104A\u104B,\-]|$"
+    # Pattern B: missing ် after င့ at word-end (strict boundary).
+    text = re.sub(
+        rf"({_TRAILING_ASAT_CONSONANT}){_MEDIAL}င့(?={_B})",
+        r"\1\2င့်",
+        text,
+    )
+    # Pattern C: wrong း instead of ် after င့, broadened to Myanmar-char
+    # follow-on (catches ခွင့းထုတ် as well as ခွင့း alone).
+    text = re.sub(
+        rf"({_TRAILING_ASAT_CONSONANT}){_MEDIAL}င့း(?![\u103A])",
+        r"\1\2င့်",
+        text,
+    )
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Duplicate removal
 # ---------------------------------------------------------------------------
@@ -627,6 +693,9 @@ def correct_myanmar_ocr(text: str) -> str:
 
     # Step 4c: Fix visarga compound vowel confusion (းာ → ုာ)
     text = _fix_visarga_compound_vowel(text)
+
+    # Step 4d: Recover dropped trailing asat (်) after ည့/င့
+    text = _fix_trailing_asat(text)
 
     # Step 5: Reorder marks to canonical Unicode order
     text = _reorder_marks(text)
