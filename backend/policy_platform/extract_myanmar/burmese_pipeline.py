@@ -427,16 +427,20 @@ def find_burmese_heading_match(
     paragraphs: list[str],
     *,
     reserved_paragraphs: set[int] | None = None,
+    numeric_index: dict[int, int] | None = None,
 ) -> tuple[int, int, str] | None:
     """Find a Burmese heading-anchored section for ``slot_id``.
 
     Mirrors the English ``find_heading_match`` contract: returns
     ``(start_idx, end_idx, joined_text)`` on success, ``None`` otherwise.
-    Does NOT depend on the English rag pipeline.
 
-    Burmese heading detection is delegated to
-    :func:`has_burmese_slot_synonym_in_first_line` for the marker check
-    and to :func:`get_burmese_heading_patterns` for the pattern match.
+    When ``numeric_index`` is provided (Myanmar numbered sections detected),
+    uses numeric position mapping instead of synonym-based matching.
+    Numeric mapping is more reliable for documents with explicit section
+    numbers (၁, ၂, ၃, ၄).
+
+    When ``numeric_index`` is None, falls back to synonym-based matching
+    via ``get_burmese_heading_patterns``.
     """
     if slot_id not in _HEADING_PATTERN_SLOTS:
         return None
@@ -445,6 +449,45 @@ def find_burmese_heading_match(
     if reserved_paragraphs is None:
         reserved_paragraphs = set()
 
+    # Phase 3: Numeric section mapper — override synonym matching
+    # when Myanmar numbered sections are detected.
+    if numeric_index is not None:
+        # Find all paragraph indices mapped to this slot
+        slot_indices = [
+            idx for idx, sid in numeric_index.items()
+            if sid == slot_id and idx not in reserved_paragraphs
+        ]
+        if not slot_indices:
+            return None
+        start_idx = min(slot_indices)
+        end_idx = max(slot_indices)
+        # Collect body text
+        body_paragraphs = [
+            p.strip()
+            for idx in range(start_idx, end_idx + 1)
+            for p in [paragraphs[idx]]
+            if p and p.strip() and idx not in reserved_paragraphs
+        ]
+        # Sub-section separator injection
+        _SUB_SECTION_RE = re.compile(
+            r"(?:^|(?<=\s))([\u1040-\u1049]+-[\u1040-\u1049]+[\u104B.#]\s*)"
+        )
+        joined_parts: list[str] = []
+        for piece in body_paragraphs:
+            clean = piece.strip()
+            if not clean:
+                continue
+            m = _SUB_SECTION_RE.match(clean)
+            if m and joined_parts:
+                joined_parts.append("\n\n" + clean)
+            else:
+                joined_parts.append(clean)
+        joined = " ".join(joined_parts).strip()
+        if not joined:
+            return None
+        return (start_idx, end_idx, joined)
+
+    # Fallback: synonym-based matching
     patterns = get_burmese_heading_patterns(slot_id)
     if not patterns:
         return None
@@ -466,8 +509,6 @@ def find_burmese_heading_match(
         return None
 
     # Walk forward collecting body paragraphs until the next heading
-    # boundary (any other slot's Burmese heading or a generic
-    # ``looks_like_burmese_heading`` match) or end-of-paragraphs.
     end_idx = len(paragraphs) - 1
     for j in range(start_idx + 1, len(paragraphs)):
         next_p = paragraphs[j]
@@ -478,14 +519,11 @@ def find_burmese_heading_match(
             end_idx = j - 1
             break
 
-    # Collect body text, excluding reserved indices.
     body_paragraphs = [
         p.strip()
         for k, p in enumerate(paragraphs[start_idx + 1: end_idx + 1], start=start_idx + 1)
         if p and p.strip() and k not in reserved_paragraphs
     ]
-    # Also include the inline body (text after the heading) from the heading
-    # paragraph if present.
     heading_para = paragraphs[start_idx]
     heading_first = heading_para.split("\n")[0]
     inline_body = ""
@@ -498,7 +536,20 @@ def find_burmese_heading_match(
     if inline_body:
         pieces.append(inline_body)
     pieces.extend(body_paragraphs)
-    joined = " ".join(pieces).strip()
+    _SUB_SECTION_RE = re.compile(
+        r"(?:^|(?<=\s))([\u1040-\u1049]+-[\u1040-\u1049]+[\u104B.#]\s*)"
+    )
+    joined_parts: list[str] = []
+    for piece in pieces:
+        clean = piece.strip()
+        if not clean:
+            continue
+        m = _SUB_SECTION_RE.match(clean)
+        if m and joined_parts:
+            joined_parts.append("\n\n" + clean)
+        else:
+            joined_parts.append(clean)
+    joined = " ".join(joined_parts).strip()
     if not joined:
         joined = heading_first.strip()
     return (start_idx, end_idx, joined)
@@ -539,6 +590,19 @@ def apply_burmese_heading_anchors(
     if not has_burmese:
         return 0
 
+    # Phase 3: Build numeric section index when Myanmar numbered sections
+    # are detected. Numeric mapping overrides synonym-based matching.
+    numeric_index = None
+    try:
+        from ..rag.burmese_numeric_headings import (
+            has_numeric_sections,
+            build_numeric_section_index,
+        )
+        if has_numeric_sections(paragraphs):
+            numeric_index = build_numeric_section_index(paragraphs)
+    except ImportError:
+        pass
+
     slots = getattr(rag_result, "slots", None)
     if not isinstance(slots, dict):
         return 0
@@ -549,7 +613,8 @@ def apply_burmese_heading_anchors(
         if sid not in _HEADING_PATTERN_SLOTS:
             continue
         match = find_burmese_heading_match(
-            sid, paragraphs, reserved_paragraphs=reserved
+            sid, paragraphs, reserved_paragraphs=reserved,
+            numeric_index=numeric_index,
         )
         if match is not None:
             s_idx, e_idx, text = match

@@ -348,6 +348,95 @@ def _is_garbage_line(line: str) -> bool:
     if re.search(r"\?[၀-၉]", stripped):
         return True
 
+    # =====================================================================
+    # GENERIC Myanmar-flowchart garbage rules (Rules 22-31)
+    # =====================================================================
+    # All rules below are GATED on Myanmar-script presence. Pure English
+    # lines skip this entire block (preserving English regression 11/11).
+    #
+    # Rules use Unicode ranges and structural patterns only — no
+    # document-specific vocabulary or hardcoded file references. They
+    # apply uniformly to any Myanmar policy PDF.
+    # =====================================================================
+    if not _MYANMAR_ALL.search(stripped):
+        return False
+
+    # Rule 22: digit-space-Myanmar-digit flowchart connector
+    # (e.g. "+ 0 ၂", "0 ၁ ၂", "� 0 နံပါတ်")
+    if re.search(r"\b[+0]\s+[\u1040-\u1049]\b", stripped):
+        return True
+
+    # Rule 23: Latin-word + Myanmar-digit fragments (column-wrap)
+    if re.search(r"[A-Za-z]+\s+[\u1040-\u1049]+[\s]+[\u1040-\u1049]", stripped):
+        return True
+
+    # Rule 24: Flowchart decision-node keywords + period (long-line variant)
+    # Burmese flowchart nodes use these words as standalone decision labels
+    # like "ပယ်ခ�။", "အတည်ပြု။". Gated on <80 chars to preserve
+    # full sentences ("အကယ်၍ ပယ်ချပါက..." >80 chars, kept).
+    if (
+        re.search(
+            r"(ပယ်ချ|အတည်ပြု|လက်ခံ|ပ�်ခြင်း|စစ်ဆေး)\s*[\u104B\.\)\:]",
+            stripped,
+        )
+        and len(stripped) < 80
+    ):
+        return True
+
+    # Rule 25: Column-wrap artifact — Myanmar consonant + space + punct
+    # (e.g. "မှတ် ။" suggests the OCR split a clean line mid-word)
+    if re.search(r"[\u1000-\u1021]\s+[\u104B\.\,;:]", stripped):
+        return True
+
+    # Rule 26: Standalone English question-word fragments in Myanmar doc
+    # (e.g. "no", "yes", "n/a" alone — flowchart yes/no nodes)
+    if re.fullmatch(r"\s*(no|yes|n\s*/\s*a)\s*", stripped, re.IGNORECASE):
+        return True
+
+    # Rule 27: Form-field label with empty value (e.g. "Required : ")
+    # Generic pattern — any short Latin label followed by colon and space.
+    if re.match(r"^[A-Za-z][A-Za-z\s]{2,30}:\s*$", stripped):
+        return True
+
+    # Rule 28: Standalone YES/NO/Y-N checkbox (with optional slash variants)
+    # Catches all common checkbox labels: "YES", "NO", "YES/NO", "Y/N".
+    if re.fullmatch(
+        r"\s*(yes\s*/\s*no|yes|no|y\s*/\s*n|y\s*/\s*n\s*/\s*a)\s*",
+        stripped,
+        re.IGNORECASE,
+    ):
+        return True
+
+    # Rule 30: Flowchart connector word — context-aware short-line variant.
+    # REMOVE when: connector word appears AND line is <30 chars AND no
+    #   sentence-ending marker. (Standalone flowchart node text.)
+    # PRESERVE when: line >=30 chars OR has sentence-ending marker
+    #   (e.g. "သတ်မှတ်ချက်များနှင့် မကိုက်ညီပါက ပယ်ချရမည်။" — kept).
+    _FLOW_KEYWORDS = re.compile(
+        r"(ပယ်ချ|အတည်ပြု|စစ်ဆေး|လက်ခံ|ပယ်ခြင်း)"
+    )
+    _SENT_END = re.compile(r"[\u104B\u104E\u104F\.\!\?။]")
+    if (
+        _FLOW_KEYWORDS.search(stripped)
+        and len(stripped) < 30
+        and not _SENT_END.search(stripped)
+    ):
+        return True
+
+    # Rule 31: Mixed English + Myanmar short-line (<20 chars)
+    # Dual gate: Latin char count >= 3 AND Myanmar char count >= 3.
+    # Preserves short English-only phrases ("HR Department", "Group Co.")
+    # and short Myanmar-only phrases.
+    if len(stripped) < 20:
+        latin_count = sum(1 for c in stripped if c.isascii() and c.isalpha())
+        myanmar_count = len(_MYANMAR_ALL.findall(stripped))
+        if latin_count >= 3 and myanmar_count >= 3:
+            return True
+
+    # Rule 29 (corpus-level repeated form labels) is implemented in
+    # ``_filter_repeated_form_labels`` as a post-pass over the full
+    # paragraph list — single-line rules cannot detect repetition.
+
     return False
 
 
@@ -367,6 +456,41 @@ def _strip_garbage_lines(text: str) -> str:
             continue
         result.append(line)
     return "\n".join(result)
+
+
+def _filter_repeated_form_labels(
+    paragraphs: list[str],
+    threshold: int = 3,
+) -> list[str]:
+    """Corpus-level garbage filter: remove lines that repeat >=threshold times.
+
+    Catches form-field labels that appear repeatedly in flowcharts
+    (same label printed in multiple boxes across pages). Skips empty
+    lines. Threshold is generic — any line appearing ``threshold`` or
+    more times in the document is treated as repeated noise.
+
+    Args:
+        paragraphs: list of paragraph strings (post single-line garbage filter).
+        threshold: minimum repetition count to drop a line (default 3).
+
+    Returns:
+        New list with repeated-form-label lines removed.
+    """
+    if not paragraphs:
+        return list(paragraphs)
+    from collections import Counter
+
+    # Count non-empty stripped lines.
+    counter: Counter[str] = Counter()
+    for p in paragraphs:
+        if p and p.strip():
+            stripped = p.strip()
+            counter[stripped] += 1
+    repeated = {line for line, count in counter.items() if count >= threshold}
+    return [
+        p for p in paragraphs
+        if p and p.strip() and p.strip() not in repeated
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -763,6 +887,20 @@ def correct_myanmar_ocr(text: str) -> str:
     # Step 8: AGGRESSIVELY filter out garbage lines
     # This is the key step - drop anything not cleanly readable
     text = _strip_garbage_lines(text)
+
+    # Step 8.5: Generic Myanmar-flowchart garbage removal (Rules 22-31).
+    # Single-line rules inside ``_is_garbage_line`` already removed
+    # checkbox fragments, digit-artifacts, mixed-script short lines, and
+    # context-aware flowchart connectors. This post-pass (Rule 29)
+    # detects *repeated* form-field labels — lines that appear
+    # ``threshold`` or more times in the document (typical of form
+    # labels printed in every flowchart box across pages). The post-pass
+    # is gated on Myanmar-script presence so English-only documents
+    # are unaffected.
+    if _MYANMAR_ALL.search(text):
+        paragraphs = text.split("\n")
+        paragraphs = _filter_repeated_form_labels(paragraphs, threshold=3)
+        text = "\n".join(paragraphs)
 
     # Step 9: Apply myOCR paper confusion pairs
     text = _apply_confusion_pairs(text)

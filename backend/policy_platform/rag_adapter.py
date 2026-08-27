@@ -162,39 +162,48 @@ def _normalize_chunk(text: str) -> str:
 
 
 def _split_into_source_paragraphs(text: str) -> list[str]:
-    """Split a prose chunk at numbered-clause boundaries and bullet
-    markers that already exist in the source document.
+    """Split a prose chunk at paragraph boundaries that already exist
+    in the source document.
 
-    Goal: preserve the source PDF's paragraph structure 1:1. Each
-    numbered clause (2.1., 1.1., 3.4., ...) and each bullet (▪) becomes
-    its own content_paragraph item, matching how the source PDF lays
-    them out on separate lines.
+    Splits on:
+      1. Double newlines (\n\n) — inserted by find_burmese_heading_match
+         for Myanmar sub-section markers (၁-၁။, ၂-၃#, etc.)
+      2. English numbered-clause boundaries (2.1., 1.1., 3.4., ...)
+      3. Bullet markers (▪)
 
-    No new line breaks are invented. The split regex only fires at
-    clauses/bullets that already exist. When the input has no numbered
-    clauses or bullets (e.g. a single-sentence scope like "All local
-    employees directly affected by a verified flood event."), the
-    function falls back to a single-paragraph list so short-scope
-    documents are unaffected.
+    No new line breaks are invented. Each split preserves source layout.
     """
     if not text or not text.strip():
         return [_normalize_chunk(text)] if text else []
-    chunks = [c for c in _CLAUSE_SPLIT_RE.split(text) if c.strip()]
+
+    # Phase 2: Split at \n\n paragraph breaks (Myanmar sub-section separation)
+    if "\n\n" in text:
+        raw_chunks = text.split("\n\n")
+    else:
+        raw_chunks = [text]
+
     out: list[str] = []
-    for chunk in chunks:
-        pieces = _BULLET_SPLIT_RE.split(chunk)
-        cur = ""
-        for pc in pieces:
-            if not pc:
+    for raw in raw_chunks:
+        if not raw or not raw.strip():
+            continue
+        # Further split English numbered clauses and bullets
+        pieces = _CLAUSE_SPLIT_RE.split(raw)
+        for chunk in pieces:
+            if not chunk or not chunk.strip():
                 continue
-            if pc.strip() == "\u25aa":
-                if cur.strip():
-                    out.append(_normalize_chunk(cur))
-                cur = "\u25aa "
-            else:
-                cur += pc
-        if cur.strip():
-            out.append(_normalize_chunk(cur))
+            bullet_pieces = _BULLET_SPLIT_RE.split(chunk)
+            cur = ""
+            for pc in bullet_pieces:
+                if not pc:
+                    continue
+                if pc.strip() == "\u25aa":
+                    if cur.strip():
+                        out.append(_normalize_chunk(cur))
+                    cur = "\u25aa "
+                else:
+                    cur += pc
+            if cur.strip():
+                out.append(_normalize_chunk(cur))
     if not out:
         return [_normalize_chunk(text)]
     if len(out) == 1:
