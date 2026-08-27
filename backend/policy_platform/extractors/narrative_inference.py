@@ -193,6 +193,40 @@ _EXCLUSIONS_HEADING_RE = re.compile(
 )
 
 
+# Layer D — Myanmar script helper. We reuse the burmese_strings
+# constants via lazy import to avoid circulars; the constants are
+# narrow, generic keyword lists (department-head nouns, ownership
+# phrases, audience markers, officer titles, type-classification
+# nouns) that mirror the English keyword lists above.
+def _burmese_strings():
+    """Lazy import to avoid circulars at module load."""
+    try:
+        from policy_platform.i18n.burmese_strings import (
+            OWNERSHIP_KEYWORDS_MM,
+            AUDIENCE_KEYWORDS_MM,
+            OFFICER_KEYWORDS_MM,
+            REVIEW_KEYWORDS_MM,
+            BRIEF_INTRO_PATTERNS_MM,
+            REASON_INTRO_PATTERNS_MM,
+            DEPARTMENT_HEAD_NOUNS_MM,
+            TYPE_INFERENCE_MM,
+            has_burmese,
+        )
+        return {
+            "ownership": OWNERSHIP_KEYWORDS_MM,
+            "audience": AUDIENCE_KEYWORDS_MM,
+            "officer": OFFICER_KEYWORDS_MM,
+            "review": REVIEW_KEYWORDS_MM,
+            "brief_intro": BRIEF_INTRO_PATTERNS_MM,
+            "reason_intro": REASON_INTRO_PATTERNS_MM,
+            "dept_nouns": DEPARTMENT_HEAD_NOUNS_MM,
+            "type_mm": TYPE_INFERENCE_MM,
+            "has_burmese": has_burmese,
+        }
+    except Exception:
+        return None
+
+
 # Domain taxonomy for department-head nouns. Used for Functional Area
 # and Responsible Function vocabulary matching. This is domain
 # vocabulary (the names of common organizational units), NOT
@@ -884,6 +918,62 @@ def infer_narrative_fields(
         if result:
             out["Type:"] = result[0]
 
+    # Layer G — Type inference from Policy Title suffix (Myanmar + English).
+    # Fires after the English type-inference has had its chance. If
+    # the title ends with a known classification noun (Policy,
+    # Standard, Procedure, etc. — English OR Myanmar via TYPE_INFERENCE_MM),
+    # extract that classification as the Type. General heuristic —
+    # no per-file hardcoding.
+    if not existing_field_map.get("Type:"):
+        # Reuse the Policy Title we just inferred (or already had).
+        title_value = out.get("Policy Title:") or existing_field_map.get(
+            "Policy Title:"
+        )
+        if title_value:
+            title_mm = title_value
+            mm = _burmese_strings()
+            if mm is not None:
+                # Myanmar: find longest TYPE_INFERENCE_MM key in title.
+                best_mm: tuple[int, str] | None = None
+                for mm_key, en_class in mm["type_mm"].items():
+                    if mm_key in title_mm:
+                        if best_mm is None or len(mm_key) > best_mm[0]:
+                            best_mm = (len(mm_key), en_class)
+                if best_mm is not None:
+                    cleaned = parse_field_value("Type:", best_mm[1])
+                    if cleaned:
+                        out["Type:"] = cleaned
+            # English fallback if Myanmar path didn't fire.
+            if not out.get("Type:"):
+                title_low_en = title_value.lower()
+                # Look for trailing classification noun in title.
+                for keyword in (
+                    "policy",
+                    "policies",
+                    "standard",
+                    "standards",
+                    "procedure",
+                    "procedures",
+                    "guideline",
+                    "guidelines",
+                    "framework",
+                    "charter",
+                    "directive",
+                    "rule",
+                    "regulation",
+                    "protocol",
+                    "manual",
+                    "handbook",
+                    "code",
+                ):
+                    if keyword in title_low_en.split():
+                        # Capitalize first letter to match vocabulary.
+                        cls = keyword.capitalize()
+                        cleaned = parse_field_value("Type:", cls)
+                        if cleaned:
+                            out["Type:"] = cleaned
+                            break
+
     # Phase 7 — Applicable Sector(s) inference.
     if not existing_field_map.get("Applicable Sector(s):"):
         result = _infer_applicable_sectors(paras, parse_field_value)
@@ -931,5 +1021,127 @@ def infer_narrative_fields(
         result = _infer_reason_for_policy(paras, parse_field_value)
         if result:
             out["Reason for Policy:"] = result[0]
+
+    # Layer D — Myanmar keyword inference. Only fires when at least one
+    # paragraph contains Myanmar script. Mirrors the English
+    # _infer_* functions but scans for Myanmar keyword patterns from
+    # burmese_strings.py. General heuristic — no per-file hardcoding.
+    mm = _burmese_strings()
+    if mm is not None:
+        any_mm = any(mm["has_burmese"](p) for p in paras if p)
+        if any_mm:
+            # Applicable Sector(s) from Myanmar audience keywords.
+            if not existing_field_map.get("Applicable Sector(s):"):
+                for p in paras[:40]:
+                    if not mm["has_burmese"](p):
+                        continue
+                    if any(kw in p for kw in mm["audience"]):
+                        cleaned = parse_field_value(
+                            "Applicable Sector(s):", p.strip()[:300]
+                        )
+                        if cleaned:
+                            out["Applicable Sector(s):"] = cleaned
+                            break
+            # Functional Area(s) from Myanmar ownership keywords + dept-nouns.
+            if not existing_field_map.get("Functional Area(s):"):
+                for p in paras[:60]:
+                    if not mm["has_burmese"](p):
+                        continue
+                    if any(kw in p for kw in mm["ownership"]):
+                        # Extract first noun phrase containing a dept-noun.
+                        for noun in mm["dept_nouns"]:
+                            if noun in p:
+                                # Capture surrounding phrase (3 tokens max).
+                                idx = p.find(noun)
+                                start = max(0, idx - 12)
+                                end = min(len(p), idx + len(noun) + 12)
+                                phrase = p[start:end].strip()
+                                # Trim to last noun.
+                                cleaned = parse_field_value(
+                                    "Functional Area(s):", phrase
+                                )
+                                if cleaned:
+                                    out["Functional Area(s):"] = cleaned
+                                    break
+                        if out.get("Functional Area(s):"):
+                            break
+            # Responsible Function Officer(s) from Myanmar officer titles.
+            if not existing_field_map.get("Responsible Function Officer(s):"):
+                for p in paras[:80]:
+                    if not mm["has_burmese"](p):
+                        continue
+                    if any(kw in p for kw in mm["officer"]):
+                        cleaned = parse_field_value(
+                            "Responsible Function Officer(s):", p.strip()[:200]
+                        )
+                        if cleaned:
+                            out["Responsible Function Officer(s):"] = cleaned
+                            break
+            # Last Reviewed from Myanmar review keywords.
+            if not existing_field_map.get("Last Reviewed:"):
+                for p in paras[:100]:
+                    if not mm["has_burmese"](p):
+                        continue
+                    if any(kw in p for kw in mm["review"]):
+                        cleaned = parse_field_value(
+                            "Last Reviewed:", p.strip()[:200]
+                        )
+                        if cleaned:
+                            out["Last Reviewed:"] = cleaned
+                            break
+            # Applies to from Myanmar audience keywords.
+            if not existing_field_map.get("Applies to:"):
+                for p in paras[:50]:
+                    if not mm["has_burmese"](p):
+                        continue
+                    if any(kw in p for kw in mm["audience"]):
+                        s = p[:300].strip()
+                        # Strip a leading keyword to leave a clean noun phrase.
+                        for kw in mm["audience"]:
+                            if kw in s:
+                                idx = s.find(kw)
+                                # Strip up to and including the keyword.
+                                s = s[idx + len(kw):].strip()
+                                break
+                        s = s.rstrip(":").strip()
+                        if s:
+                            cleaned = parse_field_value("Applies to:", s)
+                            if cleaned:
+                                out["Applies to:"] = cleaned
+                                break
+            # Brief Description from Myanmar brief-intro patterns.
+            if not existing_field_map.get("Brief Description:"):
+                for p in paras[:40]:
+                    if not mm["has_burmese"](p):
+                        continue
+                    if not any(re.match(pat, p, re.IGNORECASE) for pat in mm["brief_intro"]):
+                        continue
+                    sentences = _split_sentences(p)
+                    if sentences:
+                        first = sentences[0].strip()[:500]
+                        if first:
+                            cleaned = parse_field_value(
+                                "Brief Description:", first
+                            )
+                            if cleaned:
+                                out["Brief Description:"] = cleaned
+                                break
+            # Reason for Policy from Myanmar reason-intro patterns.
+            if not existing_field_map.get("Reason for Policy:"):
+                for p in paras[:40]:
+                    if not mm["has_burmese"](p):
+                        continue
+                    if not any(re.match(pat, p, re.IGNORECASE) for pat in mm["reason_intro"]):
+                        continue
+                    sentences = _split_sentences(p)
+                    if sentences:
+                        first = sentences[0].strip()[:600]
+                        if first:
+                            cleaned = parse_field_value(
+                                "Reason for Policy:", first
+                            )
+                            if cleaned:
+                                out["Reason for Policy:"] = cleaned
+                                break
 
     return out

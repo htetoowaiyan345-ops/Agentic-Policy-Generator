@@ -29,6 +29,7 @@ import signal
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+import re
 
 import numpy as np
 
@@ -767,6 +768,69 @@ class RetrievalPipeline:
                     )
                     slots_needing_rag.remove(5)
 
+        # Layer C: Myanmar position-based fallback. When the document
+        # contains Myanmar-script paragraphs AND a slot's RAG path
+        # returned no high-confidence match, fall back to
+        # position-based assignment: take the next unclaimed
+        # Myanmar paragraph AFTER the slot's heading anchor (or at
+        # the start of the Myanmar section if no anchor exists).
+        # This is the generic heuristic that recovers Myanmar body
+        # content the vector retriever dropped (BM25 still helps for
+        # exact-match section names, but free-form Myanmar prose
+        # without clear headings falls through to this path).
+        if slots_needing_rag:
+            _MM_RE_LOOSE = re.compile(
+                r"[\u1000-\u109F\uAA60-\uAA7F\uA9E0-\uA9FF]"
+            )
+            any_mm = any(
+                _MM_RE_LOOSE.search(p) for p in paragraphs if p
+            )
+            if any_mm:
+                # Build a set of unclaimed Myanmar paragraph indices
+                # for the position-based assignment.
+                unclaimed_mm = []
+                for i, p in enumerate(paragraphs):
+                    if i in reserved_paragraphs:
+                        continue
+                    if not p or not p.strip():
+                        continue
+                    # Must be a Myanmar paragraph (>= 30 chars).
+                    if (
+                        _MM_RE_LOOSE.search(p)
+                        and len(p.strip()) >= 30
+                    ):
+                        unclaimed_mm.append(i)
+                # Process remaining slots in slot-id order so each
+                # gets a sequential slice of unclaimed paragraphs.
+                # Cap to keep content compact.
+                cursor = 0
+                for sid in sorted(slots_needing_rag):
+                    if sid in (5, 6, 7, 8, 9, 10, 12, 13, 14):
+                        # Find the next Myanmar paragraph after the
+                        # cursor position.
+                        assigned = None
+                        for i in range(cursor, len(unclaimed_mm)):
+                            if unclaimed_mm[i] > cursor:
+                                assigned = unclaimed_mm[i]
+                                break
+                        if assigned is None and cursor < len(unclaimed_mm):
+                            assigned = unclaimed_mm[cursor]
+                        if assigned is not None:
+                            cursor = assigned + 1
+                            result.slots[sid] = SlotAssignment(
+                                slot_id=sid,
+                                chunk_text=paragraphs[assigned].strip(),
+                                source_idx=assigned,
+                                score=0.5,
+                                backend="mm_position_fallback",
+                            )
+                            reserved_paragraphs.add(assigned)
+                # Remove assigned slots from the RAG queue.
+                slots_needing_rag = [
+                    s for s in slots_needing_rag
+                    if s not in result.slots
+                ]
+
         if not slots_needing_rag:
             result.elapsed_seconds = time.perf_counter() - t0
             return result
@@ -984,6 +1048,23 @@ class RetrievalPipeline:
 
         MIN_CHUNK_CHARS = 30
 
+        # Layer C: detect whether this slot's retrieval is operating
+        # on Myanmar-script content. The TF-IDF/MiniLM vector space has
+        # no representation of Myanmar syllables — every vector query
+        # against a Myanmar chunk returns noise. When at least one
+        # chunk in the corpus contains Myanmar Unicode codepoints, we
+        # down-weight the vector contribution and let BM25 dominate.
+        # English PDFs (no Myanmar chunks) keep the existing alpha.
+        _MM_RE = re.compile(r"[\u1000-\u109F\uAA60-\uAA7F\uA9E0-\uA9FF]")
+        has_mm_chunks = any(
+            _MM_RE.search(ch.text) for ch in chunks
+        )
+        if has_mm_chunks:
+            # Vector contributes 0.1, BM25 contributes 0.9.
+            alpha_eff = 0.1
+        else:
+            alpha_eff = self.alpha
+
         # Aggregate (chunk_idx, hybrid_score) across all slot queries.
         agg: Dict[int, float] = {}
 
@@ -1001,7 +1082,7 @@ class RetrievalPipeline:
                             continue
                         if len(chunks[idx].text.strip()) < MIN_CHUNK_CHARS:
                             continue
-                        agg[idx] = agg.get(idx, 0.0) + self.alpha * float(score)
+                        agg[idx] = agg.get(idx, 0.0) + alpha_eff * float(score)
 
             # BM25 search.
             bm25_hits = bm25_store.search([q], TOP_K_PER_BACKEND)
@@ -1015,7 +1096,7 @@ class RetrievalPipeline:
                         continue
                     if len(chunks[idx].text.strip()) < MIN_CHUNK_CHARS:
                         continue
-                    agg[idx] = agg.get(idx, 0.0) + (1.0 - self.alpha) * (float(score) / max_bm25)
+                    agg[idx] = agg.get(idx, 0.0) + (1.0 - alpha_eff) * (float(score) / max_bm25)
 
         if not agg:
             return SlotAssignment(slot_id=slot_id, chunk_text=None, backend="all_reserved")

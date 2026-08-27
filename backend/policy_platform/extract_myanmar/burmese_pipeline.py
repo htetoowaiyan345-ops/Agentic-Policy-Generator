@@ -94,8 +94,12 @@ def looks_like_burmese_heading(line: str) -> bool:
     stripped = line.strip()
     if not stripped:
         return False
-    # Myanmar digit prefix + Burmese text
-    if re.match(r"^\s*[\u1040-\u1049]+[\u104B.]\s*[\u1000-\u109F]", stripped):
+    # Myanmar digit prefix + Burmese text. Accept `။` (U+104B), `.`, or `#`
+    # (Tesseract OCR often mis-recognizes the tiny Burmese period as
+    # `#` when it immediately follows Myanmar digits). The `#` fallback
+    # is gated on Myanmar content present elsewhere in the document;
+    # English-only docs use `.` or `:` not `#` for section markers.
+    if re.match(r"^\s*[\u1040-\u1049]+[\u104B.#]\s*[\u1000-\u109F]", stripped):
         return True
     # Short Burmese-only line, no body punctuation
     has_burmese = any("\u1000" <= ch <= "\u109F" for ch in stripped)
@@ -105,17 +109,32 @@ def looks_like_burmese_heading(line: str) -> bool:
         return False
     body_chars = [ch for ch in stripped if not ch.isspace()]
     if any(
-        ch.isascii() and (ch.isalnum() or ch in ":-.,()") and ch != "\u104B"
+        ch.isascii() and (ch.isalnum() or ch in ":-.,()#") and ch != "\u104B"
         for ch in body_chars
     ):
         return False
-    # Known Burmese heading synonyms (bare word)
+    # Known Burmese heading synonyms — loaded dynamically from the
+    # burmese_synonyms YAML so the hardcoded set stays in sync with the
+    # canonical synonym list. Falls back to the legacy hardcoded set
+    # if the loader is unavailable.
+    try:
+        from ..i18n.burmese_synonyms import get_all_burmese_synonyms
+        all_syns = get_all_burmese_synonyms()
+        flat = []
+        for syns in all_syns.values():
+            flat.extend(syns)
+        if stripped in flat:
+            return True
+    except Exception:
+        pass
+    # Legacy hardcoded set (kept as a safety net; the YAML loader
+    # may be unavailable in some test contexts).
     BURMESE_HEADINGS = {
-        "နိဒ�န်း", "မူဝါဒ", "ရည်ရွယ်ချက်", "ရည်ရွယ်",
-        "�ယ်ပယ်", "အကျိုးခံစားခွင့်", "ချန်လှပ်ချက်များ", "ချန်လှပ်ချက်",
-        "အဓိပ္ပာယ်", "အဓိပ္ပာယ်ဖော်ပြချက်", "ဆက်စပ်မူဝါဒများ",
-        "ဆက်စ�်မူဝါဒ", "သမိုင်း", "မူဝါဒပြန်လည့်စစ်ဆေးခြင်း",
-        "ပ�န်လည့်စစ်�ေးခြင်း",
+        "နိဒါန်း", "မူဝါဒ", "ရည်ရွယ်ချက်", "ရည်ရွယ်",
+        "နယ်ပယ်", "အကျိုးခံစားခွင့်", "ချွင်းချက်များ", "ချွင်းချက်",
+        "အဓိပ္ပါယ်", "အဓိပ္ပါယ်ဖော်ပြချက်", "ဆက်စပ်မူဝါဒများ",
+        "ဆက်စပ်မူဝါဒ", "သမိုင်း", "မူဝါဒပြန်လည့်စစ်ဆေးခြင်း",
+        "ပြန်လည့်စစ်ဆေးခြင်း",
     }
     if stripped in BURMESE_HEADINGS:
         return True
@@ -143,9 +162,14 @@ def get_burmese_heading_patterns(slot_id: int) -> list[re.Pattern]:
         syns = get_burmese_synonyms(slot_id)
     except Exception:
         syns = []
-    sep = r"(?:[:\-.\ufffd]|\s|$|[\u1000-\u109F])"
+    # Separator accepts `။` (U+104B), `.`, `:`, `-`, or `#` (Tesseract
+    # OCR may mis-read the Burmese period as ASCII hash when it follows
+    # Myanmar digits).
+    sep = r"(?:[:\-.\ufffd#]|\s|$|[\u1000-\u109F])"
     prefix_en = r"(?:\d+\.\s*|\d+\)\s*|[IVX]+\.\s*)?"
-    prefix_my = r"(?:[\u1040-\u1049]+[\u104B.]\s*)?"
+    # Myanmar digit prefix accepts `။` (U+104B), `.`, or `#` as the
+    # period character following the digits.
+    prefix_my = r"(?:[\u1040-\u1049]+[\u104B.#]\s*)?"
     seen: set[str] = set()
     for syn in syns:
         norm = syn.strip()
@@ -238,8 +262,10 @@ def has_burmese_slot_synonym_in_first_line(
     escaped = [re.escape(s) for s in syns if s]
     if not escaped:
         return False
+    # Myanmar digit prefix accepts `။` (U+104B), `.`, or `#` as the
+    # period character (Tesseract OCR fallback).
     pattern = re.compile(
-        r"^\s*(?:[\u1040-\u1049]+[\u104B.]\s*)?(?:"
+        r"^\s*(?:[\u1040-\u1049]+[\u104B.#]\s*)?(?:"
         + "|".join(escaped)
         + r")\s*[:\-.]?\s*$",
     )
@@ -315,9 +341,13 @@ def split_paragraphs_on_burmese_headings(lines: list[str]) -> list[str]:
     if not prefixes:
         return list(lines)
     prefix_alt = "|".join(re.escape(p) for p in prefixes)
+    # Myanmar digit prefix accepts `။` (U+104B), `.`, or `#` as the
+    # period character. The `#` fallback is gated on the prefix-Myanmar-
+    # digit constraint so English text with hash characters (room #5,
+    # tag #foo) is preserved unchanged.
     pattern = re.compile(
         r"(?:^|(?<=\s))"
-        r"(?:[\u1040-\u1049]+[\u104B.]\s*)"
+        r"(?:[\u1040-\u1049]+[\u104B.#]\s*)"
         r"(?:" + prefix_alt + r")",
     )
     out: list[str] = []

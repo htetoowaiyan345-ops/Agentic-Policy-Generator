@@ -422,6 +422,93 @@ def _burmese_data_not_found_placeholder() -> str:
     return "Data is not found in source file."
 
 
+def _i18n_label_normalize(lines: list[str]) -> list[str]:
+    """Layer B — rewrite Myanmar-script label lines into canonical
+    `English Label: value` format using the i18n reverse index.
+
+    For each line, if the line begins with a Myanmar-script phrase
+    that maps to a Brain canonical label (e.g., `မူဝါဒနံပါတ်: HR_GP_00002`
+    becomes `Policy Number: HR_GP_00002`), replace the Myanmar prefix
+    with the canonical English label and preserve the value. Lines
+    that don't begin with a Myanmar-script label are passed through
+    unchanged. Lines whose Myanmar prefix has no canonical mapping
+    are also passed through unchanged.
+
+    English PDFs are completely unaffected — every line is detected
+    as non-Myanmar and passed through. This is the language-agnostic
+    contract: downstream field_parser sees a single canonical English
+    label regardless of source language.
+
+    Order of operations:
+      1. Trim leading whitespace.
+      2. Check first 80 chars for a Myanmar-script label phrase.
+      3. Use burmese_synonyms.get_canonical_for_burmese_label to resolve.
+      4. Strip trailing colon from the matched phrase and re-emit as
+         `English Label:<rest of line>`.
+    """
+    import re as _re
+    from policy_platform.i18n.burmese_synonyms import get_canonical_for_burmese_label
+
+    out: list[str] = []
+    for line in lines:
+        if not line:
+            out.append(line)
+            continue
+        s = (line or "").strip()
+        if not s:
+            out.append(line)
+            continue
+        # Quick check: any Myanmar codepoint in first 80 chars?
+        head = s[:80]
+        if not _re.search(
+            r"[\u1000-\u109F\uAA60-\uAA7F\uA9E0-\uA9FF]", head
+        ):
+            out.append(line)
+            continue
+        # Find the longest Myanmar-phrase prefix that resolves to a
+        # canonical. Walk word-by-word: try the whole head, then
+        # progressively shorten until a hit is found (or exhaust).
+        best_match: tuple[str, str, int] | None = None  # (canonical, matched_phrase, matched_len)
+        # Greedy longest-prefix search over Myanmar-script runs
+        for m in _re.finditer(
+            r"[\u1000-\u109F\uAA60-\uAA7F\uA9E0-\uA9FF][^\s:]*",
+            head,
+        ):
+            phrase = m.group(0).rstrip(":").strip()
+            if not phrase:
+                continue
+            canonical = get_canonical_for_burmese_label(phrase)
+            if canonical and (
+                best_match is None or len(phrase) > best_match[2]
+            ):
+                best_match = (canonical, phrase, len(phrase))
+        if best_match is None:
+            out.append(line)
+            continue
+        canonical, _phrase, matched_len = best_match
+        # Reconstruct: strip the matched Myanmar phrase from `s` and
+        # prepend `English canonical`. Preserve any leading colon /
+        # value separator.
+        rest_start = matched_len
+        # Skip leading separator chars (colon, space, tab).
+        while rest_start < len(s) and s[rest_start] in (":", " ", "\t", "။"):
+            rest_start += 1
+        rest = s[rest_start:].strip()
+        # If the line had a colon at end of matched phrase, replace
+        # with `canonical + colon`; otherwise add one.
+        had_colon = s[matched_len:matched_len + 1] == ":" or \
+            s[matched_len:matched_len + 1] == "။"
+        sep = ":" if had_colon else ":"
+        new_line = f"{canonical} {rest}".strip() if rest else f"{canonical}".strip()
+        # Ensure canonical has a trailing colon if missing.
+        if not new_line.rstrip().endswith(":"):
+            new_line = new_line.rstrip() + sep
+        # Prepend any leading whitespace that was stripped earlier.
+        leading_ws = line[: len(line) - len(line.lstrip())]
+        out.append(leading_ws + new_line)
+    return out
+
+
 def _clean_pdf_column_wrap_tail(line: str) -> str:
     """Phase U3: clean PDF column-wrap garbage tails from
     `Label: value` lines.
@@ -951,6 +1038,10 @@ def dispatch(path: Path) -> ExtractedDocument:
     split = _split_paragraphs_on_brain_labels(merged)
     burmese_split = _split_paragraphs_on_burmese_headings(split)
     normalized = _normalize_label_colons(burmese_split)
+    # Layer B: i18n label normalization — rewrite Myanmar-script label
+    # lines to canonical English labels via the burmese_synonyms YAML
+    # reverse index. No-op for English PDFs (no Myanmar codepoints).
+    normalized = _i18n_label_normalize(normalized)
     new_orig = _rebuild_original_indices(cleaned, original_indices, normalized)
 
     # Phase U3: clean PDF column-wrap garbage tails from

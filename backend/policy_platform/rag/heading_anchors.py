@@ -80,6 +80,15 @@ def _load_slot_heading_words() -> dict[int, list[str]]:
 
     Falls back to the Brain slot titles if a slot has no synonyms
     defined (e.g. slot 1 / 3 are label-row slots, not heading-anchored).
+
+    Layer B — also appends Burmese synonyms from the i18n loader
+    (burmese_synonyms.get_burmese_synonyms(slot_id)) so Myanmar PDFs
+    whose section headings are in Myanmar script (e.g. 'ရည်ရွယ်ချက်'
+    for slot 7 Purpose) are matched by the heading-anchor regex. The
+    Burmese phrases are appended AFTER the English ones (English-first
+    ordering means English documents still match without scanning
+    Myanmar chars). No per-file hardcoding — Burmese vocabulary comes
+    from the canonical YAML data file.
     """
     from ..framework.section_map import FROZEN_SECTIONS, SECTION_HEADING_SYNONYMS
     words: dict[int, list[str]] = {}
@@ -91,6 +100,25 @@ def _load_slot_heading_words() -> dict[int, list[str]]:
         else:
             # Fallback to the Brain title (e.g. "INTRODUCTION" -> "introduction").
             words[sid] = [sec["title"].lower()]
+    # Layer B: append Burmese synonyms from the i18n loader. Failure
+    # of the loader (missing file, malformed YAML) must NOT block
+    # English PDF processing — the English-only list is already valid.
+    try:
+        from policy_platform.i18n.burmese_synonyms import get_burmese_synonyms
+        for sid, mm_list in get_burmese_synonyms.__globals__.get(
+            "_HEADINGS_CACHE", {}
+        ).items():
+            for mm in mm_list:
+                if mm not in words.get(sid, []):
+                    words.setdefault(sid, []).append(mm)
+        # If the cache is empty (loader not yet hit), call once to
+        # prime the cache via _ensure_loaded.
+        for sid in range(5, 15):
+            for mm in get_burmese_synonyms(sid):
+                if mm not in words.get(sid, []):
+                    words.setdefault(sid, []).append(mm)
+    except Exception:
+        pass
     return words
 
 

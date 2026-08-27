@@ -493,6 +493,50 @@ def _fix_myanmar_punctuation(text: str) -> str:
     return text
 
 
+def _fix_section_marker_period(text: str) -> str:
+    """Repair Tesseract Myanmar OCR error: `#` instead of `။` after digits.
+
+    Tesseract's Myanmar model frequently mis-recognizes the modern
+    Burmese sentence-final marker U+104B (။) as the ASCII hash `#`
+    when the marker immediately follows a Myanmar digit. This breaks
+    section-boundary detection (e.g. `၁။ ရည်ရွယ်ချက်` becomes
+    `၁# ရည်ရွယ်ချက်`), which causes the heading-anchor layer to
+    miss numbered sections like 1. Purpose and 2. Scope & Beneficiaries.
+
+    This function only fires for Myanmar content (`has_myanmar` gate).
+    For pure-English input the function is a no-op even if ASCII `#`
+    is present (English `#` is a legitimate character in URLs,
+    hashtag references, etc.). The substitution is gated on the
+    IMMEDIATELY-PRECEDING character being a Myanmar digit (U+1040-1049)
+    OR a hyphen following Myanmar digits, so English text like
+    `room #5` or `tag #foo` is preserved unchanged.
+
+    After substitution, downstream code can match patterns like
+    `၁။` / `၁-၁။` for section boundary detection (replacing
+    the now-correct period after Myanmar digit).
+    """
+    if not text:
+        return text
+    # Quick gate: only run if any Myanmar codepoint present.
+    if not _MYANMAR_ALL.search(text):
+        return text
+    # Pattern A: Myanmar digit(s) + `#` + whitespace OR EOL → Myanmar digit(s) + `။`
+    # Catches standalone section markers like `၁# ` at end of a line.
+    text = re.sub(
+        r"([\u1040-\u1049]+)#(\s|$)",
+        r"\1။\2",
+        text,
+    )
+    # Pattern B: Myanmar digit(s) + `-` + Myanmar digit(s) + `#` + whitespace → same + `။`
+    # Catches sub-section markers like `၁-၁#`.
+    text = re.sub(
+        r"([\u1040-\u1049])-([\u1040-\u1049]+)#(\s|$)",
+        r"\1-\2။\3",
+        text,
+    )
+    return text
+
+
 def _fix_visarga_compound_vowel(text: str) -> str:
     """Fix Tesseract confusion of visarga (း) with vowel-u (ု) before ာ.
 
@@ -694,6 +738,12 @@ def correct_myanmar_ocr(text: str) -> str:
 
     # Step 4b: Fix Myanmar punctuation errors (ၤ → ။, ASCII : → ။)
     text = _fix_myanmar_punctuation(text)
+
+    # Step 4b.5: Repair Tesseract `#` → `။` confusion after Myanmar digits.
+    # This restores section markers like `၁။ ရည်ရွယ်ချက်` so the
+    # heading-anchor layer can detect numbered sections. No-op for
+    # non-Myanmar content (gate inside the function).
+    text = _fix_section_marker_period(text)
 
     # Step 4c: Fix visarga compound vowel confusion (းာ → ုာ)
     text = _fix_visarga_compound_vowel(text)

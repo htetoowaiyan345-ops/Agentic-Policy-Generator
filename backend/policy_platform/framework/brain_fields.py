@@ -237,10 +237,17 @@ def canonical_label(input_label: str) -> str | None:
     Strategy:
       1. Exact canonical or synonym match.
       2. Longest-prefix match against the canonical labels — so Brain
-         paragraphs like `Responsible Function Officer(s):` resolve to
-         `Responsible Function Officer(s):` (the longer canonical),
-         not the shorter `Responsible Function(s):`. This handles
-         Brain headings that extend a canonical with extra words.
+        paragraphs like `Responsible Function Officer(s):` resolve to
+        `Responsible Function Officer(s):` (the longer canonical),
+        not the shorter `Responsible Function(s):`. This handles
+        Brain headings that extend a canonical with extra words.
+      3. Layer B — Burmese reverse lookup via the i18n loader. When
+        the input label is a Myanmar script line like 'ရည်ရွယ်ချက်'
+        or 'မူဝါဒနံပါတ်:', resolve to the canonical English label
+        via the burmese_synonyms YAML reverse index. This makes
+        canonical_label() language-agnostic so the rest of the pipeline
+        (field_parser, narrative_inference) sees a single canonical
+        string regardless of the source language.
     """
     target = _norm(input_label)
     # Exact match first (canonical or synonym).
@@ -259,20 +266,21 @@ def canonical_label(input_label: str) -> str | None:
                 best = (len(ncan), canonical)
     if best is not None:
         return best[1]
-    # Phase 6 — Burmese reverse-index fallback. Only consulted when English
-    # exact + prefix matching both failed. Maps Burmese phrases from
-    # ``burmese_synonyms.yaml`` to canonical English labels.
+
+    # Layer B: Burmese reverse lookup. Only fire when the input label
+    # contains Myanmar script — keeps English PDFs completely
+    # untouched. The i18n loader caches YAML on first import.
     try:
         from policy_platform.i18n.burmese_synonyms import (
             get_canonical_for_burmese_label,
         )
-        # Strip trailing colon before reverse lookup (loader accepts both).
-        cleaned = input_label.strip().rstrip(":").strip()
-        result = get_canonical_for_burmese_label(cleaned)
-        if result:
-            return result
+        canonical = get_canonical_for_burmese_label(input_label)
+        if canonical is not None:
+            return canonical
     except Exception:
+        # i18n loader missing or YAML malformed — fall through.
         pass
+
     return None
 
 

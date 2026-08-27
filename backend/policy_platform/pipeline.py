@@ -106,6 +106,50 @@ def _maybe_inject_title_from_top_paragraph(
         validated = parse_field_value("Policy Title:", stripped)
         if validated is None:
             continue
+        # Layer F: Myanmar-aware preference. If the validated title is
+        # purely Myanmar-script AND an English-script title appears in
+        # the first 10 paragraphs (e.g., "Group Policy – …"), prefer
+        # the English title. General heuristic — works for any
+        # Myanmar PDF where the source has both languages on the cover.
+        try:
+            from policy_platform.i18n.burmese_strings import has_burmese
+            is_pure_mm = has_burmese(validated) and not any(
+                c.isascii() and c.isalpha() for c in validated
+            )
+        except Exception:
+            is_pure_mm = False
+        if is_pure_mm:
+            for q in paragraphs[:10]:
+                if not q:
+                    continue
+                q_clean = str(q).strip()
+                if not q_clean:
+                    continue
+                # Quick check: has English letters AND not Myanmar.
+                try:
+                    from policy_platform.i18n.burmese_strings import has_burmese
+                    if has_burmese(q_clean):
+                        continue
+                except Exception:
+                    continue
+                has_en = any(c.isascii() and c.isalpha() for c in q_clean)
+                if not has_en:
+                    continue
+                # Reject obvious non-title lines.
+                if ":" in q_clean or ";" in q_clean:
+                    continue
+                if len(q_clean) < 8 or len(q_clean) > 200:
+                    continue
+                if q_clean.endswith(".") and len(q_clean) > 1 and q_clean[-2].islower():
+                    continue
+                # Apply same prefix stripper.
+                q_stripped = _strip_title_prefix(
+                    q_clean.split("\n", 1)[0].strip()
+                )
+                q_validated = parse_field_value("Policy Title:", q_stripped)
+                if q_validated is not None:
+                    validated = q_validated
+                    break
         return {**field_map, "Policy Title:": validated}
     return field_map
 
@@ -121,7 +165,7 @@ def _normalize_value_for_compare(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
 
 
-def _refine_field_map_cross_field(field_map: dict) -> dict:
+def _refine_field_map_cross_field(field_map: dict, paragraphs: list | None = None) -> dict:
     """Apply cross-field refinement rules to the populated field_map.
 
     General heuristics — no per-file hardcoding. Rules:
@@ -220,9 +264,21 @@ def _refine_field_map_cross_field(field_map: dict) -> dict:
             out.pop("Last Reviewed:", None)
 
     # Rule 4: Responsible Function Officer(s) — inherit Approved by when empty.
+    # Layer E: only inherit when the source contains no Myanmar text.
+    # Myanmar PDFs often have a separate officer value that doesn't
+    # match Approved by; leaking Approved by there produces wrong output.
+    # English PDFs preserve the original behavior (inherit when empty).
     officer_val = out.get("Responsible Function Officer(s):", "")
     if not officer_val and approved_by:
-        out["Responsible Function Officer(s):"] = approved_by
+        try:
+            from policy_platform.i18n.burmese_strings import has_burmese
+            source_has_mm = any(
+                has_burmese(p) for p in (paragraphs or []) if p
+            )
+        except Exception:
+            source_has_mm = False
+        if not source_has_mm:
+            out["Responsible Function Officer(s):"] = approved_by
 
     return out
 
@@ -567,6 +623,14 @@ def _run_extracted_pipeline(
         labels across columns, row 1 = values across columns). The
         transposed form is general — it works for any future file
         that encodes slot-1 metadata as a single-row label table.
+
+        Phase 8 (field-extraction completeness for Myanmar PDFs):
+        Newlines in label cells are collapsed to spaces so multi-line
+        labels like `Effected/Review\ndate` become a single-token
+        `Effected/Review date` that the Brain label vocabulary can
+        match. Without this, the synthesized paragraph carries an
+        embedded newline that breaks `_LABEL_LINE_RE`'s single-line
+        anchor and the label is silently dropped.
         """
         out: list[str] = []
         if not tables:
@@ -578,11 +642,11 @@ def _run_extracted_pipeline(
             n_cols = max(len(r) for r in tbl if r)
             if n_cols >= 3 and len(tbl) <= 3:
                 header_cells = [
-                    (str(c).strip() if c else "") for c in (tbl[0] or [])
+                    (" ".join(str(c).split()) if c else "") for c in (tbl[0] or [])
                 ]
                 value_row = tbl[1] if len(tbl) >= 2 else []
                 value_cells = [
-                    (str(c).strip() if c else "") for c in (value_row or [])
+                    (" ".join(str(c).split()) if c else "") for c in (value_row or [])
                 ]
                 for label, value in zip(header_cells, value_cells):
                     if not label or not value:
@@ -596,8 +660,8 @@ def _run_extracted_pipeline(
             for row in tbl:
                 if not row or len(row) < 2:
                     continue
-                label = (row[0] or "").strip()
-                value = (row[1] or "").strip()
+                label = " ".join((row[0] or "").split())
+                value = " ".join((row[1] or "").split())
                 if not label or not value:
                     continue
                 if label.endswith(":"):
@@ -609,12 +673,39 @@ def _run_extracted_pipeline(
     synth_paragraphs = _label_row_tables_to_paragraphs(
         getattr(extracted, "tables", None)
     )
-    parser_input = list(synth_paragraphs) + list(extracted.paragraphs)
-    field_map = field_parser.parse(
-        parser_input,
-        dropped_paragraphs=getattr(extracted, "cleaner_dropped", None),
-        cleaned_to_original=getattr(extracted, "original_indices", None),
-    )
+    # Phase 8 (field-extraction completeness): parse synth and plain
+    # SEPARATELY, then merge with synth authoritative. Background —
+    # Myanmar PDFs render their English header labels in BOTH a
+    # transposed header table (clean values) AND as raw text lines
+    # (where post-OCR has split "Daw Win Win Tint" into "Daw Win" +
+    # "Win Tint" across cells, or contaminated the date with the
+    # Myanmar title). The previous "prefer first non-empty" merge
+    # silently overwrote the clean synth values with the corrupted
+    # plain-text values. Synth wins on conflict; plain only fills
+    # fields that synth did not populate. English PDFs (no table) see
+    # no behavior change because synth is empty.
+    if synth_paragraphs:
+        synth_map = field_parser.parse(
+            list(synth_paragraphs),
+            dropped_paragraphs=getattr(extracted, "cleaner_dropped", None),
+            cleaned_to_original=getattr(extracted, "original_indices", None),
+        ) or {}
+        plain_map = field_parser.parse(
+            list(extracted.paragraphs),
+            dropped_paragraphs=getattr(extracted, "cleaner_dropped", None),
+            cleaned_to_original=getattr(extracted, "original_indices", None),
+        ) or {}
+        # synth authoritative, plain fills gaps
+        field_map = dict(plain_map)
+        for k, v in synth_map.items():
+            if v:
+                field_map[k] = v
+    else:
+        field_map = field_parser.parse(
+            list(extracted.paragraphs),
+            dropped_paragraphs=getattr(extracted, "cleaner_dropped", None),
+            cleaned_to_original=getattr(extracted, "original_indices", None),
+        ) or {}
     if not field_map:
         field_map = {}
 
@@ -624,7 +715,7 @@ def _run_extracted_pipeline(
     field_map = _maybe_inject_reason_from_intro_paragraph(
         field_map, list(extracted.paragraphs)
     )
-    field_map = _refine_field_map_cross_field(field_map)
+    field_map = _refine_field_map_cross_field(field_map, list(extracted.paragraphs))
     # Phase 7: prose-inference for label-light documents. Fills empty
     # slots from body prose using general English patterns. Existing
     # label-row values are not overwritten.
@@ -661,7 +752,9 @@ def _run_extracted_pipeline(
             apply_burmese_label_row_overrides(
                 list(extracted.paragraphs), rag_result
             )
-        except Exception:
+        except Exception as _e:
+            import traceback
+            traceback.print_exc()
             pass
         classified = build_classification_from_rag(
             rag_result,
@@ -962,7 +1055,7 @@ def _run_extracted_pipeline(
     field_map = _maybe_inject_reason_from_intro_paragraph(
         field_map, list(extracted.paragraphs)
     )
-    field_map = _refine_field_map_cross_field(field_map)
+    field_map = _refine_field_map_cross_field(field_map, list(extracted.paragraphs))
     # Phase 7: prose-inference for label-light documents. Fills empty
     # slots from body prose using general English patterns. Existing
     # label-row values are not overwritten.
@@ -999,7 +1092,9 @@ def _run_extracted_pipeline(
             apply_burmese_label_row_overrides(
                 list(extracted.paragraphs), rag_result
             )
-        except Exception:
+        except Exception as _e:
+            import traceback
+            traceback.print_exc()
             pass
         classified = build_classification_from_rag(
             rag_result,

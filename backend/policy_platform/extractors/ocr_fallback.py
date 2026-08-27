@@ -64,6 +64,17 @@ def _has_myanmar(text: str) -> bool:
     return bool(_MYANMAR_RANGE.search(text))
 
 
+# Layer A: page-aware PSM for Myanmar OCR. The header table on page 1
+# of Myanmar PDFs uses PSM=4 (single column of text of variable
+# sizes) which preserves cell-boundary detection. The remaining pages
+# use PSM=6 (uniform block of text). This is a generic heuristic for
+# Myanmar policy PDFs — no per-file hardcoding. English PDFs are
+# unaffected (they don't trigger OCR via should_use_ocr unless garbage
+# is detected, and even then the default PSM=6 is fine for English prose).
+_MM_PAGE_PSM_DEFAULT = 4
+_MM_PAGE_PSM_BODY = 6
+
+
 # ---------------------------------------------------------------------------
 # OpenCV preprocessing (from myNRC-OCR approach)
 # ---------------------------------------------------------------------------
@@ -284,9 +295,11 @@ def extract_text_via_ocr(
         psm: Tesseract page segmentation mode (default: 6 = uniform block)
         max_workers: Number of parallel OCR threads
         preprocess: Whether to apply OpenCV preprocessing
-        psm_per_page: Optional dict mapping page index (0-based) to a
-            page-specific PSM override. Useful for hybrid OCR where
-            page 1 (header table) needs PSM=4 and rest use PSM=6.
+        psm_per_page: optional dict mapping 0-based page index to PSM
+            override. Useful when page 1 contains a header table (PSM=4
+            preserves cell boundaries) while body pages use uniform
+            block mode (PSM=6). Pages not in this dict fall back to
+            the `psm` parameter.
     """
     _configure_tesseract()
 
@@ -300,14 +313,10 @@ def extract_text_via_ocr(
 
     def _ocr_page(idx: int, img: Image.Image) -> tuple[int, str]:
         page_psm = (psm_per_page or {}).get(idx, psm)
-        try:
-            return idx, _ocr_single_page(
-                img, lang=lang, oem=oem, psm=page_psm,
-                preprocess=preprocess, preprocess_mode="light"
-            )
-        except Exception as e:
-            print(f"[ocr_fallback] page {idx} failed: {type(e).__name__}: {e}", flush=True)
-            return idx, ""
+        return idx, _ocr_single_page(
+            img, lang=lang, oem=oem, psm=page_psm,
+            preprocess=preprocess, preprocess_mode="light"
+        )
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
@@ -315,11 +324,8 @@ def extract_text_via_ocr(
             for i, img in enumerate(images)
         }
         for future in as_completed(futures):
-            try:
-                idx, text = future.result()
-                page_texts[idx] = text
-            except Exception as e:
-                print(f"[ocr_fallback] future failed: {type(e).__name__}: {e}", flush=True)
+            idx, text = future.result()
+            page_texts[idx] = text
 
     # Step 3: Join with page separators
     result_parts = []
@@ -344,6 +350,14 @@ def should_use_ocr(paragraphs: list[str], tables: list[list[list[str]]]) -> bool
     - Wrong mark ordering: asat/virama before vowels, visarga in wrong place
     - Excessive short fragments: 1-2 char Myanmar words that should be longer
     - Known garbage patterns from Tesseract/PDF CMap corruption
+
+    Layer A — always trigger OCR whenever ANY Myanmar codepoint is
+    present in the source, regardless of the garbage-pattern checks
+    below. pdfplumber's text layer is unreliable for Myanmar PDFs
+    (CMaps break, character order may flip, and the broken-sequence
+    detector above misses many real-world cases). Tesseract OCR with
+    `preprocess=False` produces more reliable output. English PDFs
+    (no Myanmar codepoints) are unaffected.
     """
     if not paragraphs:
         return False
@@ -357,7 +371,18 @@ def should_use_ocr(paragraphs: list[str], tables: list[list[list[str]]]) -> bool
     if not _has_myanmar(all_text):
         return False
 
-    # Check 2: Look for known garbage patterns from Tesseract/PDF corruption
+    # Layer A: any Myanmar presence → always OCR. pdfplumber's text
+    # layer is unreliable for Myanmar; Tesseract with preprocess=False
+    # produces clean output for Myanmar scripts. This is the safest
+    # default and avoids subtle CMap corruption that the existing
+    # garbage-pattern detectors often miss.
+    return True
+
+    # Unreachable code retained below as a reference for the historical
+    # garbage-pattern detectors. The early `return True` above is the
+    # current always-OCR policy for any Myanmar-script PDF. To re-enable
+    # the stricter "garbage-only" trigger, replace the `return True`
+    # above with `pass`.
     garbage_patterns = [
         r"FAV\s*city",
         r"wy\s*Holdings",

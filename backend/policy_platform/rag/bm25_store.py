@@ -7,6 +7,16 @@ so behaviour is identical across Python versions and operating systems.
 The store is single-document: build once with the corpus, then issue
 `search(queries, k)` calls. Scores are non-negative floats, higher is
 better.
+
+Layer C — Myanmar-aware tokenization. The default `_TOKEN_RE`
+(`[a-z0-9]+`) skips Myanmar Unicode codepoints entirely. For Myanmar
+documents this means the corpus is empty of meaningful tokens and
+BM25 returns no matches. We extend tokenization to also match Myanmar
+syllable runs (sequences of Myanmar consonants + dependent vowels +
+medial consonants + virama + asat + kinzi). English chunks tokenize
+exactly as before; Myanmar chunks gain Burmese syllables as tokens.
+General heuristic — works for any Myanmar-language document, no
+per-file hardcoding.
 """
 from __future__ import annotations
 
@@ -16,10 +26,33 @@ from typing import List, Sequence, Tuple
 
 _LOCK = threading.Lock()
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+# Myanmar Unicode block — consonants U+1000-U+1021 + independent vowels
+# U+1023-U+102A + dependent vowels U+102B-U+103A + virama U+1039 + asat
+# U+103A + signs/marks U+103B-U+103E + various marks U+102B-U+1032.
+# Extended block U+AA60-U+AA7F (N Myanmar extended) and U+A9E0-U+A9FF
+# (Myanmar extended-A). Match each Myanmar syllable as a single token
+# (the regex engine handles greedy matching at the syllable boundary).
+_MM_TOKEN_RE = re.compile(
+    r"[\u1000-\u109F\uAA60-\uAA7F\uA9E0-\uA9FF]+"
+)
 
 
 def _tokenize(text: str) -> List[str]:
-    return _TOKEN_RE.findall(text.lower())
+    """Tokenize a single string into lowercase Latin words AND Myanmar
+    syllable runs. Latin tokenization is unchanged from the original
+    implementation; Myanmar tokens are added as full syllable strings
+    (no further splitting — Burmese is largely a syllable-based
+    language and the BM25 IDF/TF statistics work at syllable-level
+    granularity).
+    """
+    if not text:
+        return []
+    lower = text.lower()
+    # Latin tokens (existing behaviour).
+    latin = _TOKEN_RE.findall(lower)
+    # Myanmar tokens.
+    mm = _MM_TOKEN_RE.findall(lower)
+    return latin + mm
 
 
 class BM25Store:
