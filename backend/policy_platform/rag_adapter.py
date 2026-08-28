@@ -182,28 +182,51 @@ def _split_into_source_paragraphs(text: str) -> list[str]:
     else:
         raw_chunks = [text]
 
+    # Phase 7 (simplified): Split at pure dash bullet markers "- ".
+    # After Phase 7 Step 5, "+ "-prefixed lines become "- Content".
+    # Split on whitespace + dash + whitespace so each bullet becomes its own
+    # paragraph, with the dash preserved at the START of each new chunk.
+    _DASH_BULLET_SPLIT_RE = re.compile(r"\s+-\s+")
+
     out: list[str] = []
     for raw in raw_chunks:
         if not raw or not raw.strip():
             continue
-        # Further split English numbered clauses and bullets
-        pieces = _CLAUSE_SPLIT_RE.split(raw)
-        for chunk in pieces:
-            if not chunk or not chunk.strip():
+        # Phase 7: Split on dash bullets. The split pattern consumes the
+        # whitespace + dash + whitespace BEFORE each new bullet. We then
+        # prepend "- " to each new chunk so the dash is preserved at the
+        # START of the bullet paragraph (not absorbed into the previous
+        # paragraph's tail).
+        parts = _DASH_BULLET_SPLIT_RE.split(raw)
+        rebuilt: list[str] = []
+        if parts and parts[0].strip():
+            rebuilt.append(parts[0])
+        for p in parts[1:]:
+            # Each new chunk was preceded by " - " — prepend "- " so it
+            # starts with the dash visible.
+            rebuilt.append("- " + p.lstrip())
+        bullet_split = rebuilt if rebuilt else [raw]
+        for bullet_chunk in bullet_split:
+            if not bullet_chunk or not bullet_chunk.strip():
                 continue
-            bullet_pieces = _BULLET_SPLIT_RE.split(chunk)
-            cur = ""
-            for pc in bullet_pieces:
-                if not pc:
+            # Further split English numbered clauses and bullets
+            pieces = _CLAUSE_SPLIT_RE.split(bullet_chunk)
+            for chunk in pieces:
+                if not chunk or not chunk.strip():
                     continue
-                if pc.strip() == "\u25aa":
-                    if cur.strip():
-                        out.append(_normalize_chunk(cur))
-                    cur = "\u25aa "
-                else:
-                    cur += pc
-            if cur.strip():
-                out.append(_normalize_chunk(cur))
+                bullet_pieces = _BULLET_SPLIT_RE.split(chunk)
+                cur = ""
+                for pc in bullet_pieces:
+                    if not pc:
+                        continue
+                    if pc.strip() == "\u25aa":
+                        if cur.strip():
+                            out.append(_normalize_chunk(cur))
+                        cur = "\u25aa "
+                    else:
+                        cur += pc
+                if cur.strip():
+                    out.append(_normalize_chunk(cur))
     if not out:
         return [_normalize_chunk(text)]
     if len(out) == 1:

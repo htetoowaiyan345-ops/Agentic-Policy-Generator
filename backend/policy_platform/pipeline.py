@@ -747,7 +747,9 @@ def _run_extracted_pipeline(
                 apply_burmese_label_row_overrides,
             )
             apply_burmese_heading_anchors(
-                list(extracted.paragraphs), rag_result
+                list(extracted.paragraphs), rag_result,
+                tables=list(extracted.tables) if getattr(extracted, "tables", None) else None,
+                table_paragraph_indices=list(extracted.table_paragraph_indices) if getattr(extracted, "table_paragraph_indices", None) else None,
             )
             apply_burmese_label_row_overrides(
                 list(extracted.paragraphs), rag_result
@@ -1087,7 +1089,9 @@ def _run_extracted_pipeline(
                 apply_burmese_label_row_overrides,
             )
             apply_burmese_heading_anchors(
-                list(extracted.paragraphs), rag_result
+                list(extracted.paragraphs), rag_result,
+                tables=list(extracted.tables) if getattr(extracted, "tables", None) else None,
+                table_paragraph_indices=list(extracted.table_paragraph_indices) if getattr(extracted, "table_paragraph_indices", None) else None,
             )
             apply_burmese_label_row_overrides(
                 list(extracted.paragraphs), rag_result

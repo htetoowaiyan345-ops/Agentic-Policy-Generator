@@ -276,6 +276,53 @@ def extract(path: Path) -> ExtractedDocument:
                         line for line in corrected.split("\n") if line.strip()
                     ]
                     pdfplumber_doc.paragraphs = ocr_paragraphs
+                    # Phase 7: pdfplumber table detection for Myanmar PDFs.
+                    # Myanmar PDFs typically have no text layer, so pdfplumber
+                    # initially returns no tables. After OCR, retry pdfplumber
+                    # table detection which may pick up tables from image
+                    # analysis (via pymupdf-like heuristics). Fall back to
+                    # OCR-text heuristics if pdfplumber fails.
+                    try:
+                        import pdfplumber
+                        with pdfplumber.open(str(path)) as pdf:
+                            for page in pdf.pages:
+                                try:
+                                    page_tables = page.find_tables() or []
+                                except Exception:
+                                    page_tables = []
+                                for t in page_tables:
+                                    rows = t.extract() or []
+                                    if not rows:
+                                        continue
+                                    cells = [
+                                        [("" if c is None else str(c)) for c in row]
+                                        for row in rows
+                                    ]
+                                    max_cols = max(
+                                        (len(r) for r in cells if r), default=0
+                                    )
+                                    # Only keep 3+ column tables (real data
+                                    # tables, not 2-col label rows).
+                                    if max_cols >= 3:
+                                        pdfplumber_doc.tables.append(cells)
+                    except Exception:
+                        pass
+                    # Phase 7 Step 3: OCR-text heuristic table detection.
+                    # If pdfplumber didn't find tables, detect them from the
+                    # OCR-corrected text using structural patterns.
+                    if not pdfplumber_doc.tables:
+                        try:
+                            from .ocr_fallback import (
+                                detect_tables_from_ocr_text,
+                            )
+                            heuristic_tables = detect_tables_from_ocr_text(
+                                corrected
+                            )
+                            for t in heuristic_tables:
+                                if len(t) >= 2 and len(t[0]) >= 3:
+                                    pdfplumber_doc.tables.append(t)
+                        except Exception:
+                            pass
         except ImportError:
             # ocr_fallback or myanmar_post_ocr not available; skip.
             pass

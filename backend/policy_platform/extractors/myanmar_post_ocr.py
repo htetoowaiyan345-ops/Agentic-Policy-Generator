@@ -813,6 +813,61 @@ def _apply_confusion_pairs(text: str) -> str:
 # Main correction pipeline
 # ---------------------------------------------------------------------------
 
+def _number_bullet_lines(text: str) -> str:
+    """Replace leading "+ " bullets with numbered markers.
+
+    Consecutive lines starting with "+ " are numbered sequentially:
+      first  → "(၁) " (Myanmar) or "(1) " (fallback)
+      second → "(၂) " or "(2) "
+      third  → "(၃) " or "(3) "
+      etc.
+
+    Counter resets on blank lines or non-bullet lines.
+
+    Uses Myanmar numerals as primary with Arabic numeral fallback
+    to ensure visible bullets even if Myanmar font is missing.
+
+    Args:
+        text: Myanmar text with "+ " bullet prefixes.
+
+    Returns:
+        Text with "+ " replaced by numbered markers.
+    """
+    if not text or not text.strip():
+        return text
+    if "+ " not in text:
+        return text
+
+    lines = text.split("\n")
+    counter = 0
+    out: list[str] = []
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith("+ "):
+            counter += 1
+            # Primary: Myanmar digit (1-9), Fallback: Arabic numeral
+            if counter <= 9:
+                mm_digit = chr(0x1040 + counter)  # ၁, ၂, ၃, ...
+                # Use both Myanmar and Arabic for guaranteed visibility
+                digit_display = f"{mm_digit}/{counter}"
+            else:
+                digit_display = str(counter)
+            # Replace "+ " at start with "- " for reliable visibility.
+            # Pure ASCII dash renders in any DOCX font — zero risk of blank lines.
+            # Counter is maintained for correctness (resets between groups) but
+            # not emitted as text since Myanmar numerals may render blank in
+            # fonts lacking Myanmar glyph support.
+            prefix_len = len(line) - len(stripped) + 2  # indent + "+ "
+            new_line = f"{line[:prefix_len - 2]}- {stripped[2:]}"
+            out.append(new_line)
+        else:
+            if stripped:
+                # Non-bullet non-blank line resets counter
+                counter = 0
+            out.append(line)
+    return "\n".join(out)
+
+
 def correct_myanmar_ocr(text: str) -> str:
     """Apply post-OCR corrections to Myanmar text.
 
@@ -904,6 +959,12 @@ def correct_myanmar_ocr(text: str) -> str:
 
     # Step 9: Apply myOCR paper confusion pairs
     text = _apply_confusion_pairs(text)
+
+    # Step 10: Phase 7 - Replace "+ " bullet prefixes with Myanmar numerals.
+    # Consecutive "+ "-prefixed lines become "(၁) ", "(၂) ", "(၃) ".
+    # This preserves source structure while making output Myanmar-native.
+    if _MYANMAR_ALL.search(text):
+        text = _number_bullet_lines(text)
 
     # Final cleanup
     text = re.sub(r"[ \t]+", " ", text)

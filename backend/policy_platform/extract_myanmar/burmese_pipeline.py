@@ -558,6 +558,8 @@ def find_burmese_heading_match(
 def apply_burmese_heading_anchors(
     paragraphs: list[str],
     rag_result: object,
+    tables: list | None = None,
+    table_paragraph_indices: list[int] | None = None,
 ) -> int:
     """Override slots in ``rag_result`` for Burmese documents.
 
@@ -579,6 +581,10 @@ def apply_burmese_heading_anchors(
          sections that happen to use English in a Burmese doc).
 
     Non-Burmese documents pass through unchanged.
+
+    When ``tables`` is provided, detected tables are routed to the
+    matching slot (typically slot 10 - Award Structure) based on
+    paragraph position.
 
     Returns the number of slots that were overridden.
     """
@@ -623,8 +629,6 @@ def apply_burmese_heading_anchors(
             sa.source_idx = s_idx
             sa.score = 1.0
             sa.backend = "burmese_heading_anchor"
-            sa.table = None
-            sa.extra_tables = []
             overridden += 1
             continue
         backend = getattr(sa, "backend", "") or ""
@@ -633,9 +637,18 @@ def apply_burmese_heading_anchors(
             sa.source_idx = None
             sa.score = 0.0
             sa.backend = "no_burmese_heading"
-            sa.table = None
-            sa.extra_tables = []
             overridden += 1
+
+    # Phase 7 Step 4: Route detected tables to slots.
+    # Tables extracted from OCR heuristics or pdfplumber are routed to
+    # the matching slot based on paragraph position. If a table falls
+    # within a slot's heading-anchor paragraph range, attach it.
+    # User-confirmed: tables belong in Award Structure (slot 10).
+    if tables and numeric_index is not None:
+        _route_burmese_tables(
+            slots, tables, paragraphs, numeric_index,
+            table_paragraph_indices=table_paragraph_indices,
+        )
     return overridden
 
 
@@ -654,6 +667,7 @@ _RAG_OR_FALLBACK_BACKENDS: frozenset[str] = frozenset({
     "low_confidence",
     "fallback_position",
     "position_fallback",
+    "mm_position_fallback",
     "timeout",
     "empty_input",
 })
@@ -668,6 +682,97 @@ def _is_rag_or_fallback_backend(backend: str) -> bool:
     if backend.startswith("rag:") or backend.startswith("rag_"):
         return True
     return False
+
+
+def _route_burmese_tables(
+    slots: dict,
+    tables: list,
+    paragraphs: list[str],
+    numeric_index: dict[int, int],
+    table_paragraph_indices: list[int] | None = None,
+) -> int:
+    """Phase 7 Step 4: Route detected tables to matching slots.
+
+    Uses content-based detection to classify tables and route them:
+      - Header tables (2-5 rows × 5 cols, contains "Policy"/"Version")
+        → skip (already in slot 1 via field_parser).
+      - Award Structure tables (contains "Rank", "Health Care", "Amount")
+        → slot 10 (Award Structure & Payout Tiers).
+      - Other data tables → slot 10 (fallback per user decision).
+
+    Note: table_paragraph_indices from pdfplumber may not align with
+    OCR paragraphs. We use content-based classification instead.
+
+    Args:
+        slots: rag_result.slots dict (mutated in-place).
+        tables: list of detected tables (each is list[list[str]]).
+        paragraphs: list of paragraph strings (for range lookup).
+        numeric_index: dict mapping paragraph_idx → slot_id.
+        table_paragraph_indices: optional (used for reference only).
+
+    Returns the number of tables routed.
+    """
+    if not tables:
+        return 0
+    routed = 0
+    _HEADER_KEYWORDS = frozenset({
+        "policy no", "version", "approved by", "prepared by",
+        "effective", "review date", "ဤမူဝါဒ", "policy_title",
+    })
+    _AWARD_KEYWORDS = frozenset({
+        "rank", "health care", "hospital care", "amount",
+        "limit", "annual", "monthly", "per visit", "benefit",
+        "eligibility", "tier", "payout", "ကာယကံရှ",
+        "ထတ်ု်ယူ", "ပမာဏ", "တစ်နစ်", "တစ်လ",
+    })
+
+    def _table_text(table: list) -> str:
+        """Flatten table cells to lowercase text for keyword matching."""
+        return " ".join(
+            " ".join(str(c).lower() for c in row)
+            for row in table if row
+        )
+
+    def _is_header_table(table: list) -> bool:
+        """Header table: 2-5 rows, 5 columns, has label-row keywords."""
+        rows = len(table)
+        cols = max((len(r) for r in table if r), default=0)
+        if rows < 2 or rows > 5 or cols < 4:
+            return False
+        text = _table_text(table)
+        hits = sum(1 for kw in _HEADER_KEYWORDS if kw in text)
+        return hits >= 2
+
+    def _is_award_table(table: list) -> bool:
+        """Award Structure table: has Rank, Health/Hospital Care, amount."""
+        text = _table_text(table)
+        hits = sum(1 for kw in _AWARD_KEYWORDS if kw in text)
+        return hits >= 3
+
+    # Classify and route each table
+    award_tables: list[list] = []
+    other_tables: list[list] = []
+    for table in tables:
+        if _is_header_table(table):
+            continue  # Skip — already in slot 1 via field_parser
+        if _is_award_table(table):
+            award_tables.append(table)
+        else:
+            other_tables.append(table)
+
+    # Route award tables to slot 10 (Award Structure)
+    if 10 in slots:
+        sa = slots[10]
+        if award_tables:
+            sa.table = award_tables[0]
+            sa.extra_tables = award_tables[1:] + other_tables
+            routed = len(award_tables) + len(other_tables)
+        elif other_tables:
+            sa.table = other_tables[0]
+            sa.extra_tables = other_tables[1:]
+            routed = len(other_tables)
+
+    return routed
 
 
 def _burmese_data_not_found_placeholder() -> str:

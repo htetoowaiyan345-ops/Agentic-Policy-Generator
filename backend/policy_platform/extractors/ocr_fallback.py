@@ -451,3 +451,99 @@ def extract_with_ocr_fallback(
 
     text = extract_text_via_ocr(pdf_path)
     return text, True
+
+
+# Phase 7: Heuristic table detection from OCR'd Myanmar text.
+# Myanmar PDFs lack a text layer, so pdfplumber returns no tables.
+# Detect tables from OCR text using structural patterns:
+#   - Consecutive lines with 3+ Myanmar digit groups (data rows)
+#   - Header rows containing keywords like "Rank", "Limit", "Amount"
+#   - Aligned numeric columns separated by whitespace
+import re as _re_table
+
+_MM_DIGIT_TABLE = r"[\u1040-\u1049]"
+_TABLE_HEADER_KEYWORDS = (
+    "rank",
+    "limit",
+    "amount",
+    "ကာယကံရှင�",
+    "ကာယကံရှ",
+    "�တ်မှတ်ချက်",
+    "ပေးချေမှု",
+    "ထုတ်ယူ",
+    "type",
+    "criteria",
+    "annual",
+    "monthly",
+    "per visit",
+    "tier",
+    "benefit",
+    "eligibility",
+)
+# Pattern: 3+ Myanmar digit groups separated by spaces (data row)
+_DATA_ROW_RE = _re_table.compile(
+    rf"(?:\s*{_MM_DIGIT_TABLE}+[က-႟]?\s*){{3,}}"
+    rf"|"
+    rf"(?:\s*[\d,]+\s*){{3,}}"
+)
+
+
+def detect_tables_from_ocr_text(
+    text: str,
+    min_rows: int = 2,
+    min_cols: int = 3,
+) -> list[list[list[str]]]:
+    """Detect tables from OCR'd Myanmar text via structural heuristics.
+
+    Returns a list of tables. Each table is a list of rows; each row
+    is a list of cell strings. Generic: works on any Myanmar PDF that
+    has tabular data with numeric columns.
+
+    Args:
+        text: OCR'd text (one line per row, separated by \\n).
+        min_rows: Minimum rows to qualify as a table (default 2).
+        min_cols: Minimum columns to qualify as a table (default 3).
+
+    Returns:
+        list[list[list[str]]]: Detected tables, or [] if none found.
+    """
+    if not text or not text.strip():
+        return []
+
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    tables: list[list[list[str]]] = []
+
+    def _split_row(row: str) -> list[str]:
+        """Split a row into cells by whitespace, preserving Myanmar text."""
+        cells = row.split()
+        # Group consecutive digit tokens together as one cell if adjacent
+        # to non-digit Myanmar. For now, simple split is sufficient.
+        return cells if cells else [row]
+
+    def _looks_like_data_row(s: str) -> bool:
+        return bool(_DATA_ROW_RE.search(s))
+
+    def _looks_like_header(s: str) -> bool:
+        low = s.lower()
+        return any(kw in low for kw in _TABLE_HEADER_KEYWORDS)
+
+    # Find runs of consecutive data rows (with optional preceding header).
+    current_block: list[list[str]] = []
+    for line in lines:
+        if _looks_like_data_row(line):
+            current_block.append(_split_row(line))
+        elif _looks_like_header(line) and current_block:
+            # Prepend this line as header row
+            current_block.insert(0, _split_row(line))
+        else:
+            if len(current_block) >= min_rows:
+                max_cols = max((len(r) for r in current_block), default=0)
+                if max_cols >= min_cols:
+                    tables.append(current_block)
+            current_block = []
+    if len(current_block) >= min_rows:
+        max_cols = max((len(r) for r in current_block), default=0)
+        if max_cols >= min_cols:
+            tables.append(current_block)
+
+    return tables

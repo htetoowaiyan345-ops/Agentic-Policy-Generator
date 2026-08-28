@@ -50,8 +50,11 @@ _MM_TO_SLOT: dict[int, int] = {
 
 
 def _mm_digit_value(ch: str) -> int:
-    """Convert a single Myanmar digit character to its integer value."""
-    return ord(ch) - 0x1040 + 1
+    """Convert a single Myanmar digit character to its integer value.
+
+    Myanmar digits are U+1040 (၀=0) through U+1049 (၉=9).
+    """
+    return ord(ch) - 0x1040
 
 
 def _has_myanmar_digits(text: str) -> bool:
